@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from .graph import GraphOverlayError
 from .models import DashboardSnapshot, ProjectView
 from .project import (
     ProjectGraphService,
@@ -91,7 +92,7 @@ def create_app(*, source: object | None = None) -> FastAPI:
     @app.post("/api/project/select")
     def select_project(payload: ProjectSelectRequest) -> dict[str, Any]:
         try:
-            selected = service.select_project(payload.path)
+            service.select_project(payload.path)
         except ProjectInvalidError as exc:
             raise ApiFailure(
                 422,
@@ -105,8 +106,10 @@ def create_app(*, source: object | None = None) -> FastAPI:
             # A valid Project remains selectable while the UI presents the
             # source-specific unavailable state and offers another load.
             pass
+        except GraphOverlayError as exc:
+            raise _graph_api_failure(exc) from exc
         return {
-            "project": selected.to_dict(),
+            "project": service.project_view().to_dict(),
             "source": _source_summary(codex_source),
         }
 
@@ -161,7 +164,13 @@ def _snapshot_payload(service: ProjectGraphService) -> dict[str, Any]:
             },
             retryable=result.error.retryable if result.error else True,
         ) from exc
+    except GraphOverlayError as exc:
+        raise _graph_api_failure(exc) from exc
     return snapshot.to_dict()
+
+
+def _graph_api_failure(exc: GraphOverlayError) -> ApiFailure:
+    return ApiFailure(422, exc.code, exc.message, details=exc.details)
 
 
 def _current_project_view(service: ProjectGraphService) -> ProjectView | None:

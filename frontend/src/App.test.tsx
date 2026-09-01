@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -32,7 +32,27 @@ const snapshot: DashboardSnapshot = {
     userAgent: "Codex Desktop/0.150.1 fixture",
     error: null,
   },
-  graph: { etag: "absent", fileStatus: "absent", edges: [] },
+  graph: {
+    etag: "absent",
+    fileStatus: "absent",
+    nodes: [
+      {
+        id: "active-id",
+        displayTitle: "Map the local runtime",
+        missing: false,
+        hidden: false,
+        layout: null,
+      },
+      {
+        id: "archived-id",
+        displayTitle: "Archive the first pass",
+        missing: false,
+        hidden: false,
+        layout: null,
+      },
+    ],
+    edges: [],
+  },
   conversations: [
     {
       id: "active-id",
@@ -132,12 +152,12 @@ describe("Dashboard conversation list", () => {
 
     expect(screen.getByRole("status")).toHaveTextContent("Loading conversations");
     finishSelection?.({ project, source: health.source });
-    await screen.findByText("Map the local runtime");
+    const conversationList = within(await screen.findByRole("table", { name: "Conversation list" }));
 
-    expect(screen.getByText("active-id")).toBeInTheDocument();
-    expect(screen.getByText("archived-id")).toBeInTheDocument();
-    expect(screen.getByText("Archived")).toBeInTheDocument();
-    expect(screen.getByText("vscode")).toBeInTheDocument();
+    expect(conversationList.getByText("active-id")).toBeInTheDocument();
+    expect(conversationList.getByText("archived-id")).toBeInTheDocument();
+    expect(conversationList.getByText("Archived")).toBeInTheDocument();
+    expect(conversationList.getByText("vscode")).toBeInTheDocument();
     expect(screen.getAllByText("/projects/codexflow").length).toBeGreaterThan(0);
     expect(api.selectProject).toHaveBeenCalledWith("/projects/codexflow");
   });
@@ -173,8 +193,8 @@ describe("Dashboard conversation list", () => {
     await screen.findByText("Local runtime ready");
     await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
     await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await screen.findByText("Map the local runtime");
-    await user.click(screen.getByText("Map the local runtime"));
+    const conversationList = within(await screen.findByRole("table", { name: "Conversation list" }));
+    await user.click(conversationList.getByText("Map the local runtime"));
 
     await waitFor(() => expect(screen.getByRole("region", { name: "Conversation detail" })).toHaveTextContent("active-id"));
   });
@@ -202,7 +222,7 @@ describe("Dashboard conversation list", () => {
     await user.click(screen.getByRole("button", { name: "Load Project" }));
 
     expect(await screen.findByText("Source stale")).toBeInTheDocument();
-    expect(screen.getByText("Map the local runtime")).toBeInTheDocument();
+    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("Map the local runtime")).toBeInTheDocument();
   });
 
   it("keeps a conversation with an invalid observation range visible with a warning", async () => {
@@ -258,5 +278,86 @@ describe("Dashboard conversation list", () => {
     expect(membership).toHaveTextContent("Outside the selected Project");
     expect(membership).toHaveTextContent("nested Git repositories are excluded");
     expect(membership).not.toHaveTextContent("its Git worktree");
+  });
+});
+
+describe("Dashboard graph", () => {
+  it("renders source and missing nodes, selects a node, and supports zoom and pan", async () => {
+    const user = userEvent.setup();
+    const graphSnapshot = {
+      ...snapshot,
+      conversations: [
+        ...snapshot.conversations,
+        {
+          ...snapshot.conversations[0],
+          id: "missing-id",
+          displayTitle: "Orphaned work",
+          codex: {
+            ...snapshot.conversations[0].codex,
+            title: null,
+            preview: "",
+            createdAt: null,
+            updatedAt: null,
+            cwd: "",
+          },
+          derived: {
+            ...snapshot.conversations[0].derived,
+            missing: true,
+            validObservationRange: false,
+          },
+        },
+      ],
+      graph: {
+        ...snapshot.graph,
+        nodes: [
+          {
+            id: "active-id",
+            displayTitle: "Map the local runtime",
+            missing: false,
+            hidden: false,
+            layout: null,
+          },
+          {
+            id: "missing-id",
+            displayTitle: "Orphaned work",
+            missing: true,
+            hidden: false,
+            layout: { x: 320, y: 180 },
+          },
+        ],
+        edges: [
+          { id: "edge-1", source: "active-id", target: "missing-id", type: "continues" },
+          { id: "edge-2", source: "active-id", target: "missing-id", type: "related_to" },
+        ],
+      },
+    } as DashboardSnapshot;
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(graphSnapshot) });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const graph = await screen.findByRole("region", { name: "Conversation graph" });
+    const canvas = within(graph).getByRole("application", { name: "Graph canvas" });
+    expect(within(graph).getByRole("button", { name: /Map the local runtime/ })).toBeInTheDocument();
+    expect(within(graph).getByRole("button", { name: /Orphaned work/ })).toHaveTextContent("Missing source");
+    expect(canvas).toHaveAttribute("data-zoom", "1");
+
+    await user.click(within(graph).getByRole("button", { name: "Zoom in" }));
+    expect(canvas).toHaveAttribute("data-zoom", "1.1");
+    fireEvent.mouseDown(canvas, { clientX: 40, clientY: 40, button: 0 });
+    fireEvent.mouseMove(canvas, { clientX: 90, clientY: 70 });
+    fireEvent.mouseUp(canvas, { clientX: 90, clientY: 70 });
+    expect(canvas).toHaveAttribute("data-pan-x", "50");
+    expect(canvas).toHaveAttribute("data-pan-y", "30");
+    const edgeLines = graph.querySelectorAll("line");
+    expect(edgeLines[0]).toHaveAttribute("marker-end", "url(#graph-arrow)");
+    expect(edgeLines[1]).not.toHaveAttribute("marker-end");
+
+    await user.click(within(graph).getByRole("button", { name: /Orphaned work/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("region", { name: "Conversation detail" })).toHaveTextContent("missing-id");
+    });
   });
 });

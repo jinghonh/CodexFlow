@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from codexflow.graph import GraphOverlayError
 from codexflow.project import ProjectGraphService, ProjectInvalidError
 from codexflow.source import CodexThread, SourceReadResult
 
@@ -15,12 +16,13 @@ def make_thread(
     cwd: Path,
     *,
     title: str | None = None,
+    preview: str | None = None,
     archived: bool = False,
 ) -> CodexThread:
     return CodexThread(
         id=thread_id,
         title=title,
-        preview=f"Preview for {thread_id}",
+        preview=preview if preview is not None else f"Preview for {thread_id}",
         created_at="2024-01-01T00:00:00Z",
         updated_at="2024-01-01T01:00:00Z",
         recency_at="2024-01-01T01:00:00Z",
@@ -78,6 +80,12 @@ def ready(*threads: CodexThread) -> SourceReadResult:
     )
 
 
+def write_graph(project: Path, content: str) -> None:
+    graph_directory = project / ".codex"
+    graph_directory.mkdir(exist_ok=True)
+    (graph_directory / "graph.yaml").write_text(content, encoding="utf-8")
+
+
 def test_service_selects_a_real_project_and_filters_threads_by_path(tmp_path: Path) -> None:
     project = tmp_path / "project"
     inside = project / "src"
@@ -133,6 +141,183 @@ def test_service_keeps_thread_id_stable_across_refreshes(tmp_path: Path) -> None
     assert first.conversations[0].id == "stable-id"
     assert second.conversations[0].id == "stable-id"
     assert second.conversations[0].display_title == "Updated title"
+
+
+def test_snapshot_uses_source_conversations_as_graph_nodes_without_an_overlay(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("source-id", project, title="Codex title")))
+    service = ProjectGraphService(source)
+
+    service.select_project(str(project))
+    snapshot = service.snapshot()
+
+    assert snapshot.graph.file_status == "absent"
+    assert snapshot.graph.edges == ()
+    assert snapshot.graph.nodes == (
+        {
+            "id": "source-id",
+            "displayTitle": "Codex title",
+            "missing": False,
+            "hidden": False,
+            "layout": None,
+        },
+    )
+    assert snapshot.conversations[0].overlay.title is None
+    assert snapshot.conversations[0].overlay.hidden is False
+
+
+def test_snapshot_merges_sparse_overlay_and_keeps_dangling_ids_as_missing_nodes(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  custom-id:
+    title: Local title
+    tags: [" alpha ", alpha, beta]
+    status: active
+    note: Keep this context
+    hidden: true
+    layout:
+      x: 320
+      y: 180
+  missing-id:
+    title: Orphaned work
+edges:
+  - id: edge-1
+    source: custom-id
+    target: missing-id
+    type: continues
+    label: historical link
+""",
+    )
+    source = StubSource(
+        ready(
+            make_thread("custom-id", project, title="Codex title"),
+            make_thread("codex-id", project, title="Codex title"),
+            make_thread("preview-id", project, preview="Preview headline\nMore detail"),
+            make_thread("fallback-id", project, preview=""),
+        )
+    )
+    service = ProjectGraphService(source)
+
+    service.select_project(str(project))
+    snapshot = service.snapshot()
+
+    conversations = {conversation.id: conversation for conversation in snapshot.conversations}
+    graph_nodes = {node["id"]: node for node in snapshot.graph.nodes}
+
+    assert snapshot.graph.file_status == "ready"
+    assert snapshot.graph.etag != "absent"
+    assert conversations["custom-id"].overlay.title == "Local title"
+    assert conversations["custom-id"].overlay.tags == ("alpha", "beta")
+    assert conversations["custom-id"].overlay.hidden is True
+    assert conversations["custom-id"].overlay.layout == {"x": 320.0, "y": 180.0}
+    assert conversations["custom-id"].display_title == "Local title"
+    assert conversations["codex-id"].display_title == "Codex title"
+    assert conversations["preview-id"].display_title == "Preview headline"
+    assert conversations["fallback-id"].display_title == "fallback-id"
+
+    assert conversations["missing-id"].codex is None
+    assert conversations["missing-id"].derived.missing is True
+    assert conversations["missing-id"].display_title == "Orphaned work"
+    assert graph_nodes["missing-id"]["missing"] is True
+    assert graph_nodes["custom-id"] == {
+        "id": "custom-id",
+        "displayTitle": "Local title",
+        "missing": False,
+        "hidden": True,
+        "layout": {"x": 320.0, "y": 180.0},
+    }
+    assert "cwd" not in graph_nodes["custom-id"]
+    assert "createdAt" not in graph_nodes["custom-id"]
+    assert snapshot.graph.edges == (
+        {
+            "id": "edge-1",
+            "source": "custom-id",
+            "target": "missing-id",
+            "type": "continues",
+            "label": "historical link",
+        },
+    )
+
+
+def test_graph_nodes_use_the_latest_source_title_after_refresh(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  stable-id:
+    tags: [source]
+""",
+    )
+    source = StubSource(ready(make_thread("stable-id", project, title="First source title")))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    first = service.snapshot()
+    source.result = ready(make_thread("stable-id", project, title="Latest source title"))
+    second = service.snapshot()
+
+    assert first.graph.nodes[0]["displayTitle"] == "First source title"
+    assert second.graph.nodes[0]["displayTitle"] == "Latest source title"
+    assert second.conversations[0].codex is not None
+    assert second.conversations[0].codex.title == "Latest source title"
+
+
+def test_empty_graph_file_is_rejected_when_version_is_missing(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(project, "\n")
+    service = ProjectGraphService(StubSource(ready()))
+    service.select_project(str(project))
+
+    with pytest.raises(GraphOverlayError) as failure:
+        service.snapshot()
+
+    assert failure.value.code == "graph_version_error"
+
+
+def test_overlay_does_not_promote_a_source_thread_outside_the_selected_project(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    outside = tmp_path / "outside"
+    project.mkdir()
+    outside.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  outside-id:
+    title: Outside source
+  missing-id:
+    title: Historical conversation
+""",
+    )
+    source = StubSource(ready(make_thread("inside-id", project), make_thread("outside-id", outside)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    snapshot = service.snapshot()
+
+    assert [conversation.id for conversation in snapshot.conversations] == [
+        "inside-id",
+        "missing-id",
+    ]
+    assert snapshot.conversations[1].derived.missing is True
+    assert [node["id"] for node in snapshot.graph.nodes] == ["inside-id", "missing-id"]
 
 
 def test_service_keeps_invalid_observation_time_in_the_list(tmp_path: Path) -> None:

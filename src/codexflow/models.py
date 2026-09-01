@@ -87,6 +87,7 @@ class GraphSummary:
     etag: str = "absent"
     file_status: str = "not_loaded"
     edges: tuple[dict[str, Any], ...] = ()
+    nodes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class DashboardSnapshot:
             "graph": {
                 "etag": self.graph.etag,
                 "fileStatus": self.graph.file_status,
+                "nodes": list(self.graph.nodes),
                 "edges": list(self.graph.edges),
             },
             "conversations": [conversation.to_dict() for conversation in self.conversations],

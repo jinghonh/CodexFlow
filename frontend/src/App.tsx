@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, createApi } from "./api";
 import type { DashboardApi } from "./api";
@@ -6,6 +6,8 @@ import type {
   Conversation,
   DashboardSnapshot,
   ExcludedConversation,
+  GraphEdge,
+  GraphNode,
   HealthResponse,
   ProjectView,
 } from "./types";
@@ -165,11 +167,19 @@ export function App({ api }: AppProps) {
       )}
 
       {snapshot && !sourceUnavailable && (
-        <ConversationList
-          conversations={snapshot.conversations}
-          selectedId={selectedConversationId}
-          onSelect={setSelectedConversationId}
-        />
+        <>
+          <ConversationGraph
+            nodes={snapshot.graph.nodes}
+            edges={snapshot.graph.edges}
+            selectedId={selectedConversationId}
+            onSelect={setSelectedConversationId}
+          />
+          <ConversationList
+            conversations={snapshot.conversations}
+            selectedId={selectedConversationId}
+            onSelect={setSelectedConversationId}
+          />
+        </>
       )}
 
       {selectedConversationId && snapshot && (
@@ -245,6 +255,164 @@ function membershipReasonLabel(reason: string): string {
     git_root_unresolvable: "Git root could not be resolved",
   };
   return labels[reason] ?? "Outside the selected Project boundary";
+}
+
+interface ConversationGraphProps {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  selectedId: string | null;
+  onSelect: (id: string) => void;
+}
+
+interface GraphPoint {
+  x: number;
+  y: number;
+}
+
+interface PanOrigin extends GraphPoint {
+  panX: number;
+  panY: number;
+}
+
+function ConversationGraph({ nodes, edges, selectedId, onSelect }: ConversationGraphProps) {
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState<GraphPoint>({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const panOrigin = useRef<PanOrigin | null>(null);
+  const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes]);
+  const positions = useMemo(
+    () => new Map(visibleNodes.map((node, index) => [node.id, graphPosition(node, index)])),
+    [visibleNodes],
+  );
+  const visibleEdges = edges.filter((edge) => positions.has(edge.source) && positions.has(edge.target));
+
+  function adjustZoom(delta: number) {
+    setZoom((current) => Math.max(0.6, Math.min(1.8, Math.round((current + delta) * 10) / 10)));
+  }
+
+  function resetView() {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }
+
+  function beginPan(x: number, y: number) {
+    panOrigin.current = { x, y, panX: pan.x, panY: pan.y };
+    setIsPanning(true);
+  }
+
+  function movePan(x: number, y: number) {
+    if (!panOrigin.current) return;
+    setPan({
+      x: panOrigin.current.panX + x - panOrigin.current.x,
+      y: panOrigin.current.panY + y - panOrigin.current.y,
+    });
+  }
+
+  function endPan() {
+    panOrigin.current = null;
+    setIsPanning(false);
+  }
+
+  return (
+    <section className="graph-section" aria-label="Conversation graph">
+      <div className="graph-heading">
+        <div>
+          <p className="section-kicker">Relationship surface / read only</p>
+          <h2>Graph</h2>
+        </div>
+        <div className="graph-toolbar" role="toolbar" aria-label="Graph controls">
+          <button type="button" aria-label="Zoom out" onClick={() => adjustZoom(-0.1)}>
+            −
+          </button>
+          <span aria-live="polite">{Math.round(zoom * 100)}%</span>
+          <button type="button" aria-label="Zoom in" onClick={() => adjustZoom(0.1)}>
+            +
+          </button>
+          <button type="button" aria-label="Reset view" onClick={resetView}>
+            Reset
+          </button>
+        </div>
+      </div>
+      <div
+        className={`graph-viewport ${isPanning ? "is-panning" : ""}`}
+        role="application"
+        aria-label="Graph canvas"
+        tabIndex={0}
+        data-zoom={zoom}
+        data-pan-x={pan.x}
+        data-pan-y={pan.y}
+        onMouseDown={(event) => {
+          if (event.button === 0) beginPan(event.clientX, event.clientY);
+        }}
+        onMouseMove={(event) => movePan(event.clientX, event.clientY)}
+        onMouseUp={endPan}
+        onMouseLeave={endPan}
+      >
+        {visibleNodes.length === 0 ? (
+          <div className="graph-empty">No visible Conversation nodes in this overlay.</div>
+        ) : (
+          <div
+            className="graph-stage"
+            style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}
+          >
+            <svg className="graph-edges" viewBox="0 0 980 520" aria-hidden="true">
+              <defs>
+                <marker id="graph-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+                  <path d="M0,0 L8,4 L0,8 z" />
+                </marker>
+              </defs>
+              {visibleEdges.map((edge) => {
+                const source = positions.get(edge.source);
+                const target = positions.get(edge.target);
+                if (!source || !target) return null;
+                return (
+                  <line
+                    key={edge.id}
+                    className="graph-edge"
+                    x1={source.x + 92}
+                    y1={source.y + 48}
+                    x2={target.x + 92}
+                    y2={target.y + 48}
+                    markerEnd={edge.type === "related_to" ? undefined : "url(#graph-arrow)"}
+                  />
+                );
+              })}
+            </svg>
+            {visibleNodes.map((node) => {
+              const point = positions.get(node.id);
+              if (!point) return null;
+              return (
+                <button
+                  key={node.id}
+                  type="button"
+                  className={`graph-node ${node.missing ? "is-missing" : ""} ${node.id === selectedId ? "is-selected" : ""}`}
+                  style={{ left: point.x, top: point.y }}
+                  aria-label={`Conversation ${node.displayTitle} (${node.id})`}
+                  aria-pressed={node.id === selectedId}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={() => onSelect(node.id)}
+                >
+                  <span className="graph-node-kind">{node.missing ? "Missing source" : "Conversation"}</span>
+                  <strong>{node.displayTitle}</strong>
+                  <code>{node.id}</code>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+      <p className="graph-caption">
+        {visibleNodes.length} visible node{visibleNodes.length === 1 ? "" : "s"} · drag the field to pan · source metadata stays upstream
+      </p>
+    </section>
+  );
+}
+
+function graphPosition(node: GraphNode, index: number): GraphPoint {
+  if (node.layout) return node.layout;
+  const column = index % 3;
+  const row = Math.floor(index / 3);
+  return { x: 32 + column * 292, y: 34 + row * 150 };
 }
 
 interface ConversationListProps {
@@ -335,7 +503,13 @@ function ConversationRow({ conversation, selected, onSelect }: ConversationRowPr
       <td><span className="cwd-value" title={codex.cwd}>{codex.cwd || "—"}</span></td>
       <td><span className="source-tag">{codex.source}</span></td>
       <td>
-        {codex.archived ? <span className="archive-tag">Archived</span> : <span className="active-tag">Active</span>}
+        {conversation.derived.missing ? (
+          <span className="missing-tag">Missing source</span>
+        ) : codex.archived ? (
+          <span className="archive-tag">Archived</span>
+        ) : (
+          <span className="active-tag">Active</span>
+        )}
       </td>
     </tr>
   );
@@ -348,6 +522,7 @@ function ConversationDetail({ conversation }: { conversation: Conversation | nul
       <span className="ribbon-label">SELECTED CONVERSATION</span>
       <strong>{conversation.displayTitle}</strong>
       <code>{conversation.id}</code>
+      {conversation.derived.missing && <span className="missing-detail">Source record is no longer available.</span>}
       <span>{conversation.codex.cwd}</span>
     </aside>
   );

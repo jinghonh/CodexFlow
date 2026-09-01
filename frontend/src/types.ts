@@ -77,6 +77,22 @@ export interface ExcludedConversation {
   reason: string;
 }
 
+export interface GraphNode {
+  id: string;
+  displayTitle: string;
+  missing: boolean;
+  hidden: boolean;
+  layout: { x: number; y: number } | null;
+}
+
+export interface GraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  type: string;
+  label?: string;
+}
+
 export interface DashboardSnapshot {
   project: ProjectView;
   source: {
@@ -85,7 +101,7 @@ export interface DashboardSnapshot {
     userAgent: string | null;
     error: ApiErrorPayload | null;
   };
-  graph: { etag: string; fileStatus: string; edges: unknown[] };
+  graph: { etag: string; fileStatus: string; nodes: GraphNode[]; edges: GraphEdge[] };
   conversations: Conversation[];
   excludedConversations: ExcludedConversation[];
 }

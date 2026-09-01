@@ -81,6 +81,53 @@ async def test_http_api_selects_project_and_returns_source_conversations(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_http_snapshot_exposes_graph_nodes_without_source_field_copies(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    graph_path = project / ".codex" / "graph.yaml"
+    graph_path.parent.mkdir(parents=True)
+    graph_path.write_text(
+        """
+version: 1
+nodes:
+  missing-id:
+    title: Historical conversation
+edges:
+  - id: edge-1
+    source: present-id
+    target: missing-id
+    type: continues
+""",
+        encoding="utf-8",
+    )
+    app = create_app(source=ApiSource(ready(thread("present-id", project))))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected = await client.post("/api/project/select", json={"path": str(project)})
+        snapshot = await client.get("/api/snapshot")
+
+    assert selected.status_code == 200
+    assert selected.json()["project"]["graphFileStatus"] == "ready"
+    assert snapshot.status_code == 200
+    body = snapshot.json()
+    nodes = {node["id"]: node for node in body["graph"]["nodes"]}
+    assert nodes["present-id"]["displayTitle"] == "Title present-id"
+    assert nodes["missing-id"] == {
+        "id": "missing-id",
+        "displayTitle": "Historical conversation",
+        "missing": True,
+        "hidden": False,
+        "layout": None,
+    }
+    assert "cwd" not in nodes["present-id"]
+    assert "createdAt" not in nodes["present-id"]
+    assert body["graph"]["edges"] == [
+        {"id": "edge-1", "source": "present-id", "target": "missing-id", "type": "continues"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_http_snapshot_explains_source_threads_excluded_by_project_membership(
     tmp_path: Path,
 ) -> None:
@@ -178,3 +225,23 @@ async def test_http_refresh_keeps_the_last_complete_conversations_when_source_is
     assert refreshed.status_code == 200
     assert refreshed.json()["source"]["status"] == "stale"
     assert [item["id"] for item in refreshed.json()["conversations"]] == ["stable-id"]
+
+
+@pytest.mark.asyncio
+async def test_http_project_select_reports_a_graph_parse_error_without_overwriting_the_file(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    graph_path = project / ".codex" / "graph.yaml"
+    graph_path.parent.mkdir(parents=True)
+    graph_path.write_text("version: [", encoding="utf-8")
+    app = create_app(source=ApiSource(ready()))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected = await client.post("/api/project/select", json={"path": str(project)})
+
+    assert selected.status_code == 422
+    assert selected.json()["error"]["code"] == "graph_parse_error"
+    assert graph_path.read_text(encoding="utf-8") == "version: ["

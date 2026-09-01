@@ -14,6 +14,7 @@ from .models import (
     GraphSummary,
     ProjectView,
 )
+from .graph import GraphOverlay, read_graph_overlay
 from .source import CodexThread, SourceReadResult
 
 
@@ -80,6 +81,7 @@ class ProjectGraphService:
         self._source = source
         self._git_resolver = git_resolver or SubprocessGitResolver()
         self._project: _ProjectContext | None = None
+        self._graph_file_status = "not_loaded"
 
     def select_project(self, path: str) -> ProjectView:
         if not isinstance(path, str) or not path.strip():
@@ -105,6 +107,7 @@ class ProjectGraphService:
             git_root=git_root,
             worktree_root=git_root,
         )
+        self._graph_file_status = "not_loaded"
         return self.project_view()
 
     def project_view(self) -> ProjectView:
@@ -117,7 +120,7 @@ class ProjectGraphService:
             worktree_root=str(project.worktree_root) if project.worktree_root else None,
             is_git_project=project.git_root is not None,
             graph_file=str(graph_path),
-            graph_file_status="not_loaded",
+            graph_file_status=self._graph_file_status,
         )
 
     def snapshot(self) -> DashboardSnapshot:
@@ -125,11 +128,15 @@ class ProjectGraphService:
         result = self._source.read_snapshot()
         if result.status in {"unavailable", "incompatible"}:
             raise SourceUnavailableError(result)
+        graph_overlay = read_graph_overlay(project.real_path)
+        self._graph_file_status = graph_overlay.file_status
         included_threads, excluded_conversations = self._partition_threads(
             result.threads, project
         )
         conversations = _merge_conversations(
             included_threads,
+            graph_overlay,
+            source_ids={thread.id for thread in result.threads},
             source_available=result.has_complete_snapshot,
         )
         return DashboardSnapshot(
@@ -138,7 +145,12 @@ class ProjectGraphService:
             generated_at=result.generated_at,
             user_agent=result.user_agent,
             source_error=_source_error(result),
-            graph=GraphSummary(),
+            graph=GraphSummary(
+                etag=graph_overlay.etag,
+                file_status=graph_overlay.file_status,
+                edges=graph_overlay.edges,
+                nodes=tuple(_graph_node(conversation) for conversation in conversations),
+            ),
             conversations=tuple(conversations),
             excluded_conversations=tuple(excluded_conversations),
         )
@@ -231,17 +243,31 @@ class ProjectGraphService:
 
 def _merge_conversations(
     threads: list[CodexThread],
+    graph_overlay: GraphOverlay,
     *,
+    source_ids: set[str],
     source_available: bool,
 ) -> list[Conversation]:
     thread_by_id = {thread.id: thread for thread in threads}
-    ids = list(thread_by_id)
+    conversation_ids = list(thread_by_id)
+    referenced_ids = list(graph_overlay.nodes)
+    for edge in graph_overlay.edges:
+        referenced_ids.extend((edge["source"], edge["target"]))
+    for conversation_id in referenced_ids:
+        if conversation_id not in source_ids and conversation_id not in conversation_ids:
+            conversation_ids.append(conversation_id)
+
+    connected_ids = {
+        endpoint
+        for edge in graph_overlay.edges
+        for endpoint in (edge["source"], edge["target"])
+    }
 
     conversations: list[Conversation] = []
-    for conversation_id in ids:
+    for conversation_id in conversation_ids:
         thread = thread_by_id.get(conversation_id)
-        overlay = ConversationOverlay()
-        missing = False
+        overlay = graph_overlay.nodes.get(conversation_id, ConversationOverlay())
+        missing = source_available and conversation_id not in source_ids
         valid_range = bool(
             thread
             and thread.created_at is not None
@@ -255,7 +281,7 @@ def _merge_conversations(
                 overlay=overlay,
                 derived=DerivedConversationState(
                     missing=missing,
-                    unlinked=True,
+                    unlinked=conversation_id not in connected_ids,
                     source_available=source_available,
                     valid_observation_range=valid_range,
                 ),
@@ -289,6 +315,16 @@ def _source_error(result: SourceReadResult) -> dict[str, object] | None:
         "message": result.error.message,
         "details": result.error.details,
         "retryable": result.error.retryable,
+    }
+
+
+def _graph_node(conversation: Conversation) -> dict[str, object]:
+    return {
+        "id": conversation.id,
+        "displayTitle": conversation.display_title,
+        "missing": conversation.derived.missing,
+        "hidden": conversation.overlay.hidden,
+        "layout": conversation.overlay.layout,
     }
 
 
