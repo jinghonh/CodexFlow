@@ -306,6 +306,94 @@ code { display: block; margin-top: 8px; color: #748175; font-size: 10px; }
 .graph-empty { display: grid; min-height: 420px; place-items: center; color: var(--paper-dim); font-size: 12px; }
 .graph-caption { margin: 12px 0 0; color: #718074; font-size: 10px; line-height: 1.5; }
 
+.relationship-editor {
+  margin-top: 42px;
+  border-top: 1px solid var(--line);
+  padding-top: 24px;
+}
+.relationship-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 20px;
+}
+.relationship-heading .section-kicker { margin-bottom: 8px; }
+.relationship-heading h3 {
+  margin: 0;
+  color: var(--paper);
+  font: 400 clamp(27px, 3.4vw, 46px)/0.95 var(--serif);
+  letter-spacing: -0.05em;
+}
+.relationship-count { color: var(--lime); font: 400 35px/1 var(--serif); }
+.relationship-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.72fr) minmax(0, 1.28fr);
+  gap: 18px;
+  margin-top: 20px;
+}
+.relationship-form, .relationship-list {
+  border: 1px solid rgba(231, 234, 223, 0.18);
+  background: rgba(231, 234, 223, 0.035);
+  padding: 18px;
+}
+.relationship-form { display: grid; gap: 8px; align-content: start; }
+.relationship-form-kicker, .relationship-list-heading {
+  margin: 0 0 7px;
+  color: var(--paper-dim);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.relationship-form label {
+  margin-top: 5px;
+  color: var(--paper);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.relationship-form label span { color: var(--paper-dim); letter-spacing: 0; text-transform: none; }
+.relationship-form input, .relationship-form select {
+  width: 100%;
+  border: 1px solid rgba(231, 234, 223, 0.22);
+  border-radius: 0;
+  outline: 0;
+  background: var(--ink-soft);
+  color: var(--paper);
+  padding: 10px 11px;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.relationship-form input:focus, .relationship-form select:focus { border-color: var(--lime); box-shadow: 0 0 0 3px rgba(184, 226, 78, 0.13); }
+.relationship-form input::placeholder { color: #657066; }
+.relationship-form-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
+.relationship-save, .relationship-cancel, .relationship-actions button {
+  border: 1px solid rgba(231, 234, 223, 0.28);
+  background: rgba(231, 234, 223, 0.055);
+  color: var(--paper);
+  padding: 10px 12px;
+  font-size: 10px;
+  transition: border-color 160ms ease, color 160ms ease, transform 160ms ease, background 160ms ease;
+}
+.relationship-save { border-color: var(--lime); background: var(--lime); color: var(--ink); font-weight: 700; }
+.relationship-save:hover:not(:disabled), .relationship-cancel:hover, .relationship-actions button:hover { border-color: var(--lime); color: var(--lime); transform: translateY(-2px); }
+.relationship-save:hover:not(:disabled) { background: #d2f477; color: var(--ink); }
+.relationship-save:disabled { cursor: wait; opacity: 0.65; }
+.relationship-success { color: var(--lime); font-size: 10px; line-height: 1.5; }
+.relationship-error { color: var(--orange); font-size: 10px; line-height: 1.5; white-space: normal; }
+.relationship-list { min-width: 0; }
+.relationship-list-heading { display: flex; justify-content: space-between; gap: 12px; color: var(--lime); }
+.relationship-list-heading span:last-child { color: var(--paper-dim); letter-spacing: 0; text-transform: none; }
+.relationship-list ul { display: grid; gap: 10px; margin: 0; padding: 0; list-style: none; }
+.relationship-list li { min-width: 0; border-top: 1px solid rgba(231, 234, 223, 0.12); padding-top: 12px; }
+.relationship-flow { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; color: var(--paper); }
+.relationship-flow strong { max-width: 30%; overflow: hidden; font: 400 18px/1.05 var(--serif); letter-spacing: -0.02em; text-overflow: ellipsis; white-space: nowrap; }
+.relationship-flow span { color: var(--lime); font-size: 17px; }
+.relationship-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 7px; color: var(--paper-dim); font-size: 10px; }
+.relationship-meta span:first-child { color: var(--orange); letter-spacing: 0.07em; text-transform: uppercase; }
+.relationship-list li code { margin-top: 7px; overflow-wrap: anywhere; color: #748175; font-size: 9px; }
+.relationship-actions { display: flex; gap: 7px; margin-top: 10px; }
+.relationship-actions button { padding: 6px 9px; }
+.relationship-empty { margin: 24px 0; color: var(--paper-dim); font-size: 11px; line-height: 1.5; }
+
 .detail-panel { display: grid; gap: 9px; width: min(420px, 100%); margin: 35px 0 0 auto; border-left: 2px solid var(--lime); background: rgba(231, 234, 223, 0.045); padding: 20px; }
 .detail-panel strong { color: var(--paper); font: 400 25px/1 var(--serif); }
 .detail-panel span:not(.ribbon-label) { color: var(--paper-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -341,6 +429,7 @@ code { display: block; margin-top: 8px; color: #748175; font-size: 10px; }
   .hero-grid { grid-template-columns: 1fr; gap: 50px; padding-top: 72px; }
   .hero-copy h2 { font-size: clamp(55px, 16vw, 100px); }
   .project-card { box-shadow: 10px 10px 0 rgba(184, 226, 78, 0.10); }
+  .relationship-layout { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 520px) {

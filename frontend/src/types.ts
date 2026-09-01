@@ -69,6 +69,20 @@ export interface ConversationOverlayUpdate {
   layout?: NodeLayout | null;
 }
 
+export interface GraphEdgeCreate {
+  source: string;
+  target: string;
+  type: string;
+  label?: string | null;
+}
+
+export interface GraphEdgeUpdate {
+  source?: string;
+  target?: string;
+  type?: string;
+  label?: string | null;
+}
+
 export interface DerivedConversationState {
   missing: boolean;
   unlinked: boolean;

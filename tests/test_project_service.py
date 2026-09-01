@@ -210,6 +210,338 @@ def test_service_updates_node_overlay_and_persists_it_across_project_reload(
     assert reloaded_conversation.display_title == "Local title"
 
 
+def test_service_creates_a_builtin_edge_with_stable_source_to_target_identity(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(
+        ready(
+            make_thread("source-id", project, title="Source conversation"),
+            make_thread("target-id", project, title="Target conversation"),
+        )
+    )
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    updated = service.create_edge(
+        "source-id",
+        "target-id",
+        "continues",
+        "source continues target",
+        expected_etag=before.graph.etag,
+    )
+
+    assert len(updated.graph.edges) == 1
+    edge = updated.graph.edges[0]
+    assert edge["source"] == "source-id"
+    assert edge["target"] == "target-id"
+    assert edge["type"] == "continues"
+    assert edge["label"] == "source continues target"
+    assert isinstance(edge["id"], str) and edge["id"]
+    assert {conversation.id for conversation in updated.conversations} == {
+        "source-id",
+        "target-id",
+    }
+
+    reloaded = ProjectGraphService(source)
+    reloaded.select_project(str(project))
+    assert reloaded.snapshot().graph.edges == updated.graph.edges
+
+
+def test_service_creates_a_custom_edge_and_normalizes_its_type_spacing(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(
+        ready(
+            make_thread("source-id", project),
+            make_thread("target-id", project),
+        )
+    )
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    updated = service.create_edge(
+        "source-id",
+        "target-id",
+        "  blocks_release  ",
+        expected_etag=before.graph.etag,
+    )
+
+    assert updated.graph.edges[0]["type"] == "blocks_release"
+    assert "label" not in updated.graph.edges[0]
+
+
+def test_service_rejects_a_reversed_related_to_edge_as_a_duplicate(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(
+        ready(
+            make_thread("alpha", project),
+            make_thread("beta", project),
+        )
+    )
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    first = service.snapshot()
+    created = service.create_edge(
+        "beta",
+        "alpha",
+        "related_to",
+        None,
+        expected_etag=first.graph.etag,
+    )
+
+    with pytest.raises(GraphOverlayError) as failure:
+        service.create_edge(
+            "alpha",
+            "beta",
+            "related_to",
+            None,
+            expected_etag=created.graph.etag,
+        )
+
+    assert failure.value.code == "duplicate_edge"
+    assert len(service.snapshot().graph.edges) == 1
+    assert service.snapshot().graph.edges[0]["source"] == "alpha"
+    assert service.snapshot().graph.edges[0]["target"] == "beta"
+    saved_graph = (project / ".codex" / "graph.yaml").read_text(encoding="utf-8")
+    assert "source: alpha" in saved_graph
+    assert "target: beta" in saved_graph
+
+
+def test_service_rejects_a_same_endpoint_and_type_duplicate(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("source-id", project), make_thread("target-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    first = service.snapshot()
+    created = service.create_edge(
+        "source-id",
+        "target-id",
+        "depends_on",
+        None,
+        expected_etag=first.graph.etag,
+    )
+
+    with pytest.raises(GraphOverlayError) as failure:
+        service.create_edge(
+            "source-id",
+            "target-id",
+            "depends_on",
+            "duplicate",
+            expected_etag=created.graph.etag,
+        )
+
+    assert failure.value.code == "duplicate_edge"
+    assert len(service.snapshot().graph.edges) == 1
+
+
+def test_service_rejects_self_edges_without_blocking_cycles(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(
+        ready(
+            make_thread("alpha", project),
+            make_thread("beta", project),
+            make_thread("gamma", project),
+        )
+    )
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    with pytest.raises(GraphOverlayError) as failure:
+        service.create_edge(
+            "alpha",
+            "alpha",
+            "continues",
+            None,
+            expected_etag=before.graph.etag,
+        )
+    assert failure.value.code == "self_edge"
+
+    first = service.create_edge(
+        "alpha",
+        "beta",
+        "continues",
+        None,
+        expected_etag=before.graph.etag,
+    )
+    second = service.create_edge(
+        "beta",
+        "alpha",
+        "depends_on",
+        None,
+        expected_etag=first.graph.etag,
+    )
+    third = service.create_edge(
+        "beta",
+        "gamma",
+        "continues",
+        None,
+        expected_etag=second.graph.etag,
+    )
+    final = service.create_edge(
+        "gamma",
+        "alpha",
+        "continues",
+        None,
+        expected_etag=third.graph.etag,
+    )
+
+    assert len(final.graph.edges) == 4
+
+
+def test_service_updates_an_edge_type_without_changing_its_id(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("source-id", project), make_thread("target-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    created = service.create_edge(
+        "source-id",
+        "target-id",
+        "continues",
+        "original label",
+        expected_etag=service.snapshot().graph.etag,
+    )
+    edge_id = created.graph.edges[0]["id"]
+
+    updated = service.update_edge(
+        edge_id,
+        {"type": "implements"},
+        expected_etag=created.graph.etag,
+    )
+
+    assert updated.graph.edges == (
+        {
+            "id": edge_id,
+            "source": "source-id",
+            "target": "target-id",
+            "type": "implements",
+            "label": "original label",
+        },
+    )
+
+
+def test_service_deletes_only_the_requested_edge_and_keeps_conversations(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("source-id", project), make_thread("target-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    first = service.create_edge(
+        "source-id",
+        "target-id",
+        "continues",
+        None,
+        expected_etag=service.snapshot().graph.etag,
+    )
+    second = service.create_edge(
+        "target-id",
+        "source-id",
+        "references",
+        None,
+        expected_etag=first.graph.etag,
+    )
+
+    deleted = service.delete_edge(
+        first.graph.edges[0]["id"],
+        expected_etag=second.graph.etag,
+    )
+
+    assert len(deleted.graph.edges) == 1
+    assert deleted.graph.edges[0]["id"] == second.graph.edges[1]["id"]
+    assert {conversation.id for conversation in deleted.conversations} == {
+        "source-id",
+        "target-id",
+    }
+
+
+def test_service_rechecks_duplicate_and_self_edge_constraints_when_editing(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(
+        ready(
+            make_thread("alpha", project),
+            make_thread("beta", project),
+            make_thread("gamma", project),
+        )
+    )
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    first = service.create_edge(
+        "alpha",
+        "beta",
+        "continues",
+        None,
+        expected_etag=service.snapshot().graph.etag,
+    )
+    second = service.create_edge(
+        "alpha",
+        "beta",
+        "implements",
+        None,
+        expected_etag=first.graph.etag,
+    )
+    first_id = first.graph.edges[0]["id"]
+    second_id = second.graph.edges[1]["id"]
+
+    with pytest.raises(GraphOverlayError) as duplicate:
+        service.update_edge(
+            second_id,
+            {"type": "continues"},
+            expected_etag=second.graph.etag,
+        )
+    assert duplicate.value.code == "duplicate_edge"
+    assert service.snapshot().graph.edges[1]["type"] == "implements"
+
+    with pytest.raises(GraphOverlayError) as self_edge:
+        service.update_edge(
+            first_id,
+            {"target": "alpha"},
+            expected_etag=second.graph.etag,
+        )
+    assert self_edge.value.code == "self_edge"
+    assert service.snapshot().graph.edges[0]["target"] == "beta"
+
+    updated = service.update_edge(
+        first_id,
+        {"target": "gamma", "label": "moved"},
+        expected_etag=second.graph.etag,
+    )
+    assert updated.graph.edges[0] == {
+        "id": first_id,
+        "source": "alpha",
+        "target": "gamma",
+        "type": "continues",
+        "label": "moved",
+    }
+
+
 def test_service_rejects_an_invalid_user_status_without_writing_the_overlay(
     tmp_path: Path,
 ) -> None:

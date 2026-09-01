@@ -4,6 +4,7 @@ import errno
 import math
 import os
 import tempfile
+import uuid
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -142,17 +143,7 @@ def update_graph_node(
     """Persist one sparse node overlay and return the validated new document."""
 
     overlay = read_graph_overlay(project_root)
-    if overlay.file_status == "future":
-        raise GraphOverlayError(
-            "graph_read_only",
-            "Graph overlay 属于更高版本，只能只读打开",
-        )
-    if expected_etag == "*" or expected_etag != overlay.etag:
-        raise GraphOverlayError(
-            "graph_conflict",
-            "Graph overlay 已被其他修改更新，请重新加载后再保存",
-            details={"expectedEtag": expected_etag, "currentEtag": overlay.etag},
-        )
+    _check_graph_mutation_etag(overlay, expected_etag)
     if not isinstance(conversation_id, str) or not conversation_id.strip():
         raise GraphOverlayError("graph_schema_error", "Graph 节点 ID 必须是非空字符串")
     if not isinstance(changes, Mapping):
@@ -183,6 +174,159 @@ def update_graph_node(
     return read_graph_overlay(project_root)
 
 
+def create_graph_edge(
+    project_root: Path,
+    source: str,
+    target: str,
+    edge_type: str,
+    label: str | None = None,
+    *,
+    expected_etag: str,
+) -> GraphOverlay:
+    """Persist one artificial relationship and return the validated overlay."""
+
+    overlay = read_graph_overlay(project_root)
+    _check_graph_mutation_etag(overlay, expected_etag)
+    edge: dict[str, Any] = {
+        "id": uuid.uuid4().hex,
+        "source": source,
+        "target": target,
+        "type": edge_type,
+    }
+    if label is not None:
+        edge["label"] = label
+
+    document = deepcopy(overlay.raw_document) if overlay.raw_document is not None else {}
+    document["version"] = CURRENT_GRAPH_VERSION
+    raw_edges = document.get("edges", [])
+    if not isinstance(raw_edges, list):
+        raise GraphOverlayError("graph_schema_error", "Graph overlay edges 必须是列表")
+    candidate_edges = [*raw_edges, edge]
+    normalized_edges = _parse_edges(candidate_edges, mutation=True)
+    candidate_edges[-1] = normalized_edges[-1]
+    document["edges"] = candidate_edges
+    _write_graph_document(project_root, _ordered_document(document))
+    return read_graph_overlay(project_root)
+
+
+def update_graph_edge(
+    project_root: Path,
+    edge_id: str,
+    changes: Mapping[str, Any],
+    *,
+    expected_etag: str,
+) -> GraphOverlay:
+    """Persist changes to one artificial relationship without changing its ID."""
+
+    overlay = read_graph_overlay(project_root)
+    _check_graph_mutation_etag(overlay, expected_etag)
+    if not isinstance(edge_id, str) or not edge_id.strip():
+        raise GraphOverlayError("graph_schema_error", "Graph edge id 必须是非空字符串")
+    if not isinstance(changes, Mapping):
+        raise GraphOverlayError("graph_schema_error", "Graph edge 更新必须是映射")
+    allowed_fields = {"source", "target", "type", "label"}
+    unknown_fields = set(changes) - allowed_fields
+    if unknown_fields:
+        unknown = ", ".join(sorted(str(field) for field in unknown_fields))
+        raise GraphOverlayError("graph_schema_error", f"Graph edge 更新包含未知字段：{unknown}")
+    if not changes:
+        raise GraphOverlayError("graph_schema_error", "至少需要修改一个 Graph edge 字段")
+
+    document = deepcopy(overlay.raw_document) if overlay.raw_document is not None else {}
+    document["version"] = CURRENT_GRAPH_VERSION
+    raw_edges = document.get("edges", [])
+    if not isinstance(raw_edges, list):
+        raise GraphOverlayError("graph_schema_error", "Graph overlay edges 必须是列表")
+    edge_index = next(
+        (
+            index
+            for index, raw_edge in enumerate(raw_edges)
+            if isinstance(raw_edge, dict) and raw_edge.get("id") == edge_id
+        ),
+        None,
+    )
+    if edge_index is None:
+        raise GraphOverlayError("edge_not_found", f"找不到 Graph edge：{edge_id}")
+
+    candidate = deepcopy(raw_edges[edge_index])
+    for field in ("source", "target", "type"):
+        if field in changes:
+            candidate[field] = changes[field]
+    if "label" in changes:
+        if changes["label"] is None:
+            candidate.pop("label", None)
+        else:
+            candidate["label"] = changes["label"]
+
+    candidate_edges = list(raw_edges)
+    candidate_edges[edge_index] = candidate
+    normalized_edges = _parse_edges(candidate_edges, mutation=True)
+    normalized_edge = normalized_edges[edge_index]
+    for field in ("source", "target", "type"):
+        candidate[field] = normalized_edge[field]
+    if "label" in normalized_edge:
+        candidate["label"] = normalized_edge["label"]
+    else:
+        candidate.pop("label", None)
+    document["edges"] = candidate_edges
+    _write_graph_document(project_root, _ordered_document(document))
+    return read_graph_overlay(project_root)
+
+
+def delete_graph_edge(
+    project_root: Path,
+    edge_id: str,
+    *,
+    expected_etag: str,
+) -> GraphOverlay:
+    """Delete one artificial relationship while leaving all node overlays intact."""
+
+    overlay = read_graph_overlay(project_root)
+    _check_graph_mutation_etag(overlay, expected_etag)
+    if not isinstance(edge_id, str) or not edge_id.strip():
+        raise GraphOverlayError("graph_schema_error", "Graph edge id 必须是非空字符串")
+
+    document = deepcopy(overlay.raw_document) if overlay.raw_document is not None else {}
+    document["version"] = CURRENT_GRAPH_VERSION
+    raw_edges = document.get("edges", [])
+    if not isinstance(raw_edges, list):
+        raise GraphOverlayError("graph_schema_error", "Graph overlay edges 必须是列表")
+    if not any(isinstance(raw_edge, dict) and raw_edge.get("id") == edge_id for raw_edge in raw_edges):
+        raise GraphOverlayError("edge_not_found", f"找不到 Graph edge：{edge_id}")
+    document["edges"] = [
+        raw_edge
+        for raw_edge in raw_edges
+        if not (isinstance(raw_edge, dict) and raw_edge.get("id") == edge_id)
+    ]
+    _write_graph_document(project_root, _ordered_document(document))
+    return read_graph_overlay(project_root)
+
+
+def _check_graph_mutation_etag(overlay: GraphOverlay, expected_etag: str) -> None:
+    if overlay.file_status == "future":
+        raise GraphOverlayError(
+            "graph_read_only",
+            "Graph overlay 属于更高版本，只能只读打开",
+        )
+    if expected_etag == "*" or expected_etag != overlay.etag:
+        raise GraphOverlayError(
+            "graph_conflict",
+            "Graph overlay 已被其他修改更新，请重新加载后再保存",
+            details={"expectedEtag": expected_etag, "currentEtag": overlay.etag},
+        )
+
+
+def _ordered_document(document: dict[str, Any]) -> dict[str, Any]:
+    ordered: dict[str, Any] = {}
+    for key in ("version", "project", "nodes", "edges"):
+        if key in document:
+            ordered[key] = document[key]
+    for key, value in document.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
 def _document_for_update(
     overlay: GraphOverlay,
     conversation_id: str,
@@ -209,15 +353,7 @@ def _document_for_update(
         raw_nodes.pop(conversation_id, None)
     document["nodes"] = raw_nodes
     document.setdefault("edges", [])
-
-    ordered: dict[str, Any] = {}
-    for key in ("version", "project", "nodes", "edges"):
-        if key in document:
-            ordered[key] = document[key]
-    for key, value in document.items():
-        if key not in ordered:
-            ordered[key] = value
-    return ordered
+    return _ordered_document(document)
 
 
 def _node_document(node: ConversationOverlay) -> dict[str, Any]:
@@ -403,7 +539,11 @@ def _parse_layout(conversation_id: str, raw_layout: Any) -> dict[str, float] | N
     return values
 
 
-def _parse_edges(raw_edges: Any) -> tuple[dict[str, Any], ...]:
+def _parse_edges(
+    raw_edges: Any,
+    *,
+    mutation: bool = False,
+) -> tuple[dict[str, Any], ...]:
     if not isinstance(raw_edges, list):
         raise GraphOverlayError("graph_schema_error", "Graph overlay edges 必须是列表")
 
@@ -418,7 +558,10 @@ def _parse_edges(raw_edges: Any) -> tuple[dict[str, Any], ...]:
         target = _required_string(raw_edge, "target", "Graph edge target")
         edge_type = _required_string(raw_edge, "type", "Graph edge type", strip=True)
         if source == target:
-            raise GraphOverlayError("graph_schema_error", "Graph edge 不允许自环")
+            raise GraphOverlayError(
+                "self_edge" if mutation else "graph_schema_error",
+                "Graph edge 不允许自环",
+            )
         if edge_id in edge_ids:
             raise GraphOverlayError("graph_schema_error", f"Graph edge id 重复：{edge_id}")
         edge_ids.add(edge_id)
@@ -428,7 +571,10 @@ def _parse_edges(raw_edges: Any) -> tuple[dict[str, Any], ...]:
             source, target = target, source
         identity = (source, target, normalized_type)
         if identity in identities:
-            raise GraphOverlayError("graph_schema_error", "Graph overlay 包含重复关系")
+            raise GraphOverlayError(
+                "duplicate_edge" if mutation else "graph_schema_error",
+                "Graph overlay 包含重复关系",
+            )
         identities.add(identity)
 
         label = raw_edge.get("label")

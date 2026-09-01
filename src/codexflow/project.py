@@ -6,7 +6,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from .graph import GraphOverlay, read_graph_overlay, update_graph_node
+from .graph import (
+    GraphOverlay,
+    create_graph_edge,
+    delete_graph_edge,
+    read_graph_overlay,
+    update_graph_edge,
+    update_graph_node,
+)
 from .models import (
     Conversation,
     ConversationOverlay,
@@ -148,6 +155,63 @@ class ProjectGraphService:
             project.real_path,
             conversation_id,
             changes,
+            expected_etag=expected_etag,
+        )
+        self._graph_file_status = graph_overlay.file_status
+        return self._build_snapshot(result, graph_overlay, project)
+
+    def create_edge(
+        self,
+        source: str,
+        target: str,
+        edge_type: str,
+        label: str | None = None,
+        *,
+        expected_etag: str,
+    ) -> DashboardSnapshot:
+        project = self._require_project()
+        result = self._source.read_snapshot()
+        if result.status in {"unavailable", "incompatible"}:
+            raise SourceUnavailableError(result)
+        graph_overlay = create_graph_edge(
+            project.real_path,
+            source,
+            target,
+            edge_type,
+            label,
+            expected_etag=expected_etag,
+        )
+        self._graph_file_status = graph_overlay.file_status
+        return self._build_snapshot(result, graph_overlay, project)
+
+    def update_edge(
+        self,
+        edge_id: str,
+        changes: Mapping[str, object],
+        *,
+        expected_etag: str,
+    ) -> DashboardSnapshot:
+        project = self._require_project()
+        result = self._source.read_snapshot()
+        if result.status in {"unavailable", "incompatible"}:
+            raise SourceUnavailableError(result)
+        graph_overlay = update_graph_edge(
+            project.real_path,
+            edge_id,
+            changes,
+            expected_etag=expected_etag,
+        )
+        self._graph_file_status = graph_overlay.file_status
+        return self._build_snapshot(result, graph_overlay, project)
+
+    def delete_edge(self, edge_id: str, *, expected_etag: str) -> DashboardSnapshot:
+        project = self._require_project()
+        result = self._source.read_snapshot()
+        if result.status in {"unavailable", "incompatible"}:
+            raise SourceUnavailableError(result)
+        graph_overlay = delete_graph_edge(
+            project.real_path,
+            edge_id,
             expected_etag=expected_etag,
         )
         self._graph_file_status = graph_overlay.file_status

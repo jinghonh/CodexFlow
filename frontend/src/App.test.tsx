@@ -105,6 +105,9 @@ function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
     snapshot: vi.fn().mockResolvedValue(snapshot),
     refresh: vi.fn().mockResolvedValue(snapshot),
     updateNode: vi.fn().mockResolvedValue(snapshot),
+    createEdge: vi.fn().mockResolvedValue(snapshot),
+    updateEdge: vi.fn().mockResolvedValue(snapshot),
+    deleteEdge: vi.fn().mockResolvedValue(snapshot),
   };
   return {
     health: overrides.health ?? defaults.health,
@@ -112,6 +115,9 @@ function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
     snapshot: overrides.snapshot ?? defaults.snapshot,
     refresh: overrides.refresh ?? defaults.refresh,
     updateNode: overrides.updateNode ?? defaults.updateNode,
+    createEdge: overrides.createEdge ?? defaults.createEdge,
+    updateEdge: overrides.updateEdge ?? defaults.updateEdge,
+    deleteEdge: overrides.deleteEdge ?? defaults.deleteEdge,
   };
 }
 
@@ -508,5 +514,169 @@ describe("Dashboard graph", () => {
     await waitFor(() => {
       expect(screen.getByRole("region", { name: "Conversation detail" })).toHaveTextContent("missing-id");
     });
+  });
+
+  it("creates a custom relationship and renders its source-to-target meaning", async () => {
+    const user = userEvent.setup();
+    const createdSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      graph: {
+        ...snapshot.graph,
+        etag: "edge-etag",
+        edges: [
+          {
+            id: "edge-custom",
+            source: "active-id",
+            target: "archived-id",
+            type: "informs",
+            label: "context handoff",
+          },
+        ],
+      },
+    };
+    const createEdge = vi.fn().mockResolvedValue(createdSnapshot);
+    const api = apiDouble({ createEdge });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const editor = await screen.findByRole("region", { name: "Relationship editor" });
+    await user.type(within(editor).getByLabelText("Source"), "active-id");
+    await user.type(within(editor).getByLabelText("Target"), "archived-id");
+    await user.selectOptions(within(editor).getByLabelText("Relationship type"), "__custom__");
+    await user.type(within(editor).getByLabelText("Custom type"), "informs");
+    await user.type(within(editor).getByLabelText(/Label/), "context handoff");
+    await user.click(within(editor).getByRole("button", { name: "Add relationship" }));
+
+    expect(createEdge).toHaveBeenCalledWith(
+      {
+        source: "active-id",
+        target: "archived-id",
+        type: "informs",
+        label: "context handoff",
+      },
+      "absent",
+    );
+    expect(await within(editor).findByText("Relationship saved")).toBeInTheDocument();
+    const relationship = within(editor).getByRole("listitem", {
+      name: "Relationship active-id informs archived-id",
+    });
+    expect(relationship).toHaveTextContent("Map the local runtime");
+    expect(relationship).toHaveTextContent("Archive the first pass");
+    expect(relationship).toHaveTextContent("→");
+    expect(relationship).toHaveTextContent("informs");
+    expect(relationship).toHaveTextContent("context handoff");
+  });
+
+  it("edits a dangling relationship without changing its id, then deletes only the edge", async () => {
+    const user = userEvent.setup();
+    const edge = {
+      id: "edge-1",
+      source: "active-id",
+      target: "missing-id",
+      type: "continues",
+      label: "history",
+    };
+    const edgeSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      graph: {
+        ...snapshot.graph,
+        etag: "edge-etag",
+        nodes: [
+          ...snapshot.graph.nodes,
+          { id: "missing-id", displayTitle: "Orphaned work", missing: true, hidden: false, layout: null },
+        ],
+        edges: [edge],
+      },
+    };
+    const updatedSnapshot: DashboardSnapshot = {
+      ...edgeSnapshot,
+      graph: {
+        ...edgeSnapshot.graph,
+        etag: "updated-edge-etag",
+        edges: [{ ...edge, type: "fixes", label: "repaired history" }],
+      },
+    };
+    const deletedSnapshot: DashboardSnapshot = {
+      ...updatedSnapshot,
+      graph: { ...updatedSnapshot.graph, etag: "deleted-edge-etag", edges: [] },
+    };
+    const updateEdge = vi.fn().mockResolvedValue(updatedSnapshot);
+    const deleteEdge = vi.fn().mockResolvedValue(deletedSnapshot);
+    const api = apiDouble({
+      snapshot: vi.fn().mockResolvedValue(edgeSnapshot),
+      updateEdge,
+      deleteEdge,
+    });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const editor = await screen.findByRole("region", { name: "Relationship editor" });
+    const relationship = within(editor).getByRole("listitem", {
+      name: "Relationship active-id continues missing-id",
+    });
+    await user.click(within(relationship).getByRole("button", { name: "Edit relationship edge-1" }));
+    await user.selectOptions(within(editor).getByLabelText("Relationship type"), "fixes");
+    await user.clear(within(editor).getByLabelText(/Label/));
+    await user.type(within(editor).getByLabelText(/Label/), "repaired history");
+    await user.click(within(editor).getByRole("button", { name: "Save relationship" }));
+
+    expect(updateEdge).toHaveBeenCalledWith(
+      "edge-1",
+      {
+        source: "active-id",
+        target: "missing-id",
+        type: "fixes",
+        label: "repaired history",
+      },
+      "edge-etag",
+    );
+    const updatedRelationship = await within(editor).findByRole("listitem", {
+      name: "Relationship active-id fixes missing-id",
+    });
+    expect(updatedRelationship).toHaveTextContent("edge-1");
+    expect(updatedRelationship).toHaveTextContent("Orphaned work");
+
+    await user.click(within(updatedRelationship).getByRole("button", { name: "Delete relationship edge-1" }));
+    expect(deleteEdge).toHaveBeenCalledWith("edge-1", "updated-edge-etag");
+    expect(await within(editor).findByText("No artificial relationships yet.")).toBeInTheDocument();
+    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Conversation graph" })).getByRole("button", { name: /Orphaned work/ })).toBeInTheDocument();
+  });
+
+  it("keeps relationship form values and explains a duplicate relationship error", async () => {
+    const user = userEvent.setup();
+    const createEdge = vi.fn().mockRejectedValue(
+      new ApiError(409, {
+        code: "duplicate_edge",
+        message: "This relationship already exists.",
+        details: null,
+        retryable: false,
+      }),
+    );
+    const api = apiDouble({ createEdge });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const editor = await screen.findByRole("region", { name: "Relationship editor" });
+    const sourceInput = within(editor).getByLabelText("Source");
+    const targetInput = within(editor).getByLabelText("Target");
+    await user.type(sourceInput, "active-id");
+    await user.type(targetInput, "archived-id");
+    await user.click(within(editor).getByRole("button", { name: "Add relationship" }));
+
+    const alert = await within(editor).findByRole("alert");
+    expect(alert).toHaveTextContent("duplicate_edge");
+    expect(alert).toHaveTextContent("This relationship already exists.");
+    expect(sourceInput).toHaveValue("active-id");
+    expect(targetInput).toHaveValue("archived-id");
   });
 });

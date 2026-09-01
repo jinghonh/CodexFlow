@@ -57,6 +57,24 @@ class GraphNodePatchRequest(BaseModel):
     layout: GraphNodeLayoutRequest | None = None
 
 
+class GraphEdgeCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: StrictStr
+    target: StrictStr
+    type: StrictStr
+    label: StrictStr | None = None
+
+
+class GraphEdgePatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: StrictStr | None = None
+    target: StrictStr | None = None
+    type: StrictStr | None = None
+    label: StrictStr | None = None
+
+
 class ApiFailure(Exception):
     def __init__(
         self,
@@ -194,6 +212,76 @@ def create_app(*, source: object | None = None) -> FastAPI:
         response.headers["ETag"] = _quote_etag(snapshot.graph.etag)
         return snapshot.to_dict()
 
+    @app.post("/api/graph/edges")
+    def create_graph_edge_endpoint(
+        payload: GraphEdgeCreateRequest,
+        response: Response,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> dict[str, Any]:
+        expected_etag = _require_if_match(if_match)
+        try:
+            snapshot = service.create_edge(
+                payload.source,
+                payload.target,
+                payload.type,
+                payload.label,
+                expected_etag=expected_etag,
+            )
+        except ProjectNotSelectedError as exc:
+            raise ApiFailure(404, "project_not_selected", str(exc)) from exc
+        except SourceUnavailableError as exc:
+            raise _source_api_failure(exc) from exc
+        except GraphOverlayError as exc:
+            raise _graph_api_failure(exc) from exc
+        response.headers["ETag"] = _quote_etag(snapshot.graph.etag)
+        result = snapshot.to_dict()
+        result["edge"] = snapshot.graph.edges[-1]
+        return result
+
+    @app.patch("/api/graph/edges/{edge_id}")
+    def patch_graph_edge(
+        edge_id: str,
+        payload: GraphEdgePatchRequest,
+        response: Response,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> dict[str, Any]:
+        expected_etag = _require_if_match(if_match)
+        changes = payload.model_dump(exclude_unset=True)
+        if not changes:
+            raise ApiFailure(400, "invalid_request", "至少需要修改一个 Graph edge 字段")
+        try:
+            snapshot = service.update_edge(
+                edge_id,
+                changes,
+                expected_etag=expected_etag,
+            )
+        except ProjectNotSelectedError as exc:
+            raise ApiFailure(404, "project_not_selected", str(exc)) from exc
+        except SourceUnavailableError as exc:
+            raise _source_api_failure(exc) from exc
+        except GraphOverlayError as exc:
+            raise _graph_api_failure(exc) from exc
+        response.headers["ETag"] = _quote_etag(snapshot.graph.etag)
+        return snapshot.to_dict()
+
+    @app.delete("/api/graph/edges/{edge_id}")
+    def delete_graph_edge_endpoint(
+        edge_id: str,
+        response: Response,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> dict[str, Any]:
+        expected_etag = _require_if_match(if_match)
+        try:
+            snapshot = service.delete_edge(edge_id, expected_etag=expected_etag)
+        except ProjectNotSelectedError as exc:
+            raise ApiFailure(404, "project_not_selected", str(exc)) from exc
+        except SourceUnavailableError as exc:
+            raise _source_api_failure(exc) from exc
+        except GraphOverlayError as exc:
+            raise _graph_api_failure(exc) from exc
+        response.headers["ETag"] = _quote_etag(snapshot.graph.etag)
+        return snapshot.to_dict()
+
     @app.post("/api/refresh")
     def refresh(response: Response) -> dict[str, Any]:
         return _snapshot_payload(service, response=response)
@@ -230,6 +318,7 @@ def _snapshot_payload(
 
 def _graph_api_failure(exc: GraphOverlayError) -> ApiFailure:
     status_code = {
+        "edge_not_found": 404,
         "graph_conflict": 412,
         "graph_busy": 409,
         "duplicate_edge": 409,
@@ -247,6 +336,16 @@ def _graph_api_failure(exc: GraphOverlayError) -> ApiFailure:
         details=exc.details,
         retryable=exc.code in {"graph_conflict", "graph_busy", "graph_write_error"},
     )
+
+
+def _require_if_match(if_match: str | None) -> str:
+    if if_match is None or not if_match.strip():
+        raise ApiFailure(
+            400,
+            "invalid_request",
+            "保存 Graph edge 需要 If-Match 版本标记",
+        )
+    return _unquote_etag(if_match)
 
 
 def _source_api_failure(exc: SourceUnavailableError) -> ApiFailure:

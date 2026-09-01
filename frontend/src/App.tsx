@@ -7,6 +7,8 @@ import type {
   DashboardSnapshot,
   ExcludedConversation,
   GraphEdge,
+  GraphEdgeCreate,
+  GraphEdgeUpdate,
   GraphNode,
   HealthResponse,
   ConversationOverlayUpdate,
@@ -77,6 +79,33 @@ export function App({ api }: AppProps) {
       throw new Error("Load a Project before saving Conversation changes.");
     }
     const updated = await apiClient.updateNode(conversationId, changes, snapshot.graph.etag);
+    setSnapshot(updated);
+    setProject(updated.project);
+  }
+
+  async function handleEdgeCreate(edge: GraphEdgeCreate): Promise<void> {
+    if (!snapshot) {
+      throw new Error("Load a Project before saving a relationship.");
+    }
+    const updated = await apiClient.createEdge(edge, snapshot.graph.etag);
+    setSnapshot(updated);
+    setProject(updated.project);
+  }
+
+  async function handleEdgeUpdate(edgeId: string, changes: GraphEdgeUpdate): Promise<void> {
+    if (!snapshot) {
+      throw new Error("Load a Project before saving a relationship.");
+    }
+    const updated = await apiClient.updateEdge(edgeId, changes, snapshot.graph.etag);
+    setSnapshot(updated);
+    setProject(updated.project);
+  }
+
+  async function handleEdgeDelete(edgeId: string): Promise<void> {
+    if (!snapshot) {
+      throw new Error("Load a Project before deleting a relationship.");
+    }
+    const updated = await apiClient.deleteEdge(edgeId, snapshot.graph.etag);
     setSnapshot(updated);
     setProject(updated.project);
   }
@@ -187,6 +216,9 @@ export function App({ api }: AppProps) {
           <ConversationGraph
             nodes={snapshot.graph.nodes}
             edges={snapshot.graph.edges}
+            onCreateEdge={handleEdgeCreate}
+            onUpdateEdge={handleEdgeUpdate}
+            onDeleteEdge={handleEdgeDelete}
             selectedId={selectedConversationId}
             onSelect={setSelectedConversationId}
             onLayoutChange={(conversationId, layout) => handleNodeUpdate(conversationId, { layout })}
@@ -281,6 +313,9 @@ interface ConversationGraphProps {
   selectedId: string | null;
   onSelect: (id: string) => void;
   onLayoutChange: (id: string, layout: NodeLayout) => Promise<void>;
+  onCreateEdge: (edge: GraphEdgeCreate) => Promise<void>;
+  onUpdateEdge: (edgeId: string, changes: GraphEdgeUpdate) => Promise<void>;
+  onDeleteEdge: (edgeId: string) => Promise<void>;
 }
 
 interface GraphPoint {
@@ -308,6 +343,9 @@ function ConversationGraph({
   selectedId,
   onSelect,
   onLayoutChange,
+  onCreateEdge,
+  onUpdateEdge,
+  onDeleteEdge,
 }: ConversationGraphProps) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState<GraphPoint>({ x: 0, y: 0 });
@@ -513,6 +551,13 @@ function ConversationGraph({
       <p className="graph-caption">
         {visibleNodes.length} visible node{visibleNodes.length === 1 ? "" : "s"} · drag nodes to save layout · drag the field to pan
       </p>
+      <RelationshipEditor
+        nodes={nodes}
+        edges={edges}
+        onCreate={onCreateEdge}
+        onUpdate={onUpdateEdge}
+        onDelete={onDeleteEdge}
+      />
     </section>
   );
 }
@@ -522,6 +567,249 @@ function graphPosition(node: GraphNode, index: number): GraphPoint {
   const column = index % 3;
   const row = Math.floor(index / 3);
   return { x: 32 + column * 292, y: 34 + row * 150 };
+}
+
+const BUILT_IN_RELATION_TYPES = [
+  "continues",
+  "depends_on",
+  "implements",
+  "reviewed_by",
+  "fixes",
+  "references",
+  "related_to",
+] as const;
+const CUSTOM_RELATION_VALUE = "__custom__";
+
+interface RelationshipEditorProps {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  onCreate: (edge: GraphEdgeCreate) => Promise<void>;
+  onUpdate: (edgeId: string, changes: GraphEdgeUpdate) => Promise<void>;
+  onDelete: (edgeId: string) => Promise<void>;
+}
+
+function RelationshipEditor({
+  nodes,
+  edges,
+  onCreate,
+  onUpdate,
+  onDelete,
+}: RelationshipEditorProps) {
+  const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
+  const [source, setSource] = useState("");
+  const [target, setTarget] = useState("");
+  const [relationType, setRelationType] = useState<string>(BUILT_IN_RELATION_TYPES[0]);
+  const [customType, setCustomType] = useState("");
+  const [label, setLabel] = useState("");
+  const [mutationState, setMutationState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [mutationError, setMutationError] = useState<string | null>(null);
+  const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+
+  function resetEditor() {
+    setEditingEdgeId(null);
+    setSource("");
+    setTarget("");
+    setRelationType(BUILT_IN_RELATION_TYPES[0]);
+    setCustomType("");
+    setLabel("");
+  }
+
+  function beginEdit(edge: GraphEdge) {
+    setEditingEdgeId(edge.id);
+    setSource(edge.source);
+    setTarget(edge.target);
+    if (BUILT_IN_RELATION_TYPES.includes(edge.type as (typeof BUILT_IN_RELATION_TYPES)[number])) {
+      setRelationType(edge.type);
+      setCustomType("");
+    } else {
+      setRelationType(CUSTOM_RELATION_VALUE);
+      setCustomType(edge.type);
+    }
+    setLabel(edge.label ?? "");
+    setMutationState("idle");
+    setMutationError(null);
+  }
+
+  function changeRelationType(value: string) {
+    setRelationType(value);
+    if (value !== CUSTOM_RELATION_VALUE) setCustomType("");
+  }
+
+  async function submitRelationship(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const normalizedSource = source.trim();
+    const normalizedTarget = target.trim();
+    const normalizedType = (relationType === CUSTOM_RELATION_VALUE ? customType : relationType).trim();
+    if (!normalizedSource || !normalizedTarget || !normalizedType) {
+      setMutationState("error");
+      setMutationError("Source, target, and relationship type are required.");
+      return;
+    }
+
+    setMutationState("saving");
+    setMutationError(null);
+    try {
+      const normalizedLabel = label.trim() || null;
+      if (editingEdgeId) {
+        await onUpdate(editingEdgeId, {
+          source: normalizedSource,
+          target: normalizedTarget,
+          type: normalizedType,
+          label: normalizedLabel,
+        });
+      } else {
+        await onCreate({
+          source: normalizedSource,
+          target: normalizedTarget,
+          type: normalizedType,
+          label: normalizedLabel,
+        });
+      }
+      resetEditor();
+      setMutationState("saved");
+    } catch (reason: unknown) {
+      setMutationState("error");
+      setMutationError(describeMutationError(reason));
+    }
+  }
+
+  async function deleteRelationship(edge: GraphEdge) {
+    setMutationState("saving");
+    setMutationError(null);
+    try {
+      await onDelete(edge.id);
+      if (editingEdgeId === edge.id) resetEditor();
+      setMutationState("saved");
+    } catch (reason: unknown) {
+      setMutationState("error");
+      setMutationError(describeMutationError(reason));
+    }
+  }
+
+  return (
+    <section className="relationship-editor" aria-label="Relationship editor">
+      <div className="relationship-heading">
+        <div>
+          <p className="section-kicker">RELATIONSHIPS / SOURCE → TARGET</p>
+          <h3>Relationships</h3>
+        </div>
+        <span className="relationship-count">{String(edges.length).padStart(2, "0")}</span>
+      </div>
+      <div className="relationship-layout">
+        <form className="relationship-form" onSubmit={submitRelationship}>
+          <p className="relationship-form-kicker">{editingEdgeId ? "EDIT RELATIONSHIP" : "ADD RELATIONSHIP"}</p>
+          <label htmlFor="relationship-source">Source</label>
+          <input
+            id="relationship-source"
+            list="conversation-id-options"
+            value={source}
+            onChange={(event) => setSource(event.target.value)}
+            placeholder="Conversation ID"
+            autoComplete="off"
+          />
+
+          <label htmlFor="relationship-target">Target</label>
+          <input
+            id="relationship-target"
+            list="conversation-id-options"
+            value={target}
+            onChange={(event) => setTarget(event.target.value)}
+            placeholder="Conversation ID"
+            autoComplete="off"
+          />
+
+          <label htmlFor="relationship-type">Relationship type</label>
+          <select
+            id="relationship-type"
+            value={relationType}
+            onChange={(event) => changeRelationType(event.target.value)}
+          >
+            {BUILT_IN_RELATION_TYPES.map((type) => (
+              <option key={type} value={type}>{type}</option>
+            ))}
+            <option value={CUSTOM_RELATION_VALUE}>Custom relationship…</option>
+          </select>
+          {relationType === CUSTOM_RELATION_VALUE && (
+            <>
+              <label htmlFor="custom-relationship-type">Custom type</label>
+              <input
+                id="custom-relationship-type"
+                value={customType}
+                onChange={(event) => setCustomType(event.target.value)}
+                placeholder="e.g. informs"
+                autoComplete="off"
+              />
+            </>
+          )}
+
+          <label htmlFor="relationship-label">Label <span>(optional)</span></label>
+          <input
+            id="relationship-label"
+            value={label}
+            onChange={(event) => setLabel(event.target.value)}
+            placeholder="Explain the relationship"
+          />
+          <div className="relationship-form-actions">
+            <button type="submit" className="relationship-save" disabled={mutationState === "saving"}>
+              {mutationState === "saving" ? "Saving…" : editingEdgeId ? "Save relationship" : "Add relationship"}
+            </button>
+            {editingEdgeId && (
+              <button type="button" className="relationship-cancel" onClick={() => { resetEditor(); setMutationState("idle"); }}>
+                Cancel edit
+              </button>
+            )}
+          </div>
+          {mutationState === "saved" && <span className="relationship-success" role="status">Relationship saved</span>}
+          {mutationState === "error" && mutationError && (
+            <span className="relationship-error" role="alert">Could not save relationship: {mutationError}</span>
+          )}
+        </form>
+
+        <div className="relationship-list">
+          <div className="relationship-list-heading">
+            <span>Saved edges</span>
+            <span>Direction is semantic</span>
+          </div>
+          {edges.length === 0 ? (
+            <p className="relationship-empty">No artificial relationships yet.</p>
+          ) : (
+            <ul>
+              {edges.map((edge) => {
+                const sourceNode = nodeById.get(edge.source);
+                const targetNode = nodeById.get(edge.target);
+                const connector = edge.type === "related_to" ? "↔" : "→";
+                return (
+                  <li key={edge.id} aria-label={`Relationship ${edge.source} ${edge.type} ${edge.target}`}>
+                    <div className="relationship-flow">
+                      <strong>{sourceNode?.displayTitle ?? edge.source}</strong>
+                      <span aria-label={edge.type === "related_to" ? "undirected" : "directed"}>{connector}</span>
+                      <strong>{targetNode?.displayTitle ?? edge.target}</strong>
+                    </div>
+                    <div className="relationship-meta">
+                      <span>{edge.type}</span>
+                      {edge.label && <span>· {edge.label}</span>}
+                    </div>
+                    <code>{edge.source} {connector} {edge.target} · {edge.id}</code>
+                    <div className="relationship-actions">
+                      <button type="button" onClick={() => beginEdit(edge)} aria-label={`Edit relationship ${edge.id}`}>
+                        Edit
+                      </button>
+                      <button type="button" onClick={() => void deleteRelationship(edge)} aria-label={`Delete relationship ${edge.id}`}>
+                        Delete
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
+        </div>
+      </div>
+      <datalist id="conversation-id-options">
+        {nodes.map((node) => <option key={node.id} value={node.id}>{node.displayTitle}</option>)}
+      </datalist>
+    </section>
+  );
 }
 
 interface ConversationListProps {

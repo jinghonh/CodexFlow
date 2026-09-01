@@ -271,6 +271,181 @@ async def test_http_patch_node_rejects_coerced_overlay_field_types(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_http_api_creates_builtin_and_custom_edges_with_etags(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = ApiSource(ready(thread("source-id", project), thread("target-id", project)))
+    app = create_app(source=source)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        builtin = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={
+                "source": "source-id",
+                "target": "target-id",
+                "type": "continues",
+                "label": "source continues target",
+            },
+        )
+        custom = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": builtin.json()["graph"]["etag"]},
+            json={
+                "source": "target-id",
+                "target": "source-id",
+                "type": "  blocks_release  ",
+            },
+        )
+
+    assert builtin.status_code == 200
+    assert builtin.json()["edge"] == builtin.json()["graph"]["edges"][0]
+    assert builtin.headers["etag"] == f'"{builtin.json()["graph"]["etag"]}"'
+    assert custom.status_code == 200
+    assert [edge["type"] for edge in custom.json()["graph"]["edges"]] == [
+        "continues",
+        "blocks_release",
+    ]
+    assert all(edge["id"] for edge in custom.json()["graph"]["edges"])
+
+
+@pytest.mark.asyncio
+async def test_http_api_updates_and_deletes_an_edge_without_deleting_conversations(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = ApiSource(ready(thread("source-id", project), thread("target-id", project)))
+    app = create_app(source=source)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        created = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={
+                "source": "source-id",
+                "target": "target-id",
+                "type": "continues",
+                "label": "before edit",
+            },
+        )
+        created_edge = created.json()["graph"]["edges"][0]
+        updated = await client.patch(
+            f"/api/graph/edges/{created_edge['id']}",
+            headers={"If-Match": created.json()["graph"]["etag"]},
+            json={"type": "implements", "label": "after edit"},
+        )
+        deleted = await client.delete(
+            f"/api/graph/edges/{created_edge['id']}",
+            headers={"If-Match": updated.json()["graph"]["etag"]},
+        )
+
+    assert updated.status_code == 200
+    assert updated.json()["graph"]["edges"] == [
+        {
+            "id": created_edge["id"],
+            "source": "source-id",
+            "target": "target-id",
+            "type": "implements",
+            "label": "after edit",
+        }
+    ]
+    assert updated.headers["etag"] == f'"{updated.json()["graph"]["etag"]}"'
+    assert deleted.status_code == 200
+    assert deleted.json()["graph"]["edges"] == []
+    assert [conversation["id"] for conversation in deleted.json()["conversations"]] == [
+        "source-id",
+        "target-id",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_http_api_reports_edge_constraint_errors_without_changing_the_graph(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = ApiSource(ready(thread("alpha", project), thread("beta", project)))
+    app = create_app(source=source)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        created = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={"source": "alpha", "target": "beta", "type": "related_to"},
+        )
+        duplicate = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": created.json()["graph"]["etag"]},
+            json={"source": "beta", "target": "alpha", "type": "related_to"},
+        )
+        self_edge = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": created.json()["graph"]["etag"]},
+            json={"source": "alpha", "target": "alpha", "type": "continues"},
+        )
+        missing_etag = await client.post(
+            "/api/graph/edges",
+            json={"source": "alpha", "target": "beta", "type": "continues"},
+        )
+        final = await client.get("/api/snapshot")
+
+    assert created.status_code == 200
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "duplicate_edge"
+    assert self_edge.status_code == 409
+    assert self_edge.json()["error"]["code"] == "self_edge"
+    assert missing_etag.status_code == 400
+    assert missing_etag.json()["error"]["code"] == "invalid_request"
+    assert len(final.json()["graph"]["edges"]) == 1
+    assert final.json()["graph"]["edges"][0]["source"] == "alpha"
+    assert final.json()["graph"]["edges"][0]["target"] == "beta"
+
+
+@pytest.mark.asyncio
+async def test_http_api_keeps_a_dangling_edge_and_missing_endpoint_visible(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = ApiSource(ready(thread("present-id", project)))
+    app = create_app(source=source)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        created = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={"source": "historical-id", "target": "present-id", "type": "references"},
+        )
+
+    assert created.status_code == 200
+    body = created.json()
+    assert body["edge"] == body["graph"]["edges"][0]
+    assert body["edge"]["source"] == "historical-id"
+    assert body["edge"]["target"] == "present-id"
+    nodes = {node["id"]: node for node in body["graph"]["nodes"]}
+    assert nodes["historical-id"]["missing"] is True
+    assert {conversation["id"] for conversation in body["conversations"]} == {
+        "historical-id",
+        "present-id",
+    }
+
+
+@pytest.mark.asyncio
 async def test_http_snapshot_explains_source_threads_excluded_by_project_membership(
     tmp_path: Path,
 ) -> None:

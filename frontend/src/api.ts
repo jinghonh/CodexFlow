@@ -2,6 +2,8 @@ import type {
   ApiErrorPayload,
   DashboardSnapshot,
   ConversationOverlayUpdate,
+  GraphEdgeCreate,
+  GraphEdgeUpdate,
   HealthResponse,
   ProjectView,
   SourceSummary,
@@ -29,6 +31,9 @@ export interface DashboardApi {
     changes: ConversationOverlayUpdate,
     etag: string,
   ): Promise<DashboardSnapshot>;
+  createEdge(edge: GraphEdgeCreate, etag: string): Promise<DashboardSnapshot>;
+  updateEdge(edgeId: string, changes: GraphEdgeUpdate, etag: string): Promise<DashboardSnapshot>;
+  deleteEdge(edgeId: string, etag: string): Promise<DashboardSnapshot>;
 }
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -52,6 +57,29 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
           "If-Match": etag,
         },
         body: JSON.stringify(changes),
+      }),
+    createEdge: (edge, etag) =>
+      request<DashboardSnapshot>(fetchLike, "/api/graph/edges", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "If-Match": etag,
+        },
+        body: JSON.stringify(edge),
+      }),
+    updateEdge: (edgeId, changes, etag) =>
+      request<DashboardSnapshot>(fetchLike, `/api/graph/edges/${encodeURIComponent(edgeId)}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "If-Match": etag,
+        },
+        body: JSON.stringify(changes),
+      }),
+    deleteEdge: (edgeId, etag) =>
+      request<DashboardSnapshot>(fetchLike, `/api/graph/edges/${encodeURIComponent(edgeId)}`, {
+        method: "DELETE",
+        headers: { "If-Match": etag },
       }),
   };
 }
