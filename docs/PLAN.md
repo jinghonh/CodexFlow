@@ -1,1007 +1,254 @@
-# Codex Conversation Graph & Timeline System — PLAN
+# Codex Conversation Graph & Timeline System — 实现顺序与里程碑
 
-## 1. 实现目标
+本文件只规定实现顺序、交付物和验证门槛。行为、数据模型、错误语义和范围边界以 docs/SPEC.md 为准；如果两者冲突，以 SPEC.md 为准。
 
-按照 SPEC，实现一个本地运行的 Codex Conversation 可视化工具。
+## 实现前门槛
 
-第一阶段重点完成：
+1. 确认实现者已阅读根目录 CONTEXT.md 和 docs/adr/0001 至 docs/adr/0009。
+2. 确认 docs/SPEC.md、docs/PLAN.md 已被 Git 跟踪且不被 .gitignore 忽略。
+3. 建立 app-server JSON-RPC fixture，至少覆盖当前稳定最低接口、active/archived 分页和来源失败。
+4. 建立 Project 路径 fixture，覆盖 Git 根、嵌套仓库、Worktree、软链接和非 Git 目录。
+5. 建立 Graph overlay YAML fixture，覆盖空文件、有效文件、损坏文件、重复键和未来版本。
+6. 不在实现前引入 Codex 私有 SQLite/JSONL 解析作为正常数据路径。
 
-```text
-Codex Conversation 数据读取
-        ↓
-统一数据模型
-        ↓
-Conversation List
-        ↓
-Graph Editor
-        ↓
-graph.yaml 持久化
-        ↓
-Timeline
-        ↓
-Graph / Timeline 联动
-```
-
-不实现 AI 自动关系识别。
-
----
-
-# 2. 推荐技术栈
-
-前端：
-
-```text
-React
-TypeScript
-Vite
-React Flow
-```
-
-Graph 使用：
-
-```text
-@xyflow/react
-```
-
-原因：
-
-- 节点拖拽成熟；
-- Edge 创建成熟；
-- 自定义节点容易；
-- 支持节点选择；
-- 支持 Zoom / Pan；
-- 适合后续扩展。
-
-Timeline 可以优先自己实现，不建议第一版引入复杂甘特图库。
-
-推荐：
-
-```text
-React
-+
-CSS Grid / SVG
-```
-
-原因是当前 Timeline：
-
-```text
-不需要拖动
-不需要依赖关系编辑
-不需要任务进度编辑
-```
-
-本质只是时间区间可视化。
-
----
-
-# 3. 后端
-
-推荐：
-
-```text
-Python
-FastAPI
-```
-
-职责：
-
-```text
-读取 Codex Conversations
-读取 graph.yaml
-写 graph.yaml
-项目发现
-Conversation 查询
-```
-
-后端不负责 Graph 布局算法。
-
----
-
-# 4. 项目结构
-
-建议：
-
-```text
-codex-graph/
-│
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── conversation/
-│   │   │   ├── graph/
-│   │   │   └── timeline/
-│   │   │
-│   │   ├── pages/
-│   │   ├── stores/
-│   │   ├── api/
-│   │   ├── types/
-│   │   └── utils/
-│   │
-│   └── package.json
-│
-├── backend/
-│   ├── app/
-│   │   ├── api/
-│   │   ├── codex/
-│   │   ├── graph/
-│   │   ├── models/
-│   │   └── main.py
-│   │
-│   └── requirements.txt
-│
-├── docs/
-│   ├── SPEC.md
-│   └── PLAN.md
-│
-└── README.md
-```
-
----
-
-# 5. Phase 1：调查 Codex 数据来源
-
-第一步不要直接写 UI。
-
-先验证能够稳定获得：
-
-```text
-conversation_id
-title
-created_at
-updated_at
-cwd
-```
-
-目标是实现统一接口：
-
-```python
-list_conversations(project_path)
-```
-
-返回：
-
-```json
-[
-  {
-    "id": "thread-a",
-    "title": "Implement Trust Region",
-    "created_at": "...",
-    "updated_at": "...",
-    "cwd": "/project"
-  }
-]
-```
-
-优先使用 Codex 提供的正式接口。
-
-如果正式接口无法满足需求，再增加本地数据适配层。
-
-必须把 Codex 数据访问封装在：
-
-```text
-backend/app/codex/
-```
+## 实现顺序
 
-避免前端依赖 Codex 内部实现。
+### 1. 运行时骨架
 
----
+交付：
 
-# 6. Phase 2：定义统一数据模型
-
-建立：
-
-```typescript
-interface Conversation {
-    id: string
-    codexTitle: string
-    createdAt: string
-    updatedAt: string
-    cwd: string
+- 本地后端启动；
+- 回环地址监听；
+- 生产环境前端静态资源托管；
+- 开发环境前端联调方式；
+- app-server stdio 子进程生命周期管理；
+- health 接口。
 
-    title?: string
-    tags: string[]
-    status?: string
-    note?: string
+验证：
 
-    hidden: boolean
+- 服务只能从本机访问；
+- app-server 无法启动时能返回 Source unavailable；
+- 进程退出和重启不会破坏 Graph overlay。
 
-    position?: {
-        x: number
-        y: number
-    }
-}
-```
+### 2. CodexThreadSource
 
-Edge：
+交付：
 
-```typescript
-interface ConversationEdge {
-    id: string
-    source: string
-    target: string
-    type: string
-    label?: string
-}
-```
+- initialize/initialized；
+- 版本和能力探测；
+- 显式 sourceKinds；
+- active/archived 双分页；
+- opaque cursor 处理；
+- Thread 元数据规范化；
+- Complete source snapshot；
+- Source unavailable 和 stale 状态。
 
----
+验证：
 
-# 7. Phase 3：实现 graph.yaml
+- 通过 CodexThreadSource 接缝完成全部来源 fixture；
+- 不读取私有 SQLite/JSONL；
+- 分页失败不会产生新的完整快照。
 
-后端建立：
+### 3. Project membership
 
-```text
-GraphRepository
-```
+交付：
 
-提供：
+- 单根 Project 选择；
+- 原始路径和真实路径；
+- Git 根和工作树根判断；
+- 嵌套仓库排除；
+- Worktree 独立；
+- 软链接和失效路径处理；
+- Project 根范围安全检查。
 
-```text
-load_graph(project_path)
+验证：
 
-save_graph(project_path, graph)
+- 通过 ProjectGraphService 接缝完成所有路径 fixture；
+- 路径组件边界和软链接越界测试通过。
 
-update_node(...)
+### 4. Graph overlay 存储
 
-update_edge(...)
+交付：
 
-delete_edge(...)
-```
+- graph.yaml 版本 1 解析和校验；
+- 稀疏 nodes 映射；
+- edges 列表；
+- 缺失文件处理；
+- 重复键和 schema 错误；
+- 未来版本只读；
+- 旧版本迁移接口；
+- ETag；
+- 旁路锁；
+- 唯一临时文件；
+- 原子替换；
+- 备份和恢复错误。
 
-第一版可以直接：
+验证：
 
-```text
-整文件读取
-→ 修改
-→ 整文件写回
-```
+- 双写者不会静默丢失更新；
+- YAML 损坏不会覆盖原文件；
+- ETag 冲突能被客户端识别；
+- 未来版本不会被旧程序写回。
 
-无需数据库。
+### 5. ProjectGraphService
 
----
+交付：
 
-# 8. graph.yaml 安全写入
+- 来源快照与 Graph overlay 合并；
+- displayTitle；
+- hidden、missing、unlinked 和 User status；
+- Dangling edge；
+- Graph 节点和关系命令；
+- DashboardSnapshot。
 
-写文件时使用：
+验证：
 
-```text
-graph.yaml.tmp
-        ↓
-完整写入
-        ↓
-rename
-        ↓
-graph.yaml
-```
+- 状态派生和关系校验通过；
+- 来源错误、缺失来源和本地 overlay 状态不互相误判。
 
-避免程序异常导致 YAML 损坏。
+### 6. 后端 HTTP API
 
----
+交付：
 
-# 9. Phase 4：项目数据合并
+- Project 选择和读取；
+- snapshot；
+- refresh；
+- Conversation 读取；
+- 节点 overlay 编辑；
+- Edge 创建、编辑、删除；
+- ETag 和冲突错误；
+- 统一错误结构。
 
-实现：
+验证：
 
-```text
-Codex Conversations
-        +
-graph.yaml
-        ↓
-Merged Project Model
-```
+- API 契约测试覆盖成功、失败、冲突和 stale；
+- API 不允许 Project 根之外的文件访问。
 
-伪代码：
+### 7. Conversation List
 
-```python
-for conversation in codex_conversations:
+交付：
 
-    metadata = graph.nodes.get(conversation.id)
+- 来源元数据显示；
+- displayTitle；
+- 搜索；
+- 排序；
+- 标签、User status、archived、missing、unlinked 过滤；
+- Source unavailable/stale 提示。
 
-    merged.append(
-        merge(conversation, metadata)
-    )
-```
+验证：
 
-如果 graph.yaml 中存在 Codex 不存在的 ID：
+- 浏览器级 Dashboard 接缝覆盖 List 的筛选和选择行为。
 
-```text
-missing = true
-```
+### 8. Graph View
 
----
+交付：
 
-# 10. Phase 5：Conversation List
+- 节点显示；
+- 节点选择；
+- 缩放和平移；
+- 拖动和布局提交；
+- 节点详情编辑；
+- 关系创建、编辑和删除；
+- missing 占位节点；
+- Dangling edge。
 
-先实现左侧 Conversation List。
+验证：
 
-支持：
+- 不把 React Flow 内部对象作为持久化模型；
+- 所有修改通过 ProjectGraphService 和 HTTP 契约完成。
 
-```text
-搜索
-按创建时间排序
-按更新时间排序
-按标签过滤
-按状态过滤
-只看 Unlinked
-```
+### 9. Timeline View
 
-每一行至少展示：
+交付：
 
-```text
-Title
-Updated At
-Status
-Tags
-```
+- Observation range；
+- 用户时区；
+- Day/Week/Month；
+- 半开桶；
+- 起止相同点标记；
+- 无效时间警告；
+- Overlap count；
+- Timeline 与其他视图选择联动。
 
----
+验证：
 
-# 11. Unlinked 判断
+- 固定时钟 fixture 覆盖 DST、桶边界、零时长和无效范围。
 
-定义：
+### 10. 刷新与冲突交互
 
-```python
-linked_ids =
-{
-    edge.source
-    for edge in edges
-}
-∪
-{
-    edge.target
-    for edge in edges
-}
-```
+交付：
 
-如果：
+- dirty 状态；
+- 保存、丢弃、取消；
+- clean 刷新；
+- stale 来源；
+- ETag 冲突；
+- 重新加载、保存副本、明确覆盖。
 
-```text
-conversation.id not in linked_ids
-```
+验证：
 
-则：
+- 浏览器级场景覆盖每条分支；
+- 任何失败都不静默丢失用户修改。
 
-```text
-Unlinked = true
-```
+### 11. 安全与错误收口
 
----
+交付：
 
-# 12. Phase 6：Graph 基础实现
+- 回环监听检查；
+- Project 根和软链接检查；
+- app-server 进程退出处理；
+- 权限、磁盘满、锁竞争和只读文件错误；
+- 统一错误码和用户提示。
 
-使用 React Flow。
+验证：
 
-将：
+- 本地安全测试通过；
+- 所有错误均能区分 Source unavailable、missing、Graph 错误和用户输入错误。
 
-```text
-Conversation
-```
+### 12. 最终验收
 
-转换成：
+交付：
 
-```text
-React Flow Node
-```
+- SPEC.md 中的全部 MVP 用户故事有对应行为；
+- 三个测试接缝有自动化测试；
+- 无 Codex 原始数据写入；
+- 无 Cloud、远程或 Sub-agent 越界；
+- 文档、API、Graph overlay 和 UI 行为一致。
 
-将：
+## 里程碑
 
-```text
-graph.yaml edges
-```
+### Milestone 1：来源与 Project 基础
 
-转换成：
+完成运行时骨架、CodexThreadSource、单根 Project membership 和 health/snapshot 读取。
 
-```text
-React Flow Edge
-```
+验收重点：可以稳定得到一个 Complete source snapshot，并正确处理 Source unavailable。
 
-第一阶段完成：
+### Milestone 2：只读 Dashboard
 
-- Zoom；
-- Pan；
-- Node Drag；
-- Node Selection；
-- Edge Rendering。
+完成 Project 选择、Conversation List、只读 Graph、只读 Timeline 和三视图选择联动。
 
----
+验收重点：不写 Graph overlay 也能完整展示来源和 Observation range。
 
-# 13. Phase 7：Graph 编辑
+### Milestone 3：可编辑 Graph
 
-实现：
+完成节点 overlay、布局、人工关系、关系校验和 graph.yaml 提交式保存。
 
-```text
-拖节点
-        ↓
-更新 position
-        ↓
-保存 graph.yaml
-```
+验收重点：刷新后布局和人工关系保持，重复边和自环被拒绝。
 
-连接：
+### Milestone 4：持久化可靠性
 
-```text
-Source Handle
-        ↓
-拖到 Target Handle
-        ↓
-创建 Edge
-        ↓
-选择关系类型
-        ↓
-保存
-```
+完成 ETag、旁路锁、唯一临时文件、原子替换、损坏保护、备份和迁移处理。
 
----
+验收重点：双写者不会静默覆盖，YAML 错误不会破坏原文件。
 
-# 14. Edge 编辑 UI
+### Milestone 5：Timeline 与冲突交互
 
-点击 Edge 后打开侧栏：
+完成时间桶、Overlap count、dirty 刷新、外部冲突和 stale 来源体验。
 
-```text
-From
-To
-Type
-Label
+验收重点：时间边界和刷新分支符合 SPEC.md。
 
-[Save]
-[Delete]
-```
+### Milestone 6：最终质量门
 
-默认类型：
+完成三个测试接缝的自动化测试、路径安全测试、版本能力测试和文档一致性检查。
 
-```text
-continues
-depends_on
-implements
-reviewed_by
-fixes
-references
-related_to
-```
-
-同时允许：
-
-```text
-Custom
-```
-
----
-
-# 15. Phase 8：Node 编辑
-
-点击节点显示 Details Panel。
-
-允许修改：
-
-```text
-Title
-Tags
-Status
-Note
-Hidden
-```
-
-只读：
-
-```text
-Conversation ID
-Codex Title
-Created At
-Updated At
-cwd
-```
-
----
-
-# 16. 节点状态
-
-第一版可以定义：
-
-```text
-none
-active
-done
-blocked
-archived
-```
-
-状态只用于组织和过滤。
-
-不影响 Timeline。
-
----
-
-# 17. Phase 9：Timeline 数据模型
-
-对每个 Conversation：
-
-```typescript
-interface TimelineItem {
-    conversationId: string
-    start: Date
-    end: Date
-}
-```
-
-其中：
-
-```text
-start = createdAt
-end   = updatedAt
-```
-
----
-
-# 18. Timeline 坐标计算
-
-假设当前显示区间：
-
-```text
-T_min
-T_max
-```
-
-Conversation：
-
-```text
-start_i
-end_i
-```
-
-计算：
-
-\[
-x_{start}
-=
-\frac{start_i-T_{min}}
-{T_{max}-T_{min}}
-\]
-
-\[
-x_{end}
-=
-\frac{end_i-T_{min}}
-{T_{max}-T_{min}}
-\]
-
-Bar：
-
-```text
-left  = x_start
-width = x_end - x_start
-```
-
----
-
-# 19. Timeline 时间尺度
-
-第一版实现三种：
-
-```text
-Day
-Week
-Month
-```
-
-例如：
-
-```text
-[ Day ] [ Week ] [ Month ]
-```
-
-默认根据整个项目时间跨度自动选择。
-
----
-
-# 20. Phase 10：Activity Density
-
-将整个时间轴划分为时间桶：
-
-Day 模式：
-
-```text
-1 day / bucket
-```
-
-Week 模式：
-
-```text
-1 week / bucket
-```
-
-Month 模式：
-
-```text
-1 month / bucket
-```
-
-对每一个 bucket：
-
-```python
-count = number_of_conversations_overlapping(bucket)
-```
-
-重叠条件：
-
-```text
-conversation.start <= bucket.end
-
-AND
-
-conversation.end >= bucket.start
-```
-
----
-
-# 21. Phase 11：Graph / Timeline 联动
-
-建立统一：
-
-```text
-selectedConversationId
-```
-
-放入前端 Store。
-
-例如：
-
-```text
-Zustand
-```
-
-Graph 点击：
-
-```text
-setSelectedConversation(id)
-```
-
-Timeline 点击：
-
-```text
-setSelectedConversation(id)
-```
-
-Conversation List 点击：
-
-```text
-setSelectedConversation(id)
-```
-
-三个组件都订阅：
-
-```text
-selectedConversationId
-```
-
-因此：
-
-```text
-Conversation List
-Graph
-Timeline
-```
-
-天然联动。
-
----
-
-# 22. Phase 12：刷新机制
-
-增加：
-
-```text
-Refresh
-```
-
-按钮。
-
-刷新时：
-
-```text
-重新读取 Codex
-        ↓
-重新 merge graph.yaml
-        ↓
-发现新增 Conversation
-        ↓
-刷新 UI
-```
-
-第一版不需要实时监听。
-
----
-
-# 23. Phase 13：打开原始 Conversation
-
-如果 Codex 支持可稳定定位到某个 thread，应提供：
-
-```text
-Open in Codex
-```
-
-如果当前无法稳定跳转，则第一版保留：
-
-```text
-Conversation ID
-```
-
-及复制能力。
-
-此功能不能阻塞 MVP。
-
----
-
-# 24. Phase 14：异常处理
-
-必须处理：
-
-### graph.yaml 不存在
-
-自动创建：
-
-```yaml
-version: 1
-
-nodes: {}
-
-edges: []
-```
-
-### YAML 格式错误
-
-不得覆盖原文件。
-
-显示：
-
-```text
-graph.yaml parse failed
-```
-
-### Conversation 删除
-
-显示：
-
-```text
-Missing
-```
-
-### created_at = updated_at
-
-Timeline 至少绘制最小宽度的标记。
-
----
-
-# 25. Phase 15：UI 布局
-
-建议桌面端：
-
-```text
-┌─────────────────────────────────────────────────┐
-│ Project / Search / Filter / Refresh             │
-├─────────────┬───────────────────────────────────┤
-│             │                                   │
-│ Conversation│                                   │
-│ List        │             Graph                 │
-│             │                                   │
-│             │                                   │
-├─────────────┴───────────────────────────────────┤
-│                                               │
-│                  Timeline                     │
-│                                               │
-└─────────────────────────────────────────────────┘
-```
-
-Graph 应占主要空间。
-
-Timeline 高度保持适中。
-
----
-
-# 26. Phase 16：持久化策略
-
-不要每次鼠标移动都写文件。
-
-节点拖动时：
-
-```text
-drag
-drag
-drag
-drag
-drag end
-```
-
-只在：
-
-```text
-drag end
-```
-
-保存。
-
-文本编辑可以：
-
-```text
-Save
-```
-
-显式保存。
-
----
-
-# 27. Phase 17：测试
-
-后端测试：
-
-```text
-Codex conversation parser
-graph.yaml load
-graph.yaml save
-merge
-missing conversation
-unlinked calculation
-```
-
-前端测试重点：
-
-```text
-Graph selection
-Edge creation
-Edge deletion
-Node position update
-Timeline range calculation
-Graph / Timeline selection sync
-```
-
----
-
-# 28. 实现顺序
-
-严格建议按照以下顺序实现：
-
-```text
-1 Codex 数据读取
-        ↓
-2 graph.yaml
-        ↓
-3 数据 merge
-        ↓
-4 Conversation List
-        ↓
-5 Graph 只读展示
-        ↓
-6 Graph 编辑
-        ↓
-7 Node / Edge Metadata
-        ↓
-8 Timeline
-        ↓
-9 Activity Density
-        ↓
-10 Graph / Timeline 联动
-        ↓
-11 过滤 / 搜索
-        ↓
-12 UI 优化
-```
-
-不要一开始同时开发：
-
-```text
-Graph
-Timeline
-Codex Parser
-YAML
-各种过滤
-```
-
-否则调试成本会明显增加。
-
----
-
-# 29. 推荐开发里程碑
-
-## Milestone 1：Data Prototype
-
-目标：
-
-```text
-能够读取当前项目的所有 Conversation
-```
-
-输出简单 JSON。
-
----
-
-## Milestone 2：Graph Prototype
-
-目标：
-
-```text
-Conversation → React Flow Node
-```
-
-Graph 可以正常显示。
-
----
-
-## Milestone 3：Editable Graph
-
-目标：
-
-```text
-创建 Edge
-删除 Edge
-拖动 Node
-编辑 Node
-```
-
-并成功保存：
-
-```text
-.codex/graph.yaml
-```
-
----
-
-## Milestone 4：Timeline
-
-目标：
-
-自动生成：
-
-```text
-Conversation Activity Timeline
-+
-Active Conversation Count
-```
-
----
-
-## Milestone 5：Integrated Dashboard
-
-实现：
-
-```text
-Conversation List
-      ↕
-Graph
-      ↕
-Timeline
-```
-
-三者联动。
-
----
-
-# 30. MVP 完成后的下一阶段
-
-MVP 稳定后，再考虑：
-
-```text
-Task Group
-Conversation Group
-文档节点
-Git Commit 节点
-Branch 信息
-Worktree 信息
-Conversation 内容摘要
-关系模板
-Graph 子图
-多个 Graph Workspace
-项目统计
-```
-
-其中比较值得优先增加的是：
-
-```text
-Conversation Group
-```
-
-即允许多个 Conversation 被人工分组，但不改变：
-
-\[
-Conversation
-\]
-
-作为基础实体的设计。
+验收重点：另一名开发者可以只阅读 CONTEXT.md、ADR、SPEC.md 和 PLAN.md 独立完成实现。
