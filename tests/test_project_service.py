@@ -819,6 +819,31 @@ edges:
     )
 
 
+def test_conversation_connected_to_a_missing_endpoint_is_not_unlinked(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+edges:
+  - id: edge-1
+    source: present-id
+    target: missing-id
+    type: references
+""",
+    )
+    source = StubSource(ready(make_thread("present-id", project)))
+    service = ProjectGraphService(source)
+
+    service.select_project(str(project))
+    conversations = {conversation.id: conversation for conversation in service.snapshot().conversations}
+
+    assert conversations["present-id"].derived.missing is False
+    assert conversations["present-id"].derived.unlinked is False
+    assert conversations["missing-id"].derived.missing is True
+
+
 def test_graph_nodes_use_the_latest_source_title_after_refresh(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()

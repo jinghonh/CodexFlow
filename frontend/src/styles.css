@@ -205,6 +205,38 @@ h1 {
 .excluded-title strong { color: var(--orange); font-size: 10px; font-weight: 400; letter-spacing: 0.04em; text-transform: uppercase; }
 .excluded-list span { overflow-wrap: anywhere; }
 
+.filter-section {
+  margin-top: 48px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  padding: 22px 0 18px;
+  animation: rise-in 560ms ease 25ms both;
+}
+.filter-heading { display: flex; align-items: end; justify-content: space-between; gap: 24px; }
+.filter-heading .section-kicker { margin-bottom: 8px; }
+.filter-heading h2 { margin: 0; color: var(--paper); font: 400 clamp(28px, 3.5vw, 48px)/0.95 var(--serif); letter-spacing: -0.05em; }
+.filter-summary { display: flex; align-items: baseline; gap: 8px; color: var(--paper-dim); font-size: 10px; white-space: nowrap; }
+.filter-summary strong { color: var(--lime); font: 400 35px/1 var(--serif); }
+.filter-controls { display: grid; grid-template-columns: minmax(240px, 1.8fr) repeat(3, minmax(130px, 1fr)); gap: 12px; margin-top: 22px; align-items: end; }
+.filter-controls label { display: grid; gap: 7px; min-width: 0; }
+.filter-controls label span { color: var(--paper-dim); font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; }
+.filter-controls input, .filter-controls select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid rgba(231, 234, 223, 0.22);
+  border-radius: 0;
+  outline: 0;
+  background: var(--ink-soft);
+  color: var(--paper);
+  padding: 10px 11px;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.filter-controls input:focus, .filter-controls select:focus { border-color: var(--lime); box-shadow: 0 0 0 3px rgba(184, 226, 78, 0.13); }
+.filter-controls input::placeholder { color: #657066; }
+.filter-reset { align-self: end; border: 1px solid rgba(255, 139, 94, 0.48); background: transparent; color: var(--orange); padding: 10px 12px; font-size: 10px; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+.filter-reset:hover, .filter-reset:focus-visible { border-color: var(--orange); background: rgba(255, 139, 94, 0.09); outline: 0; transform: translateY(-2px); }
+.filter-caption { max-width: 900px; margin: 14px 0 0; color: #718074; font-size: 10px; line-height: 1.6; }
+
 .timeline-section {
   margin-top: 82px;
   animation: rise-in 560ms ease 45ms both;
@@ -635,6 +667,8 @@ code { display: block; margin-top: 8px; color: #748175; font-size: 10px; }
   .hero-copy h2 { font-size: clamp(55px, 16vw, 100px); }
   .project-card { box-shadow: 10px 10px 0 rgba(184, 226, 78, 0.10); }
   .relationship-layout { grid-template-columns: 1fr; }
+  .filter-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .filter-search { grid-column: 1 / -1; }
 }
 
 @media (max-width: 520px) {
@@ -649,4 +683,7 @@ code { display: block; margin-top: 8px; color: #748175; font-size: 10px; }
   .timeline-heading { align-items: flex-start; flex-direction: column; }
   .timeline-controls { align-items: stretch; justify-content: flex-start; }
   .timeline-timezone input { width: min(220px, 58vw); }
+  .filter-heading { align-items: flex-start; flex-direction: column; }
+  .filter-controls { grid-template-columns: 1fr; }
+  .filter-search { grid-column: auto; }
 }

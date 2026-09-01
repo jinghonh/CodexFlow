@@ -55,6 +55,18 @@ export interface ConversationOverlay {
 }
 
 export type UserStatus = "none" | "active" | "done" | "blocked";
+export type ConversationSort = "source" | "createdAt" | "updatedAt";
+
+export interface ConversationFilters {
+  search: string;
+  tag: string | null;
+  userStatus: UserStatus | "all";
+  archived: "all" | "active" | "archived";
+  missing: "all" | "present" | "missing";
+  unlinked: "all" | "linked" | "unlinked";
+  hidden: "all" | "visible" | "hidden";
+  sortBy: ConversationSort;
+}
 
 export interface NodeLayout {
   x: number;

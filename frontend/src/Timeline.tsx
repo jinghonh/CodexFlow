@@ -95,6 +95,13 @@ export function TimelineView({
     const conversation = conversationById.get(range.conversationId);
     return range.valid && conversation !== undefined && !conversation.derived.missing;
   });
+  const visibleWarnings = timeline.warnings.filter((warning) =>
+    conversationById.has(warning.conversationId),
+  );
+  const visibleBuckets = timeline.buckets.map((bucket) => ({
+    ...bucket,
+    overlapCount: countVisibleOverlaps(bucket, timeline.ranges, conversationById),
+  }));
   const gridTemplateColumns = `minmax(210px, 0.42fr) repeat(${timeline.buckets.length}, minmax(132px, 1fr))`;
   const trackTemplateColumns = `repeat(${timeline.buckets.length}, minmax(132px, 1fr))`;
 
@@ -159,14 +166,14 @@ export function TimelineView({
         </p>
       )}
 
-      {timeline.warnings.length > 0 && (
+      {visibleWarnings.length > 0 && (
         <div className="timeline-warning" role="alert" aria-label="Timeline warnings">
           <div>
             <strong>Invalid observation range</strong>
-            <span>{timeline.warnings.length} source record{timeline.warnings.length === 1 ? "" : "s"} will not be drawn or counted.</span>
+            <span>{visibleWarnings.length} source record{visibleWarnings.length === 1 ? "" : "s"} will not be drawn or counted.</span>
           </div>
           <ul>
-            {timeline.warnings.map((warning) => {
+            {visibleWarnings.map((warning) => {
               const conversation = conversationById.get(warning.conversationId);
               return (
                 <li key={warning.conversationId}>
@@ -187,7 +194,7 @@ export function TimelineView({
         <div className="timeline-scroll" aria-label="Timeline buckets">
           <div className="timeline-grid" style={{ gridTemplateColumns }}>
             <div className="timeline-axis-label">Conversation / range</div>
-            {timeline.buckets.map((bucket) => (
+            {visibleBuckets.map((bucket) => (
               <div
                 key={bucket.start}
                 className="timeline-bucket"
@@ -213,6 +220,8 @@ export function TimelineView({
                   <button
                     type="button"
                     className={`timeline-row-label ${conversation.id === selectedId ? "is-selected" : ""}`}
+                    aria-pressed={conversation.id === selectedId}
+                    data-conversation-id={conversation.id}
                     onClick={() => onSelect(conversation.id)}
                   >
                     <strong>{conversation.displayTitle}</strong>
@@ -233,6 +242,7 @@ export function TimelineView({
                       type="button"
                       className={`timeline-bar ${range.isPoint ? "is-point" : ""} ${conversation.id === selectedId ? "is-selected" : ""}`}
                       style={{ gridColumn: `${columns.start} / ${columns.end}` }}
+                      data-conversation-id={conversation.id}
                       aria-label={`${conversation.displayTitle} observation ${rangeLabel}`}
                       title={`${formatTimelineTime(range.start, timeline.timezone)} → ${formatTimelineTime(range.end, timeline.timezone)}`}
                       onClick={() => onSelect(conversation.id)}
@@ -257,26 +267,46 @@ function rangeColumns(
   range: ObservationRange,
   timeline: TimelineSnapshot,
 ): { start: number; end: number } | null {
-  if (!range.start || !range.end) return null;
-  const start = Date.parse(range.start);
-  const end = Date.parse(range.end);
-  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-
   let first = -1;
   let last = -1;
   timeline.buckets.forEach((bucket, index) => {
-    const bucketStart = Date.parse(bucket.start);
-    const bucketEnd = Date.parse(bucket.end);
-    const intersects = range.isPoint
-      ? start >= bucketStart && start < bucketEnd
-      : start < bucketEnd && end > bucketStart;
-    if (intersects) {
+    if (rangeIntersectsBucket(range, bucket)) {
       if (first === -1) first = index;
       last = index;
     }
   });
 
   return first === -1 ? null : { start: first + 1, end: last + 2 };
+}
+
+function countVisibleOverlaps(
+  bucket: TimelineSnapshot["buckets"][number],
+  ranges: ObservationRange[],
+  conversations: Map<string, Conversation>,
+): number {
+  const counted = new Set<string>();
+  ranges.forEach((range) => {
+    if (!range.valid || counted.has(range.conversationId)) return;
+    const conversation = conversations.get(range.conversationId);
+    if (!conversation || conversation.derived.missing) return;
+    if (rangeIntersectsBucket(range, bucket)) counted.add(range.conversationId);
+  });
+  return counted.size;
+}
+
+function rangeIntersectsBucket(
+  range: ObservationRange,
+  bucket: TimelineSnapshot["buckets"][number],
+): boolean {
+  if (!range.valid || !range.start || !range.end) return false;
+  const start = Date.parse(range.start);
+  const end = Date.parse(range.end);
+  const bucketStart = Date.parse(bucket.start);
+  const bucketEnd = Date.parse(bucket.end);
+  if (![start, end, bucketStart, bucketEnd].every(Number.isFinite)) return false;
+  return range.isPoint
+    ? start >= bucketStart && start < bucketEnd
+    : start < bucketEnd && end > bucketStart;
 }
 
 function capitalize(value: string): string {

@@ -144,6 +144,35 @@ function jsonResponse(body: unknown): Response {
   });
 }
 
+function snapshotWithTimeline(base: DashboardSnapshot = snapshot): DashboardSnapshot {
+  return {
+    ...base,
+    timeline: {
+      granularity: "day",
+      timezone: "UTC",
+      ranges: base.conversations
+        .filter((conversation) => !conversation.derived.missing)
+        .map((conversation, index) => ({
+          conversationId: conversation.id,
+          start: `2024-01-0${index + 1}T00:00:00Z`,
+          end: `2024-01-0${index + 1}T01:00:00Z`,
+          valid: true,
+          isPoint: false,
+          error: null,
+        })),
+      buckets: [
+        {
+          start: "2024-01-01T00:00:00Z",
+          end: "2024-01-03T00:00:00Z",
+          label: "2024-01-01 → 2024-01-02",
+          overlapCount: base.conversations.filter((conversation) => !conversation.derived.missing).length,
+        },
+      ],
+      warnings: [],
+    },
+  };
+}
+
 describe("Dashboard conversation list", () => {
   it("shows loading, then active and archived source metadata after project selection", async () => {
     const user = userEvent.setup();
@@ -813,5 +842,173 @@ describe("Dashboard timeline", () => {
         timezone: "Asia/Shanghai",
       });
     });
+  });
+});
+
+describe("Dashboard selection and filters", () => {
+  it("keeps one selected Conversation ID highlighted in List, Graph, and Timeline", async () => {
+    const user = userEvent.setup();
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(snapshotWithTimeline()) });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const list = within(await screen.findByRole("table", { name: "Conversation list" }));
+    const graph = within(screen.getByRole("region", { name: "Conversation graph" }));
+    const timeline = within(screen.getByRole("region", { name: "Conversation timeline" }));
+    const activeRow = list.getByText("active-id").closest("tr");
+    const activeGraphNode = graph.getByRole("button", { name: /Map the local runtime/ });
+    const activeTimelineRow = timeline.getAllByRole("button", { name: /Map the local runtime/ })[0];
+
+    await user.click(list.getByText("Map the local runtime"));
+    expect(activeRow).toHaveAttribute("aria-selected", "true");
+    expect(activeGraphNode).toHaveAttribute("aria-pressed", "true");
+    expect(activeTimelineRow).toHaveAttribute("aria-pressed", "true");
+
+    const archivedGraphNode = graph.getByRole("button", { name: /Archive the first pass/ });
+    await user.click(archivedGraphNode);
+    expect(list.getByText("archived-id").closest("tr")).toHaveAttribute("aria-selected", "true");
+    expect(activeRow).toHaveAttribute("aria-selected", "false");
+    expect(archivedGraphNode).toHaveAttribute("aria-pressed", "true");
+    expect(activeGraphNode).toHaveAttribute("aria-pressed", "false");
+
+    await user.click(activeTimelineRow);
+    expect(activeRow).toHaveAttribute("aria-selected", "true");
+    expect(activeGraphNode).toHaveAttribute("aria-pressed", "true");
+    expect(activeTimelineRow).toHaveAttribute("aria-pressed", "true");
+    expect(archivedGraphNode).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("applies one search projection to List, Graph, and Timeline without changing IDs", async () => {
+    const user = userEvent.setup();
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(snapshotWithTimeline()) });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const filters = await screen.findByRole("region", { name: "Conversation filters" });
+    await user.type(within(filters).getByRole("searchbox", { name: "Search conversations" }), "archive");
+
+    const list = within(screen.getByRole("table", { name: "Conversation list" }));
+    const graph = within(screen.getByRole("region", { name: "Conversation graph" }));
+    const timeline = within(screen.getByRole("region", { name: "Conversation timeline" }));
+    expect(list.getByText("archived-id")).toBeInTheDocument();
+    expect(list.queryByText("active-id")).not.toBeInTheDocument();
+    expect(graph.getByRole("button", { name: /Archive the first pass/ })).toBeInTheDocument();
+    expect(graph.queryByRole("button", { name: /Map the local runtime/ })).not.toBeInTheDocument();
+    expect(timeline.getAllByRole("button", { name: /Archive the first pass/ }).length).toBeGreaterThan(0);
+    expect(timeline.queryByRole("button", { name: /Map the local runtime/ })).not.toBeInTheDocument();
+    expect(timeline.getByLabelText(/1 overlapping conversations/)).toBeInTheDocument();
+  });
+
+  it("filters tag, User status, archived, missing, unlinked, and hidden states", async () => {
+    const user = userEvent.setup();
+    const active = {
+      ...snapshot.conversations[0],
+      overlay: { ...snapshot.conversations[0].overlay, tags: ["focus"], status: "done" as const, hidden: true },
+      derived: { ...snapshot.conversations[0].derived, unlinked: false },
+    };
+    const archived = {
+      ...snapshot.conversations[1],
+      overlay: { ...snapshot.conversations[1].overlay, tags: ["archive"], status: "active" as const },
+      codex: { ...snapshot.conversations[1].codex, archived: true },
+    };
+    const missing = {
+      ...active,
+      id: "missing-id",
+      displayTitle: "Orphaned work",
+      codex: { ...active.codex, title: null, preview: "", createdAt: null, updatedAt: null, cwd: "" },
+      overlay: { ...active.overlay, tags: ["history"], hidden: false },
+      derived: { ...active.derived, missing: true, unlinked: true, validObservationRange: false },
+    };
+    const filterSnapshot = snapshotWithTimeline({
+      ...snapshot,
+      graph: {
+        ...snapshot.graph,
+        nodes: [
+          { id: active.id, displayTitle: active.displayTitle, missing: false, hidden: true, layout: null },
+          { id: archived.id, displayTitle: archived.displayTitle, missing: false, hidden: false, layout: null },
+          { id: missing.id, displayTitle: missing.displayTitle, missing: true, hidden: false, layout: null },
+        ],
+      },
+      conversations: [active, archived, missing],
+    });
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(filterSnapshot) });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const filters = await screen.findByRole("region", { name: "Conversation filters" });
+    const list = () => within(screen.getByRole("table", { name: "Conversation list" }));
+
+    await user.selectOptions(within(filters).getByLabelText("Filter by tag"), "focus");
+    expect(list().getByText("active-id")).toBeInTheDocument();
+    expect(list().queryByText("archived-id")).not.toBeInTheDocument();
+    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+
+    await user.selectOptions(within(filters).getByLabelText("Filter by User status"), "done");
+    expect(list().getByText("active-id")).toBeInTheDocument();
+    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+
+    await user.selectOptions(within(filters).getByLabelText("Filter by archived"), "archived");
+    expect(list().getByText("archived-id")).toBeInTheDocument();
+    expect(list().queryByText("active-id")).not.toBeInTheDocument();
+    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+
+    await user.selectOptions(within(filters).getByLabelText("Filter by missing"), "missing");
+    expect(list().getByText("missing-id")).toBeInTheDocument();
+    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+
+    await user.selectOptions(within(filters).getByLabelText("Filter by unlinked"), "unlinked");
+    expect(list().getByText("archived-id")).toBeInTheDocument();
+    expect(list().queryByText("missing-id")).not.toBeInTheDocument();
+    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+
+    await user.selectOptions(within(filters).getByLabelText("Filter by hidden"), "hidden");
+    expect(list().getByText("active-id")).toBeInTheDocument();
+    expect(list().queryByText("archived-id")).not.toBeInTheDocument();
+
+    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+    await user.selectOptions(within(filters).getByLabelText("Sort conversations"), "updatedAt");
+    const sortedRows = list().getAllByRole("row").slice(1);
+    expect(sortedRows[0]).toHaveAttribute("data-conversation-id", "archived-id");
+    expect(sortedRows[1]).toHaveAttribute("data-conversation-id", "active-id");
+  });
+
+  it("projects Timeline overlap counts and warnings with the same filters", async () => {
+    const user = userEvent.setup();
+    const baseTimeline = snapshotWithTimeline();
+    const filteredTimelineSnapshot: DashboardSnapshot = {
+      ...baseTimeline,
+      timeline: {
+        ...baseTimeline.timeline!,
+        warnings: [
+          {
+            conversationId: "active-id",
+            code: "invalid_observation_range",
+            message: "createdAt invalid",
+          },
+        ],
+      },
+    };
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(filteredTimelineSnapshot) });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const timeline = await screen.findByRole("region", { name: "Conversation timeline" });
+    expect(within(timeline).getByRole("alert", { name: "Timeline warnings" })).toBeInTheDocument();
+    expect(within(timeline).getByLabelText(/2 overlapping conversations/)).toBeInTheDocument();
+
+    const filters = screen.getByRole("region", { name: "Conversation filters" });
+    await user.type(within(filters).getByRole("searchbox", { name: "Search conversations" }), "archive");
+
+    expect(within(timeline).queryByRole("alert", { name: "Timeline warnings" })).not.toBeInTheDocument();
+    expect(within(timeline).getByLabelText(/1 overlapping conversations/)).toBeInTheDocument();
   });
 });

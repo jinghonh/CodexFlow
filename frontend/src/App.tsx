@@ -2,9 +2,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, createApi } from "./api";
 import type { DashboardApi } from "./api";
+import {
+  DEFAULT_CONVERSATION_FILTERS,
+  filterConversations,
+  isDefaultConversationFilters,
+} from "./filters";
 import { TimelineView } from "./Timeline";
 import type {
   Conversation,
+  ConversationFilters,
   DashboardSnapshot,
   ExcludedConversation,
   GraphEdge,
@@ -34,6 +40,7 @@ export function App({ api }: AppProps) {
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<ApiError | Error | null>(null);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [filters, setFilters] = useState<ConversationFilters>(DEFAULT_CONVERSATION_FILTERS);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState<string | null>(null);
 
@@ -64,6 +71,7 @@ export function App({ api }: AppProps) {
     setTimelineError(null);
     setSnapshot(null);
     setSelectedConversationId(null);
+    setFilters(DEFAULT_CONVERSATION_FILTERS);
     try {
       const selected = await apiClient.selectProject(trimmedPath);
       setProject(selected.project);
@@ -146,6 +154,24 @@ export function App({ api }: AppProps) {
     snapshot?.source.status === "incompatible";
   const sourceStale = snapshot?.source.status === "stale";
   const runtimeLabel = health ? "Local runtime ready" : error && !project ? "Local runtime unavailable" : "Checking local runtime";
+  const filteredConversations = useMemo(
+    () => filterConversations(snapshot?.conversations ?? [], filters),
+    [filters, snapshot?.conversations],
+  );
+  const filteredConversationIds = useMemo(
+    () => {
+      const ids = new Set(filteredConversations.map(({ id }) => id));
+      if (isDefaultConversationFilters(filters)) {
+        snapshot?.graph.nodes.forEach((node) => ids.add(node.id));
+      }
+      return ids;
+    },
+    [filteredConversations, filters, snapshot?.graph.nodes],
+  );
+  const availableTags = useMemo(
+    () => Array.from(new Set((snapshot?.conversations ?? []).flatMap(({ overlay }) => overlay.tags))).sort(),
+    [snapshot?.conversations],
+  );
 
   return (
     <main className="app-shell">
@@ -243,9 +269,17 @@ export function App({ api }: AppProps) {
 
       {snapshot && !sourceUnavailable && (
         <>
+          <ConversationFilterBar
+            filters={filters}
+            tags={availableTags}
+            visibleCount={filteredConversations.length}
+            totalCount={snapshot.conversations.length}
+            onChange={(changes) => setFilters((current) => ({ ...current, ...changes }))}
+            onReset={() => setFilters(DEFAULT_CONVERSATION_FILTERS)}
+          />
           <TimelineView
             timeline={snapshot.timeline}
-            conversations={snapshot.conversations}
+            conversations={filteredConversations}
             selectedId={selectedConversationId}
             loading={timelineLoading}
             error={timelineError}
@@ -255,6 +289,7 @@ export function App({ api }: AppProps) {
           <ConversationGraph
             nodes={snapshot.graph.nodes}
             edges={snapshot.graph.edges}
+            visibleIds={filteredConversationIds}
             onCreateEdge={handleEdgeCreate}
             onUpdateEdge={handleEdgeUpdate}
             onDeleteEdge={handleEdgeDelete}
@@ -263,7 +298,7 @@ export function App({ api }: AppProps) {
             onLayoutChange={(conversationId, layout) => handleNodeUpdate(conversationId, { layout })}
           />
           <ConversationList
-            conversations={snapshot.conversations}
+            conversations={filteredConversations}
             selectedId={selectedConversationId}
             onSelect={setSelectedConversationId}
           />
@@ -346,9 +381,143 @@ function membershipReasonLabel(reason: string): string {
   return labels[reason] ?? "Outside the selected Project boundary";
 }
 
+function ConversationFilterBar({
+  filters,
+  tags,
+  visibleCount,
+  totalCount,
+  onChange,
+  onReset,
+}: {
+  filters: ConversationFilters;
+  tags: string[];
+  visibleCount: number;
+  totalCount: number;
+  onChange: (changes: Partial<ConversationFilters>) => void;
+  onReset: () => void;
+}) {
+  return (
+    <section className="filter-section" aria-label="Conversation filters">
+      <div className="filter-heading">
+        <div>
+          <p className="section-kicker">One projection / three views</p>
+          <h2>Filter the field</h2>
+        </div>
+        <div className="filter-summary" aria-live="polite">
+          <strong>{String(visibleCount).padStart(2, "0")}</strong>
+          <span>of {totalCount} shown</span>
+        </div>
+      </div>
+      <div className="filter-controls">
+        <label className="filter-search">
+          <span>Search conversations</span>
+          <input
+            type="search"
+            value={filters.search}
+            onChange={(event) => onChange({ search: event.target.value })}
+            placeholder="Title, preview, or Conversation ID"
+            autoComplete="off"
+          />
+        </label>
+        <FilterSelect
+          label="Filter by tag"
+          value={filters.tag ?? ""}
+          options={[{ value: "", label: "All tags" }, ...tags.map((tag) => ({ value: tag, label: tag }))]}
+          onChange={(value) => onChange({ tag: value || null })}
+        />
+        <FilterSelect
+          label="Filter by User status"
+          value={filters.userStatus}
+          options={[
+            { value: "all", label: "All User status" },
+            { value: "none", label: "None" },
+            { value: "active", label: "Active" },
+            { value: "done", label: "Done" },
+            { value: "blocked", label: "Blocked" },
+          ]}
+          onChange={(value) => onChange({ userStatus: value as ConversationFilters["userStatus"] })}
+        />
+        <FilterSelect
+          label="Filter by archived"
+          value={filters.archived}
+          options={[
+            { value: "all", label: "All archive states" },
+            { value: "active", label: "Active only" },
+            { value: "archived", label: "Archived only" },
+          ]}
+          onChange={(value) => onChange({ archived: value as ConversationFilters["archived"] })}
+        />
+        <FilterSelect
+          label="Filter by missing"
+          value={filters.missing}
+          options={[
+            { value: "all", label: "All source states" },
+            { value: "present", label: "Present only" },
+            { value: "missing", label: "Missing only" },
+          ]}
+          onChange={(value) => onChange({ missing: value as ConversationFilters["missing"] })}
+        />
+        <FilterSelect
+          label="Filter by unlinked"
+          value={filters.unlinked}
+          options={[
+            { value: "all", label: "All link states" },
+            { value: "linked", label: "Linked only" },
+            { value: "unlinked", label: "Unlinked only" },
+          ]}
+          onChange={(value) => onChange({ unlinked: value as ConversationFilters["unlinked"] })}
+        />
+        <FilterSelect
+          label="Filter by hidden"
+          value={filters.hidden}
+          options={[
+            { value: "all", label: "All visibility states" },
+            { value: "visible", label: "Visible only" },
+            { value: "hidden", label: "Hidden only" },
+          ]}
+          onChange={(value) => onChange({ hidden: value as ConversationFilters["hidden"] })}
+        />
+        <FilterSelect
+          label="Sort conversations"
+          value={filters.sortBy}
+          options={[
+            { value: "source", label: "Source order" },
+            { value: "updatedAt", label: "Updated · newest first" },
+            { value: "createdAt", label: "Created · newest first" },
+          ]}
+          onChange={(value) => onChange({ sortBy: value as ConversationFilters["sortBy"] })}
+        />
+        <button type="button" className="filter-reset" onClick={onReset}>Clear filters</button>
+      </div>
+      <p className="filter-caption">
+        Search and filters keep the source Conversation ID intact. Hidden is a Graph display state; hidden Conversations remain available in List and Timeline.
+      </p>
+    </section>
+  );
+}
+
+interface FilterSelectProps {
+  label: string;
+  value: string;
+  options: Array<{ value: string; label: string }>;
+  onChange: (value: string) => void;
+}
+
+function FilterSelect({ label, value, options, onChange }: FilterSelectProps) {
+  return (
+    <label>
+      <span>{label}</span>
+      <select value={value} onChange={(event) => onChange(event.target.value)}>
+        {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+    </label>
+  );
+}
+
 interface ConversationGraphProps {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  visibleIds: ReadonlySet<string>;
   selectedId: string | null;
   onSelect: (id: string) => void;
   onLayoutChange: (id: string, layout: NodeLayout) => Promise<void>;
@@ -379,6 +548,7 @@ interface NodeDragState {
 function ConversationGraph({
   nodes,
   edges,
+  visibleIds,
   selectedId,
   onSelect,
   onLayoutChange,
@@ -394,7 +564,11 @@ function ConversationGraph({
   const panOrigin = useRef<PanOrigin | null>(null);
   const nodeDrag = useRef<NodeDragState | null>(null);
   const suppressClick = useRef(false);
-  const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes]);
+  const filteredNodes = useMemo(
+    () => nodes.filter((node) => visibleIds.has(node.id)),
+    [nodes, visibleIds],
+  );
+  const visibleNodes = useMemo(() => filteredNodes.filter((node) => !node.hidden), [filteredNodes]);
   const positions = useMemo(
     () => {
       const next = new Map(visibleNodes.map((node, index) => [node.id, graphPosition(node, index)]));
@@ -548,6 +722,7 @@ function ConversationGraph({
                   type="button"
                   className={`graph-node ${node.missing ? "is-missing" : ""} ${node.id === selectedId ? "is-selected" : ""}`}
                   style={{ left: point.x, top: point.y }}
+                  data-conversation-id={node.id}
                   aria-label={`Conversation ${node.displayTitle} (${node.id})`}
                   aria-pressed={node.id === selectedId}
                   onMouseDown={(event) => {
@@ -914,6 +1089,7 @@ function ConversationRow({ conversation, selected, onSelect }: ConversationRowPr
     <tr
       className={selected ? "is-selected" : ""}
       aria-selected={selected}
+      data-conversation-id={conversation.id}
       tabIndex={0}
       onClick={() => onSelect(conversation.id)}
       onKeyDown={(event) => {
