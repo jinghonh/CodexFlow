@@ -61,6 +61,28 @@ class Conversation:
 
 
 @dataclass(frozen=True)
+class ExcludedConversation:
+    """Source metadata explaining why a Thread is outside the selected Project."""
+
+    id: str
+    cwd: str
+    resolved_cwd: str | None
+    git_root: str | None
+    worktree_root: str | None
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "cwd": self.cwd,
+            "resolvedCwd": self.resolved_cwd,
+            "gitRoot": self.git_root,
+            "worktreeRoot": self.worktree_root,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
 class GraphSummary:
     etag: str = "absent"
     file_status: str = "not_loaded"
@@ -98,6 +120,7 @@ class DashboardSnapshot:
     source_error: dict[str, Any] | None
     graph: GraphSummary
     conversations: tuple[Conversation, ...]
+    excluded_conversations: tuple[ExcludedConversation, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -114,6 +137,9 @@ class DashboardSnapshot:
                 "edges": list(self.graph.edges),
             },
             "conversations": [conversation.to_dict() for conversation in self.conversations],
+            "excludedConversations": [
+                conversation.to_dict() for conversation in self.excluded_conversations
+            ],
         }
 
 

@@ -68,6 +68,15 @@ export interface Conversation {
   derived: DerivedConversationState;
 }
 
+export interface ExcludedConversation {
+  id: string;
+  cwd: string;
+  resolvedCwd: string | null;
+  gitRoot: string | null;
+  worktreeRoot: string | null;
+  reason: string;
+}
+
 export interface DashboardSnapshot {
   project: ProjectView;
   source: {
@@ -78,4 +87,5 @@ export interface DashboardSnapshot {
   };
   graph: { etag: string; fileStatus: string; edges: unknown[] };
   conversations: Conversation[];
+  excludedConversations: ExcludedConversation[];
 }

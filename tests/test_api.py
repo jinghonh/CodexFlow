@@ -81,6 +81,40 @@ async def test_http_api_selects_project_and_returns_source_conversations(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_http_snapshot_explains_source_threads_excluded_by_project_membership(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    inside = project / "src"
+    outside = tmp_path / "other-project"
+    inside.mkdir(parents=True)
+    outside.mkdir()
+    source = ApiSource(ready(thread("inside", inside), thread("outside", outside)))
+    app = create_app(source=source)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        selected = await client.post("/api/project/select", json={"path": str(project)})
+        snapshot = await client.get("/api/snapshot")
+
+    assert selected.status_code == 200
+    assert snapshot.status_code == 200
+    body = snapshot.json()
+    assert [item["id"] for item in body["conversations"]] == ["inside"]
+    assert body["excludedConversations"] == [
+        {
+            "id": "outside",
+            "cwd": str(outside),
+            "resolvedCwd": str(outside.resolve()),
+            "gitRoot": None,
+            "worktreeRoot": None,
+            "reason": "outside_project",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_http_runtime_serves_the_built_dashboard_at_root() -> None:
     app = create_app(source=ApiSource(ready()))
 

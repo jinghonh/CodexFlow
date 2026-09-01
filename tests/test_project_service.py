@@ -44,6 +44,31 @@ class StubSource:
         return self.result
 
 
+class ProjectBoundGitResolver:
+    def __init__(self, project: Path) -> None:
+        self.project = project.resolve()
+        self.paths: list[Path] = []
+
+    def root_for(self, path: Path) -> Path | None:
+        resolved = path.resolve()
+        self.paths.append(resolved)
+        try:
+            resolved.relative_to(self.project)
+        except ValueError as exc:
+            raise AssertionError("git resolution escaped the selected Project") from exc
+        return None
+
+
+class FlakyGitResolver:
+    def __init__(self, project: Path) -> None:
+        self.project = project.resolve()
+
+    def root_for(self, path: Path) -> Path | None:
+        if path.resolve() == self.project:
+            return None
+        raise TimeoutError("git resolver timed out")
+
+
 def ready(*threads: CodexThread) -> SourceReadResult:
     return SourceReadResult(
         status="ready",
@@ -144,6 +169,27 @@ def test_git_project_excludes_a_nested_independent_repository(tmp_path: Path) ->
 
     assert service.project_view().is_git_project is True
     assert [conversation.id for conversation in snapshot.conversations] == ["regular"]
+    assert snapshot.excluded_conversations[0].id == "nested"
+    assert snapshot.excluded_conversations[0].reason == "different_git_root"
+
+
+def test_non_git_project_also_excludes_a_nested_independent_repository(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    regular = project / "src"
+    nested = project / "vendor"
+    regular.mkdir(parents=True)
+    nested.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(nested)], check=True)
+    service = ProjectGraphService(
+        StubSource(ready(make_thread("regular", regular), make_thread("nested", nested)))
+    )
+
+    selected = service.select_project(str(project))
+    snapshot = service.snapshot()
+
+    assert selected.is_git_project is False
+    assert [conversation.id for conversation in snapshot.conversations] == ["regular"]
+    assert snapshot.excluded_conversations[0].reason == "nested_git_repository"
 
 
 def test_service_treats_a_symlink_alias_as_the_same_project_and_ignores_broken_cwd(
@@ -167,10 +213,94 @@ def test_service_treats_a_symlink_alias_as_the_same_project_and_ignores_broken_c
     service.select_project(str(alias))
     snapshot = service.snapshot()
 
+    selected = service.project_view()
+    assert selected.original_path == str(alias)
+    assert selected.real_path == str(project.resolve())
     assert [conversation.id for conversation in snapshot.conversations] == [
         "through-real-path",
         "through-alias",
     ]
+
+
+def test_snapshot_explains_excluded_source_paths_without_reading_them(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    inside = project / "src"
+    outside = tmp_path / "project-sibling"
+    outside_file = tmp_path / "private.txt"
+    escape = project / "escape"
+    broken_cwd = project / "broken-cwd"
+    escape_target = tmp_path / "escape-target"
+    inside.mkdir(parents=True)
+    outside.mkdir()
+    escape_target.mkdir()
+    escape.symlink_to(escape_target, target_is_directory=True)
+    outside_file.write_text("private outside content", encoding="utf-8")
+    broken_cwd.symlink_to(project / "does-not-exist", target_is_directory=True)
+    source = StubSource(
+        ready(
+            make_thread("inside", inside),
+            make_thread("outside", outside),
+            make_thread("outside-file", outside_file),
+            make_thread("symlink-escape", escape),
+            make_thread("broken", broken_cwd),
+        )
+    )
+    service = ProjectGraphService(source)
+
+    service.select_project(str(project))
+    snapshot = service.snapshot()
+
+    excluded = {item.id: item for item in snapshot.excluded_conversations}
+    assert [conversation.id for conversation in snapshot.conversations] == ["inside"]
+    assert excluded["outside"].cwd == str(outside)
+    assert excluded["outside"].resolved_cwd == str(outside.resolve())
+    assert excluded["outside"].reason == "outside_project"
+    assert excluded["outside-file"].resolved_cwd == str(outside_file.resolve())
+    assert excluded["outside-file"].reason == "outside_project"
+    assert excluded["symlink-escape"].resolved_cwd == str(escape_target.resolve())
+    assert excluded["symlink-escape"].reason == "outside_project"
+    assert excluded["broken"].cwd == str(broken_cwd)
+    assert excluded["broken"].resolved_cwd is None
+    assert excluded["broken"].reason == "unresolvable_cwd"
+    assert "private outside content" not in str(snapshot.to_dict())
+
+
+def test_snapshot_never_resolves_git_metadata_for_a_cwd_outside_project(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    inside = project / "src"
+    outside = tmp_path / "outside"
+    inside.mkdir(parents=True)
+    outside.mkdir()
+    resolver = ProjectBoundGitResolver(project)
+    service = ProjectGraphService(
+        StubSource(ready(make_thread("inside", inside), make_thread("outside", outside))),
+        git_resolver=resolver,
+    )
+
+    service.select_project(str(project))
+    snapshot = service.snapshot()
+
+    assert [conversation.id for conversation in snapshot.conversations] == ["inside"]
+    assert all(path.is_relative_to(project.resolve()) for path in resolver.paths)
+
+
+def test_git_resolution_failure_does_not_allow_a_cwd_into_an_unknown_repository(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    inside = project / "src"
+    inside.mkdir(parents=True)
+    resolver = FlakyGitResolver(project)
+    service = ProjectGraphService(
+        StubSource(ready(make_thread("unknown-git", inside))),
+        git_resolver=resolver,
+    )
+
+    service.select_project(str(project))
+    snapshot = service.snapshot()
+
+    assert snapshot.conversations == ()
+    assert snapshot.excluded_conversations[0].reason == "git_root_unresolvable"
 
 
 def test_service_does_not_interpret_a_relative_cwd_as_a_project_membership(
@@ -188,6 +318,7 @@ def test_service_does_not_interpret_a_relative_cwd_as_a_project_membership(
     snapshot = service.snapshot()
 
     assert snapshot.conversations == ()
+    assert snapshot.excluded_conversations[0].reason == "cwd_not_absolute"
 
 
 def test_service_keeps_a_git_worktree_separate_from_its_main_worktree(tmp_path: Path) -> None:
@@ -212,7 +343,7 @@ def test_service_keeps_a_git_worktree_separate_from_its_main_worktree(tmp_path: 
         ],
         check=True,
     )
-    worktree = tmp_path / "worktree"
+    worktree = repository / "worktree"
     subprocess.run(
         ["git", "-C", str(repository), "worktree", "add", "--quiet", "-b", "fixture-worktree", str(worktree)],
         check=True,
@@ -229,3 +360,21 @@ def test_service_keeps_a_git_worktree_separate_from_its_main_worktree(tmp_path: 
     snapshot = service.snapshot()
 
     assert [conversation.id for conversation in snapshot.conversations] == ["main-worktree"]
+    assert snapshot.excluded_conversations[0].reason == "different_git_root"
+
+    worktree_service = ProjectGraphService(
+        StubSource(
+            ready(
+                make_thread("main-worktree", repository),
+                make_thread("independent-worktree", worktree),
+            )
+        )
+    )
+    selected_worktree = worktree_service.select_project(str(worktree))
+    worktree_snapshot = worktree_service.snapshot()
+
+    assert selected_worktree.worktree_root == str(worktree.resolve())
+    assert [conversation.id for conversation in worktree_snapshot.conversations] == [
+        "independent-worktree"
+    ]
+    assert worktree_snapshot.excluded_conversations[0].reason == "outside_project"

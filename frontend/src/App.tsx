@@ -2,7 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 
 import { ApiError, createApi } from "./api";
 import type { DashboardApi } from "./api";
-import type { Conversation, DashboardSnapshot, HealthResponse, ProjectView } from "./types";
+import type {
+  Conversation,
+  DashboardSnapshot,
+  ExcludedConversation,
+  HealthResponse,
+  ProjectView,
+} from "./types";
 
 interface AppProps {
   api?: DashboardApi;
@@ -111,8 +117,15 @@ export function App({ api }: AppProps) {
           <div>
             <span className="ribbon-label">SELECTED PROJECT</span>
             <strong>{project.realPath}</strong>
+            {project.originalPath !== project.realPath && (
+              <span className="project-alias">alias · {project.originalPath}</span>
+            )}
           </div>
-          <span className="ribbon-meta">{project.isGitProject ? "GIT PROJECT" : "LOCAL DIRECTORY"}</span>
+          <div className="ribbon-facts">
+            <span className="ribbon-meta">{project.isGitProject ? "GIT PROJECT" : "LOCAL DIRECTORY"}</span>
+            {project.gitRoot && <span>Git root · {project.gitRoot}</span>}
+            {project.worktreeRoot && <span>Worktree root · {project.worktreeRoot}</span>}
+          </div>
         </div>
       )}
 
@@ -144,6 +157,13 @@ export function App({ api }: AppProps) {
         </div>
       )}
 
+      {snapshot && !sourceUnavailable && snapshot.excludedConversations.length > 0 && (
+        <ProjectMembershipNotice
+          excluded={snapshot.excludedConversations}
+          isGitProject={project?.isGitProject ?? snapshot.project.isGitProject}
+        />
+      )}
+
       {snapshot && !sourceUnavailable && (
         <ConversationList
           conversations={snapshot.conversations}
@@ -169,6 +189,62 @@ export function App({ api }: AppProps) {
       )}
     </main>
   );
+}
+
+function ProjectMembershipNotice({
+  excluded,
+  isGitProject,
+}: {
+  excluded: ExcludedConversation[];
+  isGitProject: boolean;
+}) {
+  const countLabel = `${excluded.length} conversation${excluded.length === 1 ? "" : "s"} excluded`;
+  const boundaryDescription = isGitProject
+    ? "Only a resolved cwd inside the selected Project and the same Git worktree is included in the List."
+    : "Only a resolved cwd inside the selected Project is included in the List; nested Git repositories are excluded.";
+  return (
+    <section className="membership-panel" aria-label="Project membership">
+      <div className="membership-heading">
+        <div>
+          <p className="section-kicker">PROJECT BOUNDARY / SOURCE FILTER</p>
+          <strong>{countLabel}</strong>
+        </div>
+        <span className="membership-count">{String(excluded.length).padStart(2, "0")}</span>
+      </div>
+      <p className="membership-description">
+        {boundaryDescription}
+      </p>
+      <ul className="excluded-list">
+        {excluded.map((conversation) => (
+          <li key={conversation.id}>
+            <div className="excluded-title">
+              <code>{conversation.id}</code>
+              <strong>{membershipReasonLabel(conversation.reason)}</strong>
+            </div>
+            <span>cwd · {conversation.cwd}</span>
+            {conversation.resolvedCwd && conversation.resolvedCwd !== conversation.cwd && (
+              <span>resolved · {conversation.resolvedCwd}</span>
+            )}
+            {conversation.gitRoot && <span>Git root · {conversation.gitRoot}</span>}
+            {conversation.worktreeRoot && <span>Worktree root · {conversation.worktreeRoot}</span>}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function membershipReasonLabel(reason: string): string {
+  const labels: Record<string, string> = {
+    outside_project: "Outside the selected Project",
+    nested_git_repository: "Nested Git repository",
+    different_git_root: "Different Git root or worktree",
+    cwd_not_absolute: "Working directory is not absolute",
+    unresolvable_cwd: "Working directory could not be resolved",
+    cwd_not_directory: "Working directory is not a directory",
+    git_root_unresolvable: "Git root could not be resolved",
+  };
+  return labels[reason] ?? "Outside the selected Project boundary";
 }
 
 interface ConversationListProps {

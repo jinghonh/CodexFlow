@@ -10,6 +10,7 @@ from .models import (
     ConversationOverlay,
     DashboardSnapshot,
     DerivedConversationState,
+    ExcludedConversation,
     GraphSummary,
     ProjectView,
 )
@@ -21,6 +22,10 @@ class ProjectInvalidError(Exception):
         super().__init__(message)
         self.message = message
         self.details = details
+
+
+class GitResolutionError(Exception):
+    """Git metadata could not be resolved safely for a path."""
 
 
 class ProjectNotSelectedError(Exception):
@@ -49,8 +54,8 @@ class SubprocessGitResolver:
                 timeout=2,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
-            return None
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise GitResolutionError(f"无法解析 Git 根：{path}") from exc
         if completed.returncode != 0:
             return None
         output = completed.stdout.strip()
@@ -58,8 +63,8 @@ class SubprocessGitResolver:
             return None
         try:
             return Path(output).resolve(strict=True)
-        except OSError:
-            return None
+        except (OSError, RuntimeError) as exc:
+            raise GitResolutionError(f"无法解析 Git 根：{path}") from exc
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ class _ProjectContext:
     original_path: str
     real_path: Path
     git_root: Path | None
+    worktree_root: Path | None
 
 
 class ProjectGraphService:
@@ -86,11 +92,18 @@ class ProjectGraphService:
             raise ProjectInvalidError("Project 路径不存在或无法解析", details={"path": path}) from exc
         if not real_path.is_dir():
             raise ProjectInvalidError("Project 路径必须是目录", details={"path": path})
-        git_root = self._git_resolver.root_for(real_path)
+        try:
+            git_root = self._resolve_git_root(real_path)
+        except GitResolutionError as exc:
+            raise ProjectInvalidError(
+                "Project 的 Git 根无法解析",
+                details={"path": str(real_path), "error": str(exc)},
+            ) from exc
         self._project = _ProjectContext(
             original_path=original_path,
             real_path=real_path,
             git_root=git_root,
+            worktree_root=git_root,
         )
         return self.project_view()
 
@@ -101,7 +114,7 @@ class ProjectGraphService:
             original_path=project.original_path,
             real_path=str(project.real_path),
             git_root=str(project.git_root) if project.git_root else None,
-            worktree_root=str(project.git_root) if project.git_root else None,
+            worktree_root=str(project.worktree_root) if project.worktree_root else None,
             is_git_project=project.git_root is not None,
             graph_file=str(graph_path),
             graph_file_status="not_loaded",
@@ -112,9 +125,9 @@ class ProjectGraphService:
         result = self._source.read_snapshot()
         if result.status in {"unavailable", "incompatible"}:
             raise SourceUnavailableError(result)
-        included_threads = [
-            thread for thread in result.threads if self._belongs_to_project(thread, project)
-        ]
+        included_threads, excluded_conversations = self._partition_threads(
+            result.threads, project
+        )
         conversations = _merge_conversations(
             included_threads,
             source_available=result.has_complete_snapshot,
@@ -127,22 +140,88 @@ class ProjectGraphService:
             source_error=_source_error(result),
             graph=GraphSummary(),
             conversations=tuple(conversations),
+            excluded_conversations=tuple(excluded_conversations),
         )
 
-    def _belongs_to_project(self, thread: CodexThread, project: _ProjectContext) -> bool:
+    def _partition_threads(
+        self,
+        threads: tuple[CodexThread, ...],
+        project: _ProjectContext,
+    ) -> tuple[list[CodexThread], list[ExcludedConversation]]:
+        included: list[CodexThread] = []
+        excluded: list[ExcludedConversation] = []
+        seen_ids: set[str] = set()
+        for thread in threads:
+            if thread.id in seen_ids:
+                continue
+            seen_ids.add(thread.id)
+            belongs, explanation = self._classify_thread(thread, project)
+            if belongs:
+                included.append(thread)
+            elif explanation is not None:
+                excluded.append(explanation)
+        return included, excluded
+
+    def _classify_thread(
+        self,
+        thread: CodexThread,
+        project: _ProjectContext,
+    ) -> tuple[bool, ExcludedConversation | None]:
         raw_cwd = Path(thread.cwd)
         if not raw_cwd.is_absolute():
-            return False
+            return False, _excluded_conversation(thread, reason="cwd_not_absolute")
         try:
             cwd = raw_cwd.resolve(strict=True)
-        except (OSError, ValueError):
-            return False
-        if not cwd.is_dir() or not _is_relative_to(cwd, project.real_path):
-            return False
-        cwd_git_root = self._git_resolver.root_for(cwd)
+        except (OSError, RuntimeError, ValueError):
+            return False, _excluded_conversation(thread, reason="unresolvable_cwd")
+        if not _is_relative_to(cwd, project.real_path):
+            return False, _excluded_conversation(
+                thread,
+                resolved_cwd=cwd,
+                reason="outside_project",
+            )
+        if not cwd.is_dir():
+            return False, _excluded_conversation(
+                thread,
+                resolved_cwd=cwd,
+                reason="cwd_not_directory",
+            )
+
+        try:
+            cwd_git_root = self._resolve_git_root(cwd)
+        except GitResolutionError:
+            return False, _excluded_conversation(
+                thread,
+                resolved_cwd=cwd,
+                reason="git_root_unresolvable",
+            )
         if project.git_root is not None:
-            return cwd_git_root == project.git_root
-        return cwd_git_root is None
+            if cwd_git_root == project.worktree_root:
+                return True, None
+            return False, _excluded_conversation(
+                thread,
+                resolved_cwd=cwd,
+                git_root=cwd_git_root,
+                worktree_root=cwd_git_root,
+                reason="different_git_root",
+            )
+        if cwd_git_root is None:
+            return True, None
+        return False, _excluded_conversation(
+            thread,
+            resolved_cwd=cwd,
+            git_root=cwd_git_root,
+            worktree_root=cwd_git_root,
+            reason="nested_git_repository",
+        )
+
+    def _resolve_git_root(self, path: Path) -> Path | None:
+        try:
+            return self._git_resolver.root_for(path)
+        except GitResolutionError:
+            raise
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            raise GitResolutionError(f"无法解析 Git 根：{path}") from exc
 
     def _require_project(self) -> _ProjectContext:
         if self._project is None:
@@ -211,6 +290,24 @@ def _source_error(result: SourceReadResult) -> dict[str, object] | None:
         "details": result.error.details,
         "retryable": result.error.retryable,
     }
+
+
+def _excluded_conversation(
+    thread: CodexThread,
+    *,
+    reason: str,
+    resolved_cwd: Path | None = None,
+    git_root: Path | None = None,
+    worktree_root: Path | None = None,
+) -> ExcludedConversation:
+    return ExcludedConversation(
+        id=thread.id,
+        cwd=thread.cwd,
+        resolved_cwd=str(resolved_cwd) if resolved_cwd is not None else None,
+        git_root=str(git_root) if git_root is not None else None,
+        worktree_root=str(worktree_root) if worktree_root is not None else None,
+        reason=reason,
+    )
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

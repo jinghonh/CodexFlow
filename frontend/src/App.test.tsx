@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
-import { ApiError } from "./api";
+import { ApiError, createApi } from "./api";
 import { App } from "./App";
 import type { DashboardApi } from "./api";
 import type { DashboardSnapshot, HealthResponse, ProjectView } from "./types";
@@ -75,6 +75,7 @@ const snapshot: DashboardSnapshot = {
       derived: { missing: false, unlinked: true, sourceAvailable: true, validObservationRange: true },
     },
   ],
+  excludedConversations: [],
 };
 
 function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
@@ -90,6 +91,29 @@ function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
     snapshot: overrides.snapshot ?? defaults.snapshot,
     refresh: overrides.refresh ?? defaults.refresh,
   };
+}
+
+function httpApiDouble(snapshotToServe: DashboardSnapshot): DashboardApi {
+  const fetchLike = vi.fn(async (input: RequestInfo | URL) => {
+    switch (String(input)) {
+      case "/api/health":
+        return jsonResponse(health);
+      case "/api/project/select":
+        return jsonResponse({ project, source: health.source });
+      case "/api/snapshot":
+        return jsonResponse(snapshotToServe);
+      default:
+        throw new Error(`Unexpected fixture request: ${String(input)}`);
+    }
+  });
+  return createApi(fetchLike);
+}
+
+function jsonResponse(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
 }
 
 describe("Dashboard conversation list", () => {
@@ -204,5 +228,35 @@ describe("Dashboard conversation list", () => {
 
     expect(await screen.findByText("Invalid observation range")).toBeInTheDocument();
     expect(screen.getByText("Needs time review")).toBeInTheDocument();
+  });
+
+  it("explains source conversations excluded by the selected Project boundary", async () => {
+    const user = userEvent.setup();
+    const excludedSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      excludedConversations: [
+        {
+          id: "outside-id",
+          cwd: "/projects/other",
+          resolvedCwd: "/projects/other",
+          gitRoot: null,
+          worktreeRoot: null,
+          reason: "outside_project",
+        },
+      ],
+    };
+    const api = httpApiDouble(excludedSnapshot);
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const membership = await screen.findByRole("region", { name: "Project membership" });
+    expect(membership).toHaveTextContent("1 conversation excluded");
+    expect(membership).toHaveTextContent("/projects/other");
+    expect(membership).toHaveTextContent("Outside the selected Project");
+    expect(membership).toHaveTextContent("nested Git repositories are excluded");
+    expect(membership).not.toHaveTextContent("its Git worktree");
   });
 });

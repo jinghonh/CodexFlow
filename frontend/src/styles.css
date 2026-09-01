@@ -152,6 +152,8 @@ h1 {
 }
 .project-ribbon strong { display: block; color: var(--paper); font-size: 12px; font-weight: 400; margin-top: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ribbon-label { display: block; color: var(--paper-dim); }
+.project-alias { display: block; margin-top: 5px; color: var(--paper-dim); font-size: 10px; overflow-wrap: anywhere; }
+.ribbon-facts { display: grid; gap: 5px; justify-items: end; color: var(--paper-dim); font-size: 10px; text-align: right; }
 .ribbon-meta { color: var(--lime); font-size: 10px; letter-spacing: 0.12em; white-space: nowrap; }
 
 .loading-panel, .source-alert {
@@ -184,6 +186,24 @@ h1 {
 .source-alert strong { color: var(--orange); font-size: 12px; }
 .source-alert p { margin: 6px 0; color: var(--paper); line-height: 1.5; }
 .alert-note { color: var(--paper-dim); font-size: 10px; }
+
+.membership-panel {
+  margin-top: 28px;
+  border: 1px solid rgba(255, 139, 94, 0.32);
+  background: rgba(255, 139, 94, 0.035);
+  padding: 20px;
+}
+.membership-heading { display: flex; align-items: start; justify-content: space-between; gap: 24px; }
+.membership-heading .section-kicker { margin-bottom: 8px; color: var(--orange); }
+.membership-heading strong { color: var(--paper); font: 400 25px/1 var(--serif); }
+.membership-count { color: var(--orange); font: 400 38px/1 var(--serif); }
+.membership-description { max-width: 700px; margin: 14px 0 0; color: var(--paper-dim); font-size: 11px; line-height: 1.6; }
+.excluded-list { display: grid; gap: 10px; margin: 18px 0 0; padding: 0; list-style: none; }
+.excluded-list li { display: grid; gap: 5px; border-top: 1px solid rgba(231, 234, 223, 0.12); padding-top: 10px; color: var(--paper-dim); font-size: 10px; line-height: 1.45; }
+.excluded-title { display: flex; align-items: baseline; flex-wrap: wrap; gap: 10px; }
+.excluded-title code { display: inline; margin: 0; color: var(--paper); }
+.excluded-title strong { color: var(--orange); font-size: 10px; font-weight: 400; letter-spacing: 0.04em; text-transform: uppercase; }
+.excluded-list span { overflow-wrap: anywhere; }
 
 .list-section { margin-top: 82px; }
 .list-heading { display: flex; align-items: end; justify-content: space-between; gap: 28px; border-bottom: 1px solid var(--line); padding-bottom: 20px; }
@@ -228,5 +248,6 @@ code { display: block; margin-top: 8px; color: #748175; font-size: 10px; }
   .path-input-row { grid-template-columns: 1fr; }
   .path-input-row button { min-height: 42px; }
   .project-ribbon { align-items: flex-start; flex-direction: column; gap: 11px; }
+  .ribbon-facts { justify-items: start; text-align: left; }
   .list-heading { align-items: flex-start; flex-direction: column; }
 }
