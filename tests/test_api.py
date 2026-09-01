@@ -546,6 +546,58 @@ async def test_http_refresh_keeps_the_last_complete_conversations_when_source_is
 
 
 @pytest.mark.asyncio
+async def test_http_refresh_discovers_new_source_conversations_without_creating_edges(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = ApiSource(ready(thread("source-id", project), thread("target-id", project)))
+    app = create_app(source=source)
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        created = await client.post(
+            "/api/graph/edges",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={"source": "source-id", "target": "target-id", "type": "references"},
+        )
+        source.result = ready(
+            thread("source-id", project),
+            thread("target-id", project),
+            thread("new-id", project),
+            thread("archived-id", project, archived=True),
+        )
+        refreshed = await client.post("/api/refresh")
+
+    assert created.status_code == 200
+    assert refreshed.status_code == 200
+    body = refreshed.json()
+    assert [item["id"] for item in body["conversations"]] == [
+        "source-id",
+        "target-id",
+        "new-id",
+        "archived-id",
+    ]
+    assert {node["id"] for node in body["graph"]["nodes"]} == {
+        "source-id",
+        "target-id",
+        "new-id",
+        "archived-id",
+    }
+    assert body["graph"]["edges"] == [
+        {
+            "id": created.json()["graph"]["edges"][0]["id"],
+            "source": "source-id",
+            "target": "target-id",
+            "type": "references",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_http_project_select_reports_a_graph_parse_error_without_overwriting_the_file(
     tmp_path: Path,
 ) -> None:

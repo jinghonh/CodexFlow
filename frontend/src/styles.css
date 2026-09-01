@@ -155,6 +155,20 @@ h1 {
 .project-alias { display: block; margin-top: 5px; color: var(--paper-dim); font-size: 10px; overflow-wrap: anywhere; }
 .ribbon-facts { display: grid; gap: 5px; justify-items: end; color: var(--paper-dim); font-size: 10px; text-align: right; }
 .ribbon-meta { color: var(--lime); font-size: 10px; letter-spacing: 0.12em; white-space: nowrap; }
+.ribbon-actions { display: grid; justify-items: end; gap: 7px; min-width: 150px; }
+.draft-status { color: var(--paper-dim); font-size: 9px; letter-spacing: 0.10em; text-transform: uppercase; }
+.draft-status.is-dirty { color: var(--orange); }
+.refresh-button {
+  border: 1px solid var(--lime);
+  background: rgba(184, 226, 78, 0.10);
+  color: var(--lime);
+  padding: 9px 11px;
+  font-size: 10px;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease;
+}
+.refresh-button:hover:not(:disabled), .refresh-button:focus-visible { background: var(--lime); color: var(--ink); outline: 0; transform: translateY(-2px); }
+.refresh-button:disabled { cursor: wait; opacity: 0.55; }
+.refresh-error { max-width: 260px; color: var(--orange); font-size: 9px; line-height: 1.4; text-align: right; }
 
 .loading-panel, .source-alert {
   display: flex;
@@ -186,6 +200,35 @@ h1 {
 .source-alert strong { color: var(--orange); font-size: 12px; }
 .source-alert p { margin: 6px 0; color: var(--paper); line-height: 1.5; }
 .alert-note { color: var(--paper-dim); font-size: 10px; }
+
+.refresh-dialog-backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(10, 14, 11, 0.76);
+  padding: 24px;
+}
+.refresh-dialog {
+  width: min(520px, 100%);
+  border: 1px solid var(--orange);
+  background: var(--ink-soft);
+  box-shadow: 12px 12px 0 rgba(255, 139, 94, 0.16);
+  padding: 25px;
+}
+.refresh-dialog .section-kicker { margin-bottom: 14px; color: var(--orange); }
+.refresh-dialog h2 { margin: 0 0 12px; color: var(--paper); font: 400 clamp(28px, 5vw, 42px)/0.95 var(--serif); letter-spacing: -0.05em; }
+.refresh-dialog > p:not(.section-kicker):not(.refresh-dialog-error) { margin: 0; color: var(--paper-dim); font-size: 11px; line-height: 1.6; }
+.refresh-dialog-error { margin: 15px 0 0; color: var(--orange); font-size: 10px; line-height: 1.5; }
+.refresh-dialog-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+.refresh-dialog-actions button { border: 1px solid rgba(231, 234, 223, 0.30); background: rgba(231, 234, 223, 0.06); color: var(--paper); padding: 10px 12px; font-size: 10px; transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease; }
+.refresh-dialog-actions button:hover:not(:disabled), .refresh-dialog-actions button:focus-visible { border-color: var(--lime); color: var(--lime); outline: 0; transform: translateY(-2px); }
+.refresh-dialog-actions .refresh-dialog-save { border-color: var(--lime); background: var(--lime); color: var(--ink); font-weight: 700; }
+.refresh-dialog-actions .refresh-dialog-save:hover:not(:disabled), .refresh-dialog-actions .refresh-dialog-save:focus-visible { background: #d2f477; color: var(--ink); }
+.refresh-dialog-actions .refresh-dialog-discard { border-color: rgba(255, 139, 94, 0.62); color: var(--orange); }
+.refresh-dialog-actions .refresh-dialog-discard:hover:not(:disabled), .refresh-dialog-actions .refresh-dialog-discard:focus-visible { border-color: var(--orange); background: rgba(255, 139, 94, 0.10); color: var(--orange); }
+.refresh-dialog-actions button:disabled { cursor: wait; opacity: 0.55; }
 
 .graph-conflict-panel, .graph-status-notice {
   display: flex;
@@ -726,6 +769,8 @@ code { display: block; margin-top: 8px; color: #748175; font-size: 10px; }
   .path-input-row button { min-height: 42px; }
   .project-ribbon { align-items: flex-start; flex-direction: column; gap: 11px; }
   .ribbon-facts { justify-items: start; text-align: left; }
+  .ribbon-actions { justify-items: start; }
+  .refresh-error { text-align: left; }
   .graph-heading { align-items: flex-start; flex-direction: column; }
   .graph-toolbar { align-self: stretch; justify-content: flex-start; }
   .list-heading { align-items: flex-start; flex-direction: column; }

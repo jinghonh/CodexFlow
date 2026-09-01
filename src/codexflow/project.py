@@ -99,6 +99,7 @@ class ProjectGraphService:
         self._git_resolver = git_resolver or SubprocessGitResolver()
         self._project: _ProjectContext | None = None
         self._graph_file_status = "not_loaded"
+        self._missing_conversation_ids: set[str] | None = None
 
     def select_project(self, path: str) -> ProjectView:
         if not isinstance(path, str) or not path.strip():
@@ -125,6 +126,7 @@ class ProjectGraphService:
             worktree_root=git_root,
         )
         self._graph_file_status = "not_loaded"
+        self._missing_conversation_ids = None
         return self.project_view()
 
     def project_view(self) -> ProjectView:
@@ -292,13 +294,18 @@ class ProjectGraphService:
             graph_overlay,
             source_ids={thread.id for thread in result.threads},
             source_available=result.has_complete_snapshot,
+            missing_ids=(
+                None
+                if result.status == "ready"
+                else self._missing_conversation_ids or set()
+            ),
         )
         timeline = build_timeline(
             conversations,
             granularity=granularity,
             timezone=timezone,
         )
-        return DashboardSnapshot(
+        snapshot = DashboardSnapshot(
             project=self.project_view(),
             source_status=result.status,
             generated_at=result.generated_at,
@@ -314,6 +321,13 @@ class ProjectGraphService:
             excluded_conversations=tuple(excluded_conversations),
             timeline=timeline,
         )
+        if result.status == "ready":
+            self._missing_conversation_ids = {
+                conversation.id
+                for conversation in conversations
+                if conversation.derived.missing
+            }
+        return snapshot
 
     def _partition_threads(
         self,
@@ -407,6 +421,7 @@ def _merge_conversations(
     *,
     source_ids: set[str],
     source_available: bool,
+    missing_ids: set[str] | None,
 ) -> list[Conversation]:
     thread_by_id = {thread.id: thread for thread in threads}
     conversation_ids = list(thread_by_id)
@@ -427,7 +442,14 @@ def _merge_conversations(
     for conversation_id in conversation_ids:
         thread = thread_by_id.get(conversation_id)
         overlay = graph_overlay.nodes.get(conversation_id, ConversationOverlay())
-        missing = source_available and conversation_id not in source_ids
+        missing = (
+            source_available
+            and (
+                conversation_id in missing_ids
+                if missing_ids is not None
+                else conversation_id not in source_ids
+            )
+        )
         valid_range = bool(thread and observation_range_for_thread(thread).valid)
         conversations.append(
             Conversation(

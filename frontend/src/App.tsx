@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, createApi } from "./api";
 import type { DashboardApi } from "./api";
@@ -42,6 +42,13 @@ interface GraphConflictState {
   retry: () => Promise<DashboardSnapshot>;
 }
 
+interface DraftController {
+  save: () => Promise<void>;
+  discard: () => void;
+}
+
+type DraftRegistration = (key: string, controller: DraftController | null) => void;
+
 export function App({ api }: AppProps) {
   const apiClient = useMemo(() => api ?? createApi(), [api]);
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -62,6 +69,22 @@ export function App({ api }: AppProps) {
   const [graphMigrationState, setGraphMigrationState] = useState<"idle" | "working">("idle");
   const [graphMigrationError, setGraphMigrationError] = useState<string | null>(null);
   const [graphMigrationBackupPath, setGraphMigrationBackupPath] = useState<string | null>(null);
+  const [refreshState, setRefreshState] = useState<"idle" | "refreshing" | "saving" | "discarding">("idle");
+  const [refreshError, setRefreshError] = useState<string | null>(null);
+  const [refreshDecisionOpen, setRefreshDecisionOpen] = useState(false);
+  const [refreshDecisionError, setRefreshDecisionError] = useState<string | null>(null);
+  const [dirtyDraftCount, setDirtyDraftCount] = useState(0);
+  const draftControllers = useRef(new Map<string, DraftController>());
+  const snapshotRef = useRef<DashboardSnapshot | null>(null);
+
+  const registerDraft = useCallback<DraftRegistration>((key, controller) => {
+    if (controller) {
+      draftControllers.current.set(key, controller);
+    } else {
+      draftControllers.current.delete(key);
+    }
+    setDirtyDraftCount(draftControllers.current.size);
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -89,8 +112,15 @@ export function App({ api }: AppProps) {
     setError(null);
     setTimelineError(null);
     setSnapshot(null);
+    snapshotRef.current = null;
     setSelectedConversationId(null);
     setFilters(DEFAULT_CONVERSATION_FILTERS);
+    draftControllers.current.clear();
+    setDirtyDraftCount(0);
+    setRefreshState("idle");
+    setRefreshError(null);
+    setRefreshDecisionOpen(false);
+    setRefreshDecisionError(null);
     setGraphConflict(null);
     setGraphConflictCopyPath(null);
     setGraphConflictActionError(null);
@@ -101,7 +131,7 @@ export function App({ api }: AppProps) {
       const selected = await apiClient.selectProject(trimmedPath);
       setProject(selected.project);
       const loaded = await apiClient.snapshot();
-      setSnapshot(loaded);
+      publishSnapshot(loaded, true);
       setLoadState("ready");
     } catch (reason: unknown) {
       setLoadState("error");
@@ -120,8 +150,7 @@ export function App({ api }: AppProps) {
     setTimelineError(null);
     try {
       const updated = await apiClient.snapshot({ granularity, timezone });
-      setSnapshot(updated);
-      setProject(updated.project);
+      publishSnapshot(updated);
     } catch (reason: unknown) {
       const nextError = asError(reason);
       setTimelineError(nextError.message);
@@ -135,9 +164,84 @@ export function App({ api }: AppProps) {
   }
 
   function publishSnapshot(updated: DashboardSnapshot, resetDetail = false): void {
+    snapshotRef.current = updated;
     setSnapshot(updated);
     setProject(updated.project);
+    setSelectedConversationId((current) =>
+      current && updated.conversations.some(({ id }) => id === current) ? current : null,
+    );
     if (resetDetail) setDetailResetToken((token) => token + 1);
+  }
+
+  async function refreshSnapshot(): Promise<void> {
+    setRefreshState("refreshing");
+    setRefreshError(null);
+    const current = snapshotRef.current;
+    try {
+      const updated = current?.timeline
+        ? await apiClient.refresh({
+            granularity: current.timeline.granularity,
+            timezone: current.timeline.timezone,
+          })
+        : await apiClient.refresh();
+      publishSnapshot(updated, true);
+      setError(null);
+    } catch (reason: unknown) {
+      const nextError = asError(reason);
+      setRefreshError(describeRefreshError(reason, current !== null));
+      if (nextError instanceof ApiError) setError(nextError);
+      throw reason;
+    } finally {
+      setRefreshState("idle");
+    }
+  }
+
+  async function handleRefresh(): Promise<void> {
+    setRefreshDecisionError(null);
+    if (dirtyDraftCount > 0) {
+      setRefreshDecisionOpen(true);
+      return;
+    }
+    try {
+      await refreshSnapshot();
+    } catch {
+      // The existing snapshot and view state remain visible after a failed refresh.
+    }
+  }
+
+  async function saveDraftsAndRefresh(): Promise<void> {
+    setRefreshState("saving");
+    setRefreshDecisionError(null);
+    const controllers = Array.from(draftControllers.current.values());
+    try {
+      for (const controller of controllers) await controller.save();
+    } catch (reason: unknown) {
+      setRefreshDecisionError(asError(reason).message);
+      setRefreshState("idle");
+      return;
+    }
+    try {
+      await refreshSnapshot();
+      setRefreshDecisionOpen(false);
+    } catch {
+      setRefreshDecisionOpen(false);
+    }
+  }
+
+  async function discardDraftsAndRefresh(): Promise<void> {
+    setRefreshState("discarding");
+    setRefreshDecisionError(null);
+    for (const controller of draftControllers.current.values()) controller.discard();
+    draftControllers.current.clear();
+    setDirtyDraftCount(0);
+    setGraphConflict(null);
+    try {
+      await refreshSnapshot();
+    } catch {
+      // Discarding is already committed locally; a source failure is shown beside the ribbon.
+    } finally {
+      setRefreshDecisionOpen(false);
+    }
   }
 
   function rememberGraphConflict(
@@ -164,12 +268,12 @@ export function App({ api }: AppProps) {
     execute: (etag: string, overwrite: boolean) => Promise<DashboardSnapshot>,
     overwrite: boolean,
   ): Promise<void> {
-    if (!snapshot) throw new Error("Load a Project before saving Graph changes.");
-    const baseSnapshot = snapshot;
+    const baseSnapshot = snapshotRef.current;
+    if (!baseSnapshot) throw new Error("Load a Project before saving Graph changes.");
     try {
       const updated = await execute(overwrite ? "*" : baseSnapshot.graph.etag, overwrite);
       publishSnapshot(updated, overwrite);
-      if (overwrite) setGraphConflict(null);
+      setGraphConflict(null);
     } catch (reason: unknown) {
       if (!overwrite) {
         rememberGraphConflict(
@@ -305,7 +409,7 @@ export function App({ api }: AppProps) {
   }
 
   const sourceUnavailable =
-    (error instanceof ApiError && error.status === 503) ||
+    ((error instanceof ApiError && error.status === 503) && !snapshot) ||
     snapshot?.source.status === "unavailable" ||
     snapshot?.source.status === "incompatible";
   const sourceStale = snapshot?.source.status === "stale";
@@ -387,6 +491,26 @@ export function App({ api }: AppProps) {
             {project.worktreeRoot && <span>Worktree root · {project.worktreeRoot}</span>}
             <span>Graph overlay · {snapshot?.project.graphFileStatus ?? project.graphFileStatus}</span>
           </div>
+          {project && (
+            <div className="ribbon-actions">
+              <span className={`draft-status ${dirtyDraftCount > 0 ? "is-dirty" : ""}`}>
+                {dirtyDraftCount > 0
+                  ? "Unsaved Graph changes"
+                  : snapshot
+                  ? "Source sync ready"
+                  : "Source load needs retry"}
+              </span>
+              <button
+                type="button"
+                className="refresh-button"
+                onClick={() => void handleRefresh()}
+                disabled={refreshState !== "idle"}
+              >
+                {refreshState === "refreshing" ? "Refreshing…" : "Refresh source"}
+              </button>
+              {refreshError && <span className="refresh-error" role="alert">Refresh failed · {refreshError}</span>}
+            </div>
+          )}
         </div>
       )}
 
@@ -413,9 +537,23 @@ export function App({ api }: AppProps) {
           <span className="stale-mark" aria-hidden="true">↻</span>
           <div>
             <strong>Source stale</strong>
-            <p>The last complete source snapshot is still shown; refresh could not confirm newer data.</p>
+            <p>
+              {snapshot.source.error?.message ?? "The last complete source snapshot is still shown; refresh could not confirm newer data."}
+            </p>
+            <span className="alert-note">The last complete snapshot is preserved; retry the source refresh when available.</span>
           </div>
         </div>
+      )}
+
+      {refreshDecisionOpen && (
+        <RefreshDecisionDialog
+          dirtyCount={dirtyDraftCount}
+          action={refreshState}
+          error={refreshDecisionError}
+          onSave={() => void saveDraftsAndRefresh()}
+          onDiscard={() => void discardDraftsAndRefresh()}
+          onCancel={() => setRefreshDecisionOpen(false)}
+        />
       )}
 
       {graphConflict && (
@@ -477,6 +615,7 @@ export function App({ api }: AppProps) {
             selectedId={selectedConversationId}
             onSelect={setSelectedConversationId}
             onLayoutChange={(conversationId, layout) => handleNodeUpdate(conversationId, { layout })}
+            onDraftChange={registerDraft}
             readOnly={graphReadOnly}
           />
           <ConversationList
@@ -492,6 +631,7 @@ export function App({ api }: AppProps) {
           key={`${selectedConversationId}:${detailResetToken}`}
           conversation={snapshot.conversations.find(({ id }) => id === selectedConversationId) ?? null}
           onSave={handleNodeUpdate}
+          onDraftChange={registerDraft}
           readOnly={graphReadOnly}
         />
       )}
@@ -506,6 +646,47 @@ export function App({ api }: AppProps) {
         </div>
       )}
     </main>
+  );
+}
+
+function RefreshDecisionDialog({
+  dirtyCount,
+  action,
+  error,
+  onSave,
+  onDiscard,
+  onCancel,
+}: {
+  dirtyCount: number;
+  action: "idle" | "refreshing" | "saving" | "discarding";
+  error: string | null;
+  onSave: () => void;
+  onDiscard: () => void;
+  onCancel: () => void;
+}) {
+  const working = action !== "idle";
+  return (
+    <div className="refresh-dialog-backdrop">
+      <section className="refresh-dialog" role="dialog" aria-modal="true" aria-labelledby="refresh-dialog-title">
+        <p className="section-kicker">SOURCE REFRESH / UNSAVED WORK</p>
+        <h2 id="refresh-dialog-title">Save your Graph changes first?</h2>
+        <p>
+          {dirtyCount === 1 ? "One" : dirtyCount} unsaved Graph draft{dirtyCount === 1 ? " is" : "s are"} open. Choose what to do before reading the source again.
+        </p>
+        {error && <p className="refresh-dialog-error" role="alert">Save failed · {error} Your draft is still dirty.</p>}
+        <div className="refresh-dialog-actions">
+          <button type="button" className="refresh-dialog-save" onClick={onSave} disabled={working}>
+            {action === "saving" ? "Saving…" : "Save changes & refresh"}
+          </button>
+          <button type="button" className="refresh-dialog-discard" onClick={onDiscard} disabled={working}>
+            {action === "discarding" ? "Discarding…" : "Discard changes & refresh"}
+          </button>
+          <button type="button" className="refresh-dialog-cancel" onClick={onCancel} disabled={working}>
+            Cancel
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -800,6 +981,7 @@ interface ConversationGraphProps {
   onCreateEdge: (edge: GraphEdgeCreate) => Promise<void>;
   onUpdateEdge: (edgeId: string, changes: GraphEdgeUpdate) => Promise<void>;
   onDeleteEdge: (edgeId: string) => Promise<void>;
+  onDraftChange: DraftRegistration;
   readOnly: boolean;
 }
 
@@ -832,6 +1014,7 @@ function ConversationGraph({
   onCreateEdge,
   onUpdateEdge,
   onDeleteEdge,
+  onDraftChange,
   readOnly,
 }: ConversationGraphProps) {
   const [zoom, setZoom] = useState(1);
@@ -1050,6 +1233,7 @@ function ConversationGraph({
         onCreate={onCreateEdge}
         onUpdate={onUpdateEdge}
         onDelete={onDeleteEdge}
+        onDraftChange={onDraftChange}
         readOnly={readOnly}
       />
     </section>
@@ -1080,7 +1264,17 @@ interface RelationshipEditorProps {
   onCreate: (edge: GraphEdgeCreate) => Promise<void>;
   onUpdate: (edgeId: string, changes: GraphEdgeUpdate) => Promise<void>;
   onDelete: (edgeId: string) => Promise<void>;
+  onDraftChange: DraftRegistration;
   readOnly: boolean;
+}
+
+interface RelationshipDraft {
+  editingEdgeId: string | null;
+  source: string;
+  target: string;
+  relationType: string;
+  customType: string;
+  label: string;
 }
 
 function RelationshipEditor({
@@ -1089,6 +1283,7 @@ function RelationshipEditor({
   onCreate,
   onUpdate,
   onDelete,
+  onDraftChange,
   readOnly,
 }: RelationshipEditorProps) {
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
@@ -1100,6 +1295,9 @@ function RelationshipEditor({
   const [mutationState, setMutationState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [mutationError, setMutationError] = useState<string | null>(null);
   const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
+  const draftKey = "relationship-editor";
+
+  useEffect(() => () => onDraftChange(draftKey, null), [onDraftChange]);
 
   function resetEditor() {
     setEditingEdgeId(null);
@@ -1108,46 +1306,74 @@ function RelationshipEditor({
     setRelationType(BUILT_IN_RELATION_TYPES[0]);
     setCustomType("");
     setLabel("");
+    onDraftChange(draftKey, null);
   }
 
-  function beginEdit(edge: GraphEdge) {
-    setEditingEdgeId(edge.id);
-    setSource(edge.source);
-    setTarget(edge.target);
-    if (BUILT_IN_RELATION_TYPES.includes(edge.type as (typeof BUILT_IN_RELATION_TYPES)[number])) {
-      setRelationType(edge.type);
-      setCustomType("");
-    } else {
-      setRelationType(CUSTOM_RELATION_VALUE);
-      setCustomType(edge.type);
-    }
-    setLabel(edge.label ?? "");
+  function currentDraft(): RelationshipDraft {
+    return { editingEdgeId, source, target, relationType, customType, label };
+  }
+
+  function updateRelationshipDraft(next: RelationshipDraft): void {
+    setEditingEdgeId(next.editingEdgeId);
+    setSource(next.source);
+    setTarget(next.target);
+    setRelationType(next.relationType);
+    setCustomType(next.customType);
+    setLabel(next.label);
+    setMutationState("idle");
+    setMutationError(null);
+    onDraftChange(draftKey, {
+      save: () => saveRelationship(next),
+      discard: discardRelationshipDraft,
+    });
+  }
+
+  function discardRelationshipDraft(): void {
+    resetEditor();
     setMutationState("idle");
     setMutationError(null);
   }
 
-  function changeRelationType(value: string) {
-    setRelationType(value);
-    if (value !== CUSTOM_RELATION_VALUE) setCustomType("");
+  function beginEdit(edge: GraphEdge) {
+    const next: RelationshipDraft = {
+      editingEdgeId: edge.id,
+      source: edge.source,
+      target: edge.target,
+      relationType: BUILT_IN_RELATION_TYPES.includes(edge.type as (typeof BUILT_IN_RELATION_TYPES)[number])
+        ? edge.type
+        : CUSTOM_RELATION_VALUE,
+      customType: BUILT_IN_RELATION_TYPES.includes(edge.type as (typeof BUILT_IN_RELATION_TYPES)[number])
+        ? ""
+        : edge.type,
+      label: edge.label ?? "",
+    };
+    updateRelationshipDraft(next);
   }
 
-  async function submitRelationship(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const normalizedSource = source.trim();
-    const normalizedTarget = target.trim();
-    const normalizedType = (relationType === CUSTOM_RELATION_VALUE ? customType : relationType).trim();
+  function changeRelationType(value: string) {
+    updateRelationshipDraft({
+      ...currentDraft(),
+      relationType: value,
+      customType: value === CUSTOM_RELATION_VALUE ? customType : "",
+    });
+  }
+
+  async function saveRelationship(draft: RelationshipDraft): Promise<void> {
+    const normalizedSource = draft.source.trim();
+    const normalizedTarget = draft.target.trim();
+    const normalizedType = (draft.relationType === CUSTOM_RELATION_VALUE ? draft.customType : draft.relationType).trim();
     if (!normalizedSource || !normalizedTarget || !normalizedType) {
       setMutationState("error");
       setMutationError("Source, target, and relationship type are required.");
-      return;
+      throw new Error("Source, target, and relationship type are required.");
     }
 
     setMutationState("saving");
     setMutationError(null);
     try {
-      const normalizedLabel = label.trim() || null;
-      if (editingEdgeId) {
-        await onUpdate(editingEdgeId, {
+      const normalizedLabel = draft.label.trim() || null;
+      if (draft.editingEdgeId) {
+        await onUpdate(draft.editingEdgeId, {
           source: normalizedSource,
           target: normalizedTarget,
           type: normalizedType,
@@ -1166,6 +1392,16 @@ function RelationshipEditor({
     } catch (reason: unknown) {
       setMutationState("error");
       setMutationError(describeMutationError(reason));
+      throw reason;
+    }
+  }
+
+  async function submitRelationship(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    try {
+      await saveRelationship(currentDraft());
+    } catch {
+      // The editor keeps its draft and error state after a failed save.
     }
   }
 
@@ -1199,7 +1435,7 @@ function RelationshipEditor({
             id="relationship-source"
             list="conversation-id-options"
           value={source}
-          onChange={(event) => setSource(event.target.value)}
+          onChange={(event) => updateRelationshipDraft({ ...currentDraft(), source: event.target.value })}
           placeholder="Conversation ID"
           autoComplete="off"
           disabled={readOnly}
@@ -1210,7 +1446,7 @@ function RelationshipEditor({
             id="relationship-target"
             list="conversation-id-options"
           value={target}
-          onChange={(event) => setTarget(event.target.value)}
+          onChange={(event) => updateRelationshipDraft({ ...currentDraft(), target: event.target.value })}
           placeholder="Conversation ID"
           autoComplete="off"
           disabled={readOnly}
@@ -1234,7 +1470,7 @@ function RelationshipEditor({
               <input
                 id="custom-relationship-type"
                 value={customType}
-                onChange={(event) => setCustomType(event.target.value)}
+                onChange={(event) => updateRelationshipDraft({ ...currentDraft(), customType: event.target.value })}
                 placeholder="e.g. informs"
                 autoComplete="off"
                 disabled={readOnly}
@@ -1246,7 +1482,7 @@ function RelationshipEditor({
           <input
             id="relationship-label"
             value={label}
-            onChange={(event) => setLabel(event.target.value)}
+            onChange={(event) => updateRelationshipDraft({ ...currentDraft(), label: event.target.value })}
             placeholder="Explain the relationship"
             disabled={readOnly}
           />
@@ -1255,7 +1491,7 @@ function RelationshipEditor({
               {mutationState === "saving" ? "Saving…" : editingEdgeId ? "Save relationship" : "Add relationship"}
             </button>
             {editingEdgeId && (
-              <button type="button" className="relationship-cancel" onClick={() => { resetEditor(); setMutationState("idle"); }}>
+              <button type="button" className="relationship-cancel" onClick={discardRelationshipDraft}>
                 Cancel edit
               </button>
             )}
@@ -1414,54 +1650,91 @@ function ConversationRow({ conversation, selected, onSelect }: ConversationRowPr
   );
 }
 
+interface ConversationDraft {
+  title: string;
+  tags: string;
+  status: UserStatus;
+  note: string;
+  hidden: boolean;
+}
+
 function ConversationDetail({
   conversation,
   onSave,
+  onDraftChange,
   readOnly,
 }: {
   conversation: Conversation | null;
   onSave: (id: string, changes: ConversationOverlayUpdate) => Promise<void>;
+  onDraftChange: DraftRegistration;
   readOnly: boolean;
 }) {
   const conversationId = conversation?.id ?? null;
-  const [title, setTitle] = useState("");
-  const [tags, setTags] = useState("");
-  const [status, setStatus] = useState<UserStatus>("none");
-  const [note, setNote] = useState("");
-  const [hidden, setHidden] = useState(false);
+  const draftKey = conversationId ? `conversation-detail:${conversationId}` : "conversation-detail";
+  const [draft, setDraft] = useState<ConversationDraft>(() => conversationDraft(conversation));
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!conversation) return;
-    setTitle(conversation.overlay.title ?? "");
-    setTags(conversation.overlay.tags.join(", "));
-    setStatus(conversation.overlay.status);
-    setNote(conversation.overlay.note ?? "");
-    setHidden(conversation.overlay.hidden);
+    setDraft(conversationDraft(conversation));
     setSaveState("idle");
     setSaveError(null);
-  }, [conversationId]);
+    onDraftChange(draftKey, null);
+    return () => onDraftChange(draftKey, null);
+  }, [conversationId, draftKey, onDraftChange]);
 
   if (!conversation) return null;
+  const selectedConversation = conversation;
 
-  async function saveChanges(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  function updateDraft(next: ConversationDraft): void {
+    setDraft(next);
+    setSaveState("idle");
+    setSaveError(null);
+    if (isConversationDraftClean(next, selectedConversation)) {
+      onDraftChange(draftKey, null);
+      return;
+    }
+    onDraftChange(draftKey, {
+      save: () => persistDraft(next),
+      discard: discardDraft,
+    });
+  }
+
+  function discardDraft(): void {
+    setDraft(conversationDraft(selectedConversation));
+    setSaveState("idle");
+    setSaveError(null);
+    onDraftChange(draftKey, null);
+  }
+
+  async function persistDraft(values: ConversationDraft): Promise<void> {
     if (!conversationId) return;
     setSaveState("saving");
     setSaveError(null);
     try {
       await onSave(conversationId, {
-        title,
-        tags: normalizeTags(tags),
-        status,
-        note: note.trim() ? note : null,
-        hidden,
+        title: values.title,
+        tags: normalizeTags(values.tags),
+        status: values.status,
+        note: values.note.trim() ? values.note : null,
+        hidden: values.hidden,
       });
       setSaveState("saved");
+      onDraftChange(draftKey, null);
     } catch (reason: unknown) {
       setSaveState("error");
       setSaveError(describeMutationError(reason));
+      throw reason;
+    }
+  }
+
+  async function saveChanges(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    try {
+      await persistDraft(draft);
+    } catch {
+      // The editor keeps its draft and error state after a failed save.
     }
   }
 
@@ -1476,8 +1749,8 @@ function ConversationDetail({
       <label htmlFor="conversation-title">Custom title</label>
       <input
         id="conversation-title"
-        value={title}
-        onChange={(event) => setTitle(event.target.value)}
+        value={draft.title}
+        onChange={(event) => updateDraft({ ...draft, title: event.target.value })}
         placeholder={conversation.codex.title ?? "Uses the Codex title"}
         disabled={readOnly}
       />
@@ -1485,8 +1758,8 @@ function ConversationDetail({
       <label htmlFor="conversation-tags">Tags</label>
       <input
         id="conversation-tags"
-        value={tags}
-        onChange={(event) => setTags(event.target.value)}
+        value={draft.tags}
+        onChange={(event) => updateDraft({ ...draft, tags: event.target.value })}
         placeholder="design, release, research"
         disabled={readOnly}
       />
@@ -1494,8 +1767,8 @@ function ConversationDetail({
       <label htmlFor="conversation-status">User status</label>
       <select
         id="conversation-status"
-        value={status}
-        onChange={(event) => setStatus(event.target.value as UserStatus)}
+        value={draft.status}
+        onChange={(event) => updateDraft({ ...draft, status: event.target.value as UserStatus })}
         disabled={readOnly}
       >
         <option value="none">None</option>
@@ -1507,8 +1780,8 @@ function ConversationDetail({
       <label htmlFor="conversation-note">Note</label>
       <textarea
         id="conversation-note"
-        value={note}
-        onChange={(event) => setNote(event.target.value)}
+        value={draft.note}
+        onChange={(event) => updateDraft({ ...draft, note: event.target.value })}
         rows={4}
         placeholder="Add context only you own."
         disabled={readOnly}
@@ -1518,8 +1791,8 @@ function ConversationDetail({
         <input
           id="conversation-hidden"
           type="checkbox"
-          checked={hidden}
-          onChange={(event) => setHidden(event.target.checked)}
+          checked={draft.hidden}
+          onChange={(event) => updateDraft({ ...draft, hidden: event.target.checked })}
           disabled={readOnly}
         />
         <span>Hidden from Graph</span>
@@ -1539,6 +1812,24 @@ function ConversationDetail({
       </button>
     </form>
   );
+}
+
+function conversationDraft(conversation: Conversation | null): ConversationDraft {
+  return {
+    title: conversation?.overlay.title ?? "",
+    tags: conversation?.overlay.tags.join(", ") ?? "",
+    status: conversation?.overlay.status ?? "none",
+    note: conversation?.overlay.note ?? "",
+    hidden: conversation?.overlay.hidden ?? false,
+  };
+}
+
+function isConversationDraftClean(draft: ConversationDraft, conversation: Conversation): boolean {
+  return draft.title === (conversation.overlay.title ?? "")
+    && JSON.stringify(normalizeTags(draft.tags)) === JSON.stringify(conversation.overlay.tags)
+    && draft.status === conversation.overlay.status
+    && (draft.note.trim() ? draft.note : "") === (conversation.overlay.note ?? "")
+    && draft.hidden === conversation.overlay.hidden;
 }
 
 function isGraphConflict(reason: unknown): reason is ApiError {
@@ -1659,6 +1950,21 @@ function describeMutationError(reason: unknown): string {
     return `Error category: ${error.payload.code}. ${error.message} The last saved snapshot is unchanged and your current edits remain here. ${retryLabel} ${nextStep}`;
   }
   return `Error category: local_error. ${error.message} The last saved snapshot is unchanged and your current edits remain here. Retry the save when ready.`;
+}
+
+function describeRefreshError(reason: unknown, hasSnapshot: boolean): string {
+  const error = asError(reason);
+  if (error instanceof ApiError) {
+    const retryable = error.payload.retryable ? "yes" : "no";
+    const retained = hasSnapshot
+      ? "The last complete snapshot is preserved."
+      : "No complete source snapshot is available yet.";
+    const nextStep = error.payload.retryable
+      ? "Retry the source refresh when it is available."
+      : "Review the error details before trying again.";
+    return `Error category: ${error.payload.code}. ${error.message} ${retained} Retryable: ${retryable}. ${nextStep}`;
+  }
+  return `Error category: local_error. ${error.message} ${hasSnapshot ? "The last complete snapshot is preserved." : "No complete source snapshot is available yet."} Retryable: yes. Retry the source refresh when it is available.`;
 }
 
 function formatTimestamp(timestamp: string | null): string {

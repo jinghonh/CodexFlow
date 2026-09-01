@@ -266,6 +266,88 @@ describe("Dashboard conversation list", () => {
     expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("Map the local runtime")).toBeInTheDocument();
   });
 
+  it("shows a stale marker after a refresh failure while retaining the previous views", async () => {
+    const user = userEvent.setup();
+    const staleSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      source: {
+        ...snapshot.source,
+        status: "stale",
+        error: {
+          code: "source_unavailable",
+          message: "active page failed",
+          details: { archived: false },
+          retryable: true,
+        },
+      },
+    };
+    const refresh = vi.fn().mockResolvedValue(staleSnapshot);
+    const api = apiDouble({ refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+
+    expect(await screen.findByText("Source stale")).toBeInTheDocument();
+    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Conversation graph" })).toBeInTheDocument();
+    expect(refresh).toHaveBeenCalledWith();
+  });
+
+  it("keeps the last complete views visible when a refresh endpoint is unavailable", async () => {
+    const user = userEvent.setup();
+    const refresh = vi.fn().mockRejectedValue(
+      new ApiError(503, {
+        code: "source_unavailable",
+        message: "The source could not be reached.",
+        details: { hasCompleteSnapshot: true },
+        retryable: true,
+      }),
+    );
+    const api = apiDouble({ refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+
+    const refreshAlert = await screen.findByRole("alert");
+    expect(refreshAlert).toHaveTextContent("Refresh failed · Error category: source_unavailable. The source could not be reached.");
+    expect(refreshAlert).toHaveTextContent("The last complete snapshot is preserved.");
+    expect(refreshAlert).toHaveTextContent("Retryable: yes.");
+    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Conversation graph" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Conversation timeline" })).toBeInTheDocument();
+  });
+
+  it("can retry the source from a selected Project after the initial load is unavailable", async () => {
+    const user = userEvent.setup();
+    const snapshotRequest = vi.fn().mockRejectedValue(
+      new ApiError(503, {
+        code: "source_unavailable",
+        message: "The source is not ready yet.",
+        details: null,
+        retryable: true,
+      }),
+    );
+    const refresh = vi.fn().mockResolvedValue(snapshot);
+    const api = apiDouble({ snapshot: snapshotRequest, refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    expect(await screen.findByText("Source unavailable")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith());
+    expect(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
+  });
+
   it("keeps a conversation with an invalid observation range visible with a warning", async () => {
     const user = userEvent.setup();
     const invalidSnapshot: DashboardSnapshot = {
@@ -319,6 +401,202 @@ describe("Dashboard conversation list", () => {
     expect(membership).toHaveTextContent("Outside the selected Project");
     expect(membership).toHaveTextContent("nested Git repositories are excluded");
     expect(membership).not.toHaveTextContent("its Git worktree");
+  });
+
+  it("refreshes the source while preserving selection and filters and discovers new conversations", async () => {
+    const user = userEvent.setup();
+    const initialSnapshot = snapshotWithTimeline();
+    const newArchived = {
+      ...snapshot.conversations[1],
+      id: "new-archived-id",
+      displayTitle: "New archived conversation",
+      codex: { ...snapshot.conversations[1].codex, title: "New archived conversation" },
+    };
+    const refreshedSnapshot = snapshotWithTimeline({
+      ...snapshot,
+      source: { ...snapshot.source, generatedAt: "2024-01-03T02:00:00Z" },
+      conversations: [...snapshot.conversations, newArchived],
+      graph: {
+        ...snapshot.graph,
+        nodes: [...snapshot.graph.nodes, {
+          id: newArchived.id,
+          displayTitle: newArchived.displayTitle,
+          missing: false,
+          hidden: false,
+          layout: null,
+        }],
+      },
+    });
+    const refresh = vi.fn().mockResolvedValue(refreshedSnapshot);
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(initialSnapshot), refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const list = within(await screen.findByRole("table", { name: "Conversation list" }));
+    await user.click(list.getByText("Archive the first pass"));
+    const filters = screen.getByRole("region", { name: "Conversation filters" });
+    await user.selectOptions(within(filters).getByLabelText("Filter by archived"), "archived");
+
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith({ granularity: "day", timezone: "UTC" }));
+    expect(within(screen.getByRole("region", { name: "Conversation filters" })).getByLabelText("Filter by archived")).toHaveValue("archived");
+    const refreshedList = within(screen.getByRole("table", { name: "Conversation list" }));
+    expect(refreshedList.getByText("new-archived-id")).toBeInTheDocument();
+    expect(refreshedList.queryByText("active-id")).not.toBeInTheDocument();
+    expect(refreshedList.getByText("archived-id").closest("tr")).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("region", { name: "Relationship editor" })).toHaveTextContent("No artificial relationships yet.");
+  });
+
+  it("requires a decision for a dirty detail draft and keeps cancel non-destructive", async () => {
+    const user = userEvent.setup();
+    const refresh = vi.fn().mockResolvedValue(snapshot);
+    const api = apiDouble({ refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    const titleInput = within(detail).getByLabelText("Custom title");
+    await user.type(titleInput, "Draft title");
+
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    const dialog = await screen.findByRole("dialog", { name: "Save your Graph changes first?" });
+    expect(refresh).not.toHaveBeenCalled();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog", { name: "Save your Graph changes first?" })).not.toBeInTheDocument();
+    expect(titleInput).toHaveValue("Draft title");
+    expect(refresh).not.toHaveBeenCalled();
+  });
+
+  it("discards a dirty detail draft before refreshing without changing the committed overlay", async () => {
+    const user = userEvent.setup();
+    const refresh = vi.fn().mockResolvedValue(snapshot);
+    const updateNode = vi.fn();
+    const api = apiDouble({ refresh, updateNode });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    await user.type(within(detail).getByLabelText("Custom title"), "Discard me");
+
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Discard changes & refresh" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    expect(updateNode).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(within(await screen.findByRole("region", { name: "Conversation detail" })).getByLabelText("Custom title")).toHaveValue("");
+  });
+
+  it("keeps the dirty draft and decision dialog open when saving before refresh fails", async () => {
+    const user = userEvent.setup();
+    const updateNode = vi.fn().mockRejectedValue(
+      new ApiError(412, {
+        code: "graph_conflict",
+        message: "The Graph changed elsewhere; reload before saving.",
+        details: null,
+        retryable: true,
+      }),
+    );
+    const refresh = vi.fn().mockResolvedValue(snapshot);
+    const api = apiDouble({ updateNode, refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    const titleInput = within(detail).getByLabelText("Custom title");
+    await user.type(titleInput, "Keep this draft");
+
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    const dialog = await screen.findByRole("dialog", { name: "Save your Graph changes first?" });
+    await user.click(within(dialog).getByRole("button", { name: "Save changes & refresh" }));
+
+    await waitFor(() => expect(within(dialog).getByRole("alert")).toHaveTextContent("Your draft is still dirty."));
+    expect(refresh).not.toHaveBeenCalled();
+    expect(titleInput).toHaveValue("Keep this draft");
+    expect(screen.getByRole("button", { name: "Refresh source" })).toHaveTextContent("Refresh source");
+  });
+
+  it("saves the dirty draft before refreshing and clears the dirty state", async () => {
+    const user = userEvent.setup();
+    const savedSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      graph: { ...snapshot.graph, etag: "saved-etag" },
+      conversations: snapshot.conversations.map((conversation) =>
+        conversation.id === "active-id"
+          ? {
+              ...conversation,
+              displayTitle: "Saved title",
+              overlay: { ...conversation.overlay, title: "Saved title" },
+            }
+          : conversation,
+      ),
+    };
+    const updateNode = vi.fn().mockResolvedValue(savedSnapshot);
+    const refresh = vi.fn().mockResolvedValue(savedSnapshot);
+    const api = apiDouble({ updateNode, refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    await user.type(within(detail).getByLabelText("Custom title"), "Saved title");
+
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Save changes & refresh" }));
+
+    await waitFor(() => expect(updateNode).toHaveBeenCalledWith(
+      "active-id",
+      {
+        title: "Saved title",
+        tags: [],
+        status: "none",
+        note: null,
+        hidden: false,
+      },
+      "absent",
+    ));
+    await waitFor(() => expect(refresh).toHaveBeenCalledWith());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.getByText("Source sync ready")).toBeInTheDocument();
+  });
+
+  it("protects an unsaved relationship draft during refresh", async () => {
+    const user = userEvent.setup();
+    const refresh = vi.fn().mockResolvedValue(snapshot);
+    const createEdge = vi.fn();
+    const api = apiDouble({ refresh, createEdge });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const editor = await screen.findByRole("region", { name: "Relationship editor" });
+    const sourceInput = within(editor).getByLabelText("Source");
+    await user.type(sourceInput, "active-id");
+
+    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog).toHaveTextContent("One unsaved Graph draft is open");
+    await user.click(within(dialog).getByRole("button", { name: "Discard changes & refresh" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    expect(createEdge).not.toHaveBeenCalled();
+    expect(within(await screen.findByRole("region", { name: "Relationship editor" })).getByLabelText("Source")).toHaveValue("");
   });
 });
 

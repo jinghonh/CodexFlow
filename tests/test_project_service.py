@@ -10,7 +10,7 @@ import pytest
 import codexflow.graph as graph_module
 from codexflow.graph import GraphOverlayError
 from codexflow.project import ProjectGraphService, ProjectInvalidError
-from codexflow.source import CodexThread, SourceReadResult
+from codexflow.source import CodexThread, SourceFailure, SourceReadResult
 
 
 def make_thread(
@@ -82,6 +82,16 @@ def ready(*threads: CodexThread) -> SourceReadResult:
     )
 
 
+def stale(*threads: CodexThread) -> SourceReadResult:
+    return SourceReadResult(
+        status="stale",
+        threads=tuple(threads),
+        generated_at="2024-01-01T02:00:00Z",
+        user_agent="Codex Desktop/0.150.1 fixture",
+        error=SourceFailure("source_unavailable", "fixture source page failed"),
+    )
+
+
 def write_graph(project: Path, content: str) -> None:
     graph_directory = project / ".codex"
     graph_directory.mkdir(exist_ok=True)
@@ -143,6 +153,81 @@ def test_service_keeps_thread_id_stable_across_refreshes(tmp_path: Path) -> None
     assert first.conversations[0].id == "stable-id"
     assert second.conversations[0].id == "stable-id"
     assert second.conversations[0].display_title == "Updated title"
+
+
+def test_complete_refresh_discovers_new_conversations_without_creating_edges(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("first-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    first = service.snapshot()
+    source.result = ready(
+        make_thread("first-id", project),
+        make_thread("new-id", project, title="New source conversation"),
+        make_thread("archived-id", project, archived=True),
+    )
+    refreshed = service.snapshot()
+
+    assert [conversation.id for conversation in first.conversations] == ["first-id"]
+    assert [conversation.id for conversation in refreshed.conversations] == [
+        "first-id",
+        "new-id",
+        "archived-id",
+    ]
+    assert refreshed.graph.edges == ()
+
+
+def test_stale_refresh_preserves_missing_decisions_until_a_complete_refresh(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  historical-id:
+    title: Historical work
+""",
+    )
+    source = StubSource(ready(make_thread("present-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    first = service.snapshot()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  historical-id:
+    title: Historical work
+  newly-referenced-id:
+    title: New reference
+""",
+    )
+    source.result = stale(make_thread("present-id", project))
+    stale_snapshot = service.snapshot()
+
+    first_conversations = {item.id: item for item in first.conversations}
+    stale_conversations = {item.id: item for item in stale_snapshot.conversations}
+    assert first_conversations["historical-id"].derived.missing is True
+    assert stale_snapshot.source_status == "stale"
+    assert stale_conversations["historical-id"].derived.missing is True
+    assert stale_conversations["newly-referenced-id"].derived.missing is False
+
+    source.result = ready(
+        make_thread("present-id", project),
+        make_thread("newly-referenced-id", project),
+        make_thread("historical-id", project),
+    )
+    recovered = service.snapshot()
+    recovered_conversations = {item.id: item for item in recovered.conversations}
+    assert recovered_conversations["historical-id"].derived.missing is False
+    assert recovered_conversations["newly-referenced-id"].derived.missing is False
 
 
 def test_snapshot_uses_source_conversations_as_graph_nodes_without_an_overlay(
