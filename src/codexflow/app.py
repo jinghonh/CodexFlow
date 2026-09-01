@@ -76,6 +76,10 @@ class GraphEdgePatchRequest(BaseModel):
     label: StrictStr | None = None
 
 
+class GraphCopyRequest(BaseModel):
+    document: dict[str, Any]
+
+
 class ApiFailure(Exception):
     def __init__(
         self,
@@ -176,6 +180,39 @@ def create_app(*, source: object | None = None) -> FastAPI:
         except ProjectNotSelectedError as exc:
             raise ApiFailure(404, "project_not_selected", str(exc)) from exc
 
+    @app.post("/api/graph/migrate")
+    def migrate_graph(
+        response: Response,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        expected_etag = _require_if_match(if_match)
+        try:
+            outcome = service.migrate_graph(
+                expected_etag=expected_etag,
+                allow_overwrite=overwrite,
+            )
+        except ProjectNotSelectedError as exc:
+            raise ApiFailure(404, "project_not_selected", str(exc)) from exc
+        except SourceUnavailableError as exc:
+            raise _source_api_failure(exc) from exc
+        except GraphOverlayError as exc:
+            raise _graph_api_failure(exc) from exc
+        response.headers["ETag"] = _quote_etag(outcome.snapshot.graph.etag)
+        payload = outcome.snapshot.to_dict()
+        payload["backupPath"] = str(outcome.backup_path) if outcome.backup_path else None
+        return payload
+
+    @app.post("/api/graph/copy")
+    def copy_graph(payload: GraphCopyRequest) -> dict[str, Any]:
+        try:
+            copy_path = service.save_graph_copy(payload.document)
+        except ProjectNotSelectedError as exc:
+            raise ApiFailure(404, "project_not_selected", str(exc)) from exc
+        except GraphOverlayError as exc:
+            raise _graph_api_failure(exc) from exc
+        return {"copyPath": str(copy_path)}
+
     @app.get("/api/snapshot")
     def get_snapshot(
         response: Response,
@@ -195,6 +232,7 @@ def create_app(*, source: object | None = None) -> FastAPI:
         payload: GraphNodePatchRequest,
         response: Response,
         if_match: str | None = Header(default=None, alias="If-Match"),
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         if if_match is None or not if_match.strip():
             raise ApiFailure(
@@ -212,6 +250,7 @@ def create_app(*, source: object | None = None) -> FastAPI:
                 conversation_id,
                 changes,
                 expected_etag=_unquote_etag(if_match),
+                allow_overwrite=overwrite,
             )
         except ProjectNotSelectedError as exc:
             raise ApiFailure(404, "project_not_selected", str(exc)) from exc
@@ -227,6 +266,7 @@ def create_app(*, source: object | None = None) -> FastAPI:
         payload: GraphEdgeCreateRequest,
         response: Response,
         if_match: str | None = Header(default=None, alias="If-Match"),
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         expected_etag = _require_if_match(if_match)
         try:
@@ -236,6 +276,7 @@ def create_app(*, source: object | None = None) -> FastAPI:
                 payload.type,
                 payload.label,
                 expected_etag=expected_etag,
+                allow_overwrite=overwrite,
             )
         except ProjectNotSelectedError as exc:
             raise ApiFailure(404, "project_not_selected", str(exc)) from exc
@@ -254,6 +295,7 @@ def create_app(*, source: object | None = None) -> FastAPI:
         payload: GraphEdgePatchRequest,
         response: Response,
         if_match: str | None = Header(default=None, alias="If-Match"),
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         expected_etag = _require_if_match(if_match)
         changes = payload.model_dump(exclude_unset=True)
@@ -264,6 +306,7 @@ def create_app(*, source: object | None = None) -> FastAPI:
                 edge_id,
                 changes,
                 expected_etag=expected_etag,
+                allow_overwrite=overwrite,
             )
         except ProjectNotSelectedError as exc:
             raise ApiFailure(404, "project_not_selected", str(exc)) from exc
@@ -279,10 +322,15 @@ def create_app(*, source: object | None = None) -> FastAPI:
         edge_id: str,
         response: Response,
         if_match: str | None = Header(default=None, alias="If-Match"),
+        overwrite: bool = False,
     ) -> dict[str, Any]:
         expected_etag = _require_if_match(if_match)
         try:
-            snapshot = service.delete_edge(edge_id, expected_etag=expected_etag)
+            snapshot = service.delete_edge(
+                edge_id,
+                expected_etag=expected_etag,
+                allow_overwrite=overwrite,
+            )
         except ProjectNotSelectedError as exc:
             raise ApiFailure(404, "project_not_selected", str(exc)) from exc
         except SourceUnavailableError as exc:

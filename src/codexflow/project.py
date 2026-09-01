@@ -10,7 +10,9 @@ from .graph import (
     GraphOverlay,
     create_graph_edge,
     delete_graph_edge,
+    migrate_graph_overlay,
     read_graph_overlay,
+    save_graph_copy,
     update_graph_edge,
     update_graph_node,
 )
@@ -85,6 +87,12 @@ class _ProjectContext:
     worktree_root: Path | None
 
 
+@dataclass(frozen=True)
+class GraphMigrationOutcome:
+    snapshot: DashboardSnapshot
+    backup_path: Path | None
+
+
 class ProjectGraphService:
     def __init__(self, source: object, *, git_resolver: GitResolver | None = None) -> None:
         self._source = source
@@ -152,12 +160,38 @@ class ProjectGraphService:
             timezone=timezone,
         )
 
+    def migrate_graph(
+        self,
+        *,
+        expected_etag: str,
+        allow_overwrite: bool = False,
+    ) -> GraphMigrationOutcome:
+        project = self._require_project()
+        result = self._source.read_snapshot()
+        if result.status in {"unavailable", "incompatible"}:
+            raise SourceUnavailableError(result)
+        graph_overlay = migrate_graph_overlay(
+            project.real_path,
+            expected_etag=expected_etag,
+            allow_overwrite=allow_overwrite,
+        )
+        self._graph_file_status = graph_overlay.file_status
+        return GraphMigrationOutcome(
+            snapshot=self._build_snapshot(result, graph_overlay, project),
+            backup_path=graph_overlay.backup_path,
+        )
+
+    def save_graph_copy(self, document: Mapping[str, object]) -> Path:
+        project = self._require_project()
+        return save_graph_copy(project.real_path, document)
+
     def update_node_overlay(
         self,
         conversation_id: str,
         changes: Mapping[str, object],
         *,
         expected_etag: str,
+        allow_overwrite: bool = False,
     ) -> DashboardSnapshot:
         project = self._require_project()
         result = self._source.read_snapshot()
@@ -168,6 +202,7 @@ class ProjectGraphService:
             conversation_id,
             changes,
             expected_etag=expected_etag,
+            allow_overwrite=allow_overwrite,
         )
         self._graph_file_status = graph_overlay.file_status
         return self._build_snapshot(result, graph_overlay, project)
@@ -180,6 +215,7 @@ class ProjectGraphService:
         label: str | None = None,
         *,
         expected_etag: str,
+        allow_overwrite: bool = False,
     ) -> DashboardSnapshot:
         project = self._require_project()
         result = self._source.read_snapshot()
@@ -192,6 +228,7 @@ class ProjectGraphService:
             edge_type,
             label,
             expected_etag=expected_etag,
+            allow_overwrite=allow_overwrite,
         )
         self._graph_file_status = graph_overlay.file_status
         return self._build_snapshot(result, graph_overlay, project)
@@ -202,6 +239,7 @@ class ProjectGraphService:
         changes: Mapping[str, object],
         *,
         expected_etag: str,
+        allow_overwrite: bool = False,
     ) -> DashboardSnapshot:
         project = self._require_project()
         result = self._source.read_snapshot()
@@ -212,11 +250,18 @@ class ProjectGraphService:
             edge_id,
             changes,
             expected_etag=expected_etag,
+            allow_overwrite=allow_overwrite,
         )
         self._graph_file_status = graph_overlay.file_status
         return self._build_snapshot(result, graph_overlay, project)
 
-    def delete_edge(self, edge_id: str, *, expected_etag: str) -> DashboardSnapshot:
+    def delete_edge(
+        self,
+        edge_id: str,
+        *,
+        expected_etag: str,
+        allow_overwrite: bool = False,
+    ) -> DashboardSnapshot:
         project = self._require_project()
         result = self._source.read_snapshot()
         if result.status in {"unavailable", "incompatible"}:
@@ -225,6 +270,7 @@ class ProjectGraphService:
             project.real_path,
             edge_id,
             expected_etag=expected_etag,
+            allow_overwrite=allow_overwrite,
         )
         self._graph_file_status = graph_overlay.file_status
         return self._build_snapshot(result, graph_overlay, project)

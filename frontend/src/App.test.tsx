@@ -104,6 +104,8 @@ function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
     selectProject: vi.fn().mockResolvedValue({ project, source: health.source }),
     snapshot: vi.fn().mockResolvedValue(snapshot),
     refresh: vi.fn().mockResolvedValue(snapshot),
+    migrateGraph: vi.fn().mockResolvedValue({ ...snapshot, backupPath: null }),
+    saveCopy: vi.fn().mockResolvedValue({ copyPath: "/projects/codexflow/.codex/graph.yaml.copy.fixture" }),
     updateNode: vi.fn().mockResolvedValue(snapshot),
     createEdge: vi.fn().mockResolvedValue(snapshot),
     updateEdge: vi.fn().mockResolvedValue(snapshot),
@@ -114,6 +116,8 @@ function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
     selectProject: overrides.selectProject ?? defaults.selectProject,
     snapshot: overrides.snapshot ?? defaults.snapshot,
     refresh: overrides.refresh ?? defaults.refresh,
+    migrateGraph: overrides.migrateGraph ?? defaults.migrateGraph,
+    saveCopy: overrides.saveCopy ?? defaults.saveCopy,
     updateNode: overrides.updateNode ?? defaults.updateNode,
     createEdge: overrides.createEdge ?? defaults.createEdge,
     updateEdge: overrides.updateEdge ?? defaults.updateEdge,
@@ -416,6 +420,213 @@ describe("Dashboard graph", () => {
     expect(alert).toHaveTextContent("The Graph changed elsewhere; reload before saving.");
     expect(titleInput).toHaveValue("Draft title");
     expect(noteInput).toHaveValue("Draft note");
+  });
+
+  it("offers reload, save-copy, and explicit overwrite actions after a Graph conflict", async () => {
+    const user = userEvent.setup();
+    const updateNode = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiError(412, {
+          code: "graph_conflict",
+          message: "The Graph changed elsewhere; reload before saving.",
+          details: { expectedEtag: "draft-etag", currentEtag: "external-etag" },
+          retryable: true,
+        }),
+      )
+      .mockResolvedValue(snapshot);
+    const refresh = vi.fn().mockResolvedValue(snapshot);
+    const saveCopy = vi.fn().mockResolvedValue({ copyPath: "/projects/codexflow/.codex/graph.yaml.copy.fixture" });
+    const api = apiDouble({ updateNode, refresh, saveCopy });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    await user.type(within(detail).getByLabelText("Custom title"), "Draft title");
+    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+
+    const conflict = await screen.findByRole("alert", { name: "Graph conflict" });
+    expect(conflict).toHaveTextContent("The Graph changed elsewhere; reload before saving.");
+    expect(conflict).toHaveTextContent("draft-etag");
+    expect(conflict).toHaveTextContent("external-etag");
+    expect(within(detail).getByLabelText("Custom title")).toHaveValue("Draft title");
+    expect(within(conflict).getByRole("button", { name: "Reload Graph" })).toBeInTheDocument();
+    expect(within(conflict).getByRole("button", { name: "Save a copy" })).toBeInTheDocument();
+    expect(within(conflict).getByRole("button", { name: "Overwrite explicitly" })).toBeInTheDocument();
+
+    await user.click(within(conflict).getByRole("button", { name: "Save a copy" }));
+    await waitFor(() => expect(saveCopy).toHaveBeenCalled());
+    expect(saveCopy.mock.calls[0][0].nodes["active-id"].title).toBe("Draft title");
+    expect(conflict).toHaveTextContent("graph.yaml.copy.fixture");
+
+    await user.click(within(conflict).getByRole("button", { name: "Overwrite explicitly" }));
+    await waitFor(() => expect(updateNode).toHaveBeenCalledTimes(2));
+    expect(updateNode.mock.calls[1][2]).toBe("*");
+    expect(updateNode.mock.calls[1][3]).toBe(true);
+  });
+
+  it("opens a future Graph version read-only and disables save controls", async () => {
+    const user = userEvent.setup();
+    const futureSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      project: { ...project, graphFileStatus: "future" },
+      graph: { ...snapshot.graph, fileStatus: "future" },
+    };
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(futureSnapshot) });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const notice = await screen.findByRole("status", { name: "Graph overlay status" });
+    expect(notice).toHaveTextContent("read-only");
+
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    expect(within(detail).getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+
+  it("keeps a structured disk-full error visible in the detail editor", async () => {
+    const user = userEvent.setup();
+    const updateNode = vi.fn().mockRejectedValue(
+      new ApiError(500, {
+        code: "graph_write_error",
+        message: "Graph overlay could not be saved: disk full.",
+        details: { errno: 28, errnoName: "ENOSPC" },
+        retryable: true,
+      }),
+    );
+    const api = apiDouble({ updateNode });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    await user.type(within(detail).getByLabelText("Custom title"), "Draft title");
+    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+
+    const alert = await within(detail).findByRole("alert");
+    expect(alert).toHaveTextContent("graph_write_error");
+    expect(alert).toHaveTextContent("disk full");
+    expect(within(detail).getByLabelText("Custom title")).toHaveValue("Draft title");
+  });
+
+  it("offers an explicit migration action for a legacy Graph version", async () => {
+    const user = userEvent.setup();
+    const legacySnapshot: DashboardSnapshot = {
+      ...snapshot,
+      project: { ...project, graphFileStatus: "legacy" },
+      graph: { ...snapshot.graph, fileStatus: "legacy" },
+    };
+    const migratedSnapshot = {
+      ...snapshot,
+      graph: { ...snapshot.graph, etag: "migrated-etag", fileStatus: "ready" },
+      project: { ...project, graphFileStatus: "ready" },
+      backupPath: "/projects/codexflow/.codex/graph.yaml.bak.fixture",
+    };
+    const migrateGraph = vi.fn().mockResolvedValue(migratedSnapshot);
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(legacySnapshot), migrateGraph });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const notice = await screen.findByRole("status", { name: "Graph overlay status" });
+    await user.click(within(notice).getByRole("button", { name: "Migrate with backup" }));
+
+    await waitFor(() => expect(migrateGraph).toHaveBeenCalledWith("absent"));
+    expect(await screen.findByText(/graph.yaml.bak.fixture/)).toBeInTheDocument();
+  });
+
+  it("reloads the externally saved Graph and replaces the local draft", async () => {
+    const user = userEvent.setup();
+    const externalSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      graph: { ...snapshot.graph, etag: "external-etag" },
+      conversations: snapshot.conversations.map((conversation) =>
+        conversation.id === "active-id"
+          ? {
+              ...conversation,
+              displayTitle: "External title",
+              overlay: { ...conversation.overlay, title: "External title" },
+            }
+          : conversation,
+      ),
+    };
+    const updateNode = vi.fn().mockRejectedValue(
+      new ApiError(412, {
+        code: "graph_conflict",
+        message: "The Graph changed elsewhere; reload before saving.",
+        details: null,
+        retryable: true,
+      }),
+    );
+    const refresh = vi.fn().mockResolvedValue(externalSnapshot);
+    const api = apiDouble({ updateNode, refresh });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    await user.type(within(detail).getByLabelText("Custom title"), "Local draft");
+    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+
+    const conflict = await screen.findByRole("alert", { name: "Graph conflict" });
+    await user.click(within(conflict).getByRole("button", { name: "Reload Graph" }));
+
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("alert", { name: "Graph conflict" })).not.toBeInTheDocument();
+    expect(within(await screen.findByRole("region", { name: "Conversation detail" })).getByLabelText("Custom title")).toHaveValue("External title");
+  });
+
+  it("routes a migration conflict through the same explicit resolution actions", async () => {
+    const user = userEvent.setup();
+    const legacySnapshot: DashboardSnapshot = {
+      ...snapshot,
+      project: { ...project, graphFileStatus: "legacy" },
+      graph: { ...snapshot.graph, fileStatus: "legacy" },
+    };
+    const migratedSnapshot = {
+      ...snapshot,
+      project: { ...project, graphFileStatus: "ready" },
+      graph: { ...snapshot.graph, etag: "migrated-etag", fileStatus: "ready" },
+      backupPath: "/projects/codexflow/.codex/graph.yaml.bak.fixture",
+    };
+    const migrateGraph = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ApiError(412, {
+          code: "graph_conflict",
+          message: "The legacy Graph changed elsewhere.",
+          details: { expectedEtag: "legacy-etag", currentEtag: "external-etag" },
+          retryable: true,
+        }),
+      )
+      .mockResolvedValue(migratedSnapshot);
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(legacySnapshot), migrateGraph });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const notice = await screen.findByRole("status", { name: "Graph overlay status" });
+    await user.click(within(notice).getByRole("button", { name: "Migrate with backup" }));
+
+    const conflict = await screen.findByRole("alert", { name: "Graph conflict" });
+    expect(conflict).toHaveTextContent("legacy-etag");
+    expect(conflict).toHaveTextContent("external-etag");
+    await user.click(within(conflict).getByRole("button", { name: "Overwrite explicitly" }));
+
+    await waitFor(() => expect(migrateGraph).toHaveBeenCalledWith("*", true));
+    expect(await screen.findByText(/graph.yaml.bak.fixture/)).toBeInTheDocument();
   });
 
   it("saves a node layout only after the node drag ends", async () => {

@@ -2,8 +2,11 @@ import type {
   ApiErrorPayload,
   DashboardSnapshot,
   ConversationOverlayUpdate,
+  GraphCopyResult,
+  GraphDocument,
   GraphEdgeCreate,
   GraphEdgeUpdate,
+  GraphMigrationResponse,
   HealthResponse,
   ProjectView,
   SourceSummary,
@@ -32,14 +35,17 @@ export interface DashboardApi {
   selectProject(path: string): Promise<{ project: ProjectView; source: SourceSummary }>;
   snapshot(options?: TimelineOptions): Promise<DashboardSnapshot>;
   refresh(options?: TimelineOptions): Promise<DashboardSnapshot>;
+  migrateGraph(etag: string, overwrite?: boolean): Promise<GraphMigrationResponse>;
+  saveCopy(document: GraphDocument): Promise<GraphCopyResult>;
   updateNode(
     conversationId: string,
     changes: ConversationOverlayUpdate,
     etag: string,
+    overwrite?: boolean,
   ): Promise<DashboardSnapshot>;
-  createEdge(edge: GraphEdgeCreate, etag: string): Promise<DashboardSnapshot>;
-  updateEdge(edgeId: string, changes: GraphEdgeUpdate, etag: string): Promise<DashboardSnapshot>;
-  deleteEdge(edgeId: string, etag: string): Promise<DashboardSnapshot>;
+  createEdge(edge: GraphEdgeCreate, etag: string, overwrite?: boolean): Promise<DashboardSnapshot>;
+  updateEdge(edgeId: string, changes: GraphEdgeUpdate, etag: string, overwrite?: boolean): Promise<DashboardSnapshot>;
+  deleteEdge(edgeId: string, etag: string, overwrite?: boolean): Promise<DashboardSnapshot>;
 }
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -55,8 +61,19 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
       }),
     snapshot: (options) => request<DashboardSnapshot>(fetchLike, withTimelineOptions("/api/snapshot", options)),
     refresh: (options) => request<DashboardSnapshot>(fetchLike, withTimelineOptions("/api/refresh", options), { method: "POST" }),
-    updateNode: (conversationId, changes, etag) =>
-      request<DashboardSnapshot>(fetchLike, `/api/graph/nodes/${encodeURIComponent(conversationId)}`, {
+    migrateGraph: (etag, overwrite = false) =>
+      request<GraphMigrationResponse>(fetchLike, withOverwrite("/api/graph/migrate", overwrite), {
+        method: "POST",
+        headers: { "If-Match": etag },
+      }),
+    saveCopy: (document) =>
+      request<GraphCopyResult>(fetchLike, "/api/graph/copy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ document }),
+      }),
+    updateNode: (conversationId, changes, etag, overwrite = false) =>
+      request<DashboardSnapshot>(fetchLike, withOverwrite(`/api/graph/nodes/${encodeURIComponent(conversationId)}`, overwrite), {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
@@ -64,8 +81,8 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
         },
         body: JSON.stringify(changes),
       }),
-    createEdge: (edge, etag) =>
-      request<DashboardSnapshot>(fetchLike, "/api/graph/edges", {
+    createEdge: (edge, etag, overwrite = false) =>
+      request<DashboardSnapshot>(fetchLike, withOverwrite("/api/graph/edges", overwrite), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -73,8 +90,8 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
         },
         body: JSON.stringify(edge),
       }),
-    updateEdge: (edgeId, changes, etag) =>
-      request<DashboardSnapshot>(fetchLike, `/api/graph/edges/${encodeURIComponent(edgeId)}`, {
+    updateEdge: (edgeId, changes, etag, overwrite = false) =>
+      request<DashboardSnapshot>(fetchLike, withOverwrite(`/api/graph/edges/${encodeURIComponent(edgeId)}`, overwrite), {
         method: "PATCH",
         headers: {
           "Content-Type": "application/json",
@@ -82,8 +99,8 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
         },
         body: JSON.stringify(changes),
       }),
-    deleteEdge: (edgeId, etag) =>
-      request<DashboardSnapshot>(fetchLike, `/api/graph/edges/${encodeURIComponent(edgeId)}`, {
+    deleteEdge: (edgeId, etag, overwrite = false) =>
+      request<DashboardSnapshot>(fetchLike, withOverwrite(`/api/graph/edges/${encodeURIComponent(edgeId)}`, overwrite), {
         method: "DELETE",
         headers: { "If-Match": etag },
       }),
@@ -97,6 +114,10 @@ function withTimelineOptions(path: string, options?: TimelineOptions): string {
     timezone: options.timezone,
   });
   return `${path}?${params.toString()}`;
+}
+
+function withOverwrite(path: string, overwrite: boolean): string {
+  return overwrite ? `${path}?overwrite=true` : path;
 }
 
 async function request<T>(fetchLike: FetchLike, url: string, init?: RequestInit): Promise<T> {

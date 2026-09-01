@@ -45,7 +45,7 @@ button { cursor: pointer; }
   padding: 32px clamp(20px, 5vw, 76px) 80px;
 }
 
-.topbar, .hero-grid, .list-heading, .project-ribbon, .loading-panel, .source-alert, .detail-panel {
+.topbar, .hero-grid, .list-heading, .project-ribbon, .loading-panel, .source-alert, .detail-panel, .graph-conflict-panel, .graph-status-notice {
   animation: rise-in 560ms ease both;
 }
 
@@ -186,6 +186,55 @@ h1 {
 .source-alert strong { color: var(--orange); font-size: 12px; }
 .source-alert p { margin: 6px 0; color: var(--paper); line-height: 1.5; }
 .alert-note { color: var(--paper-dim); font-size: 10px; }
+
+.graph-conflict-panel, .graph-status-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 15px;
+  margin-top: 28px;
+  border: 1px solid rgba(255, 139, 94, 0.52);
+  background: linear-gradient(110deg, rgba(255, 139, 94, 0.10), rgba(255, 139, 94, 0.025));
+  padding: 19px;
+}
+.graph-status-notice { border-color: rgba(184, 226, 78, 0.42); background: rgba(184, 226, 78, 0.055); }
+.graph-status-notice.is-future { border-color: rgba(255, 139, 94, 0.52); background: rgba(255, 139, 94, 0.065); }
+.graph-status-notice.is-migrated { border-color: rgba(184, 226, 78, 0.58); }
+.conflict-symbol, .status-symbol {
+  display: inline-grid;
+  flex: 0 0 auto;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1px solid var(--orange);
+  color: var(--orange);
+  font-size: 14px;
+  font-weight: 700;
+}
+.status-symbol { border-color: var(--lime); color: var(--lime); }
+.graph-status-notice.is-future .status-symbol { border-color: var(--orange); color: var(--orange); }
+.conflict-copy { display: grid; gap: 8px; min-width: 0; }
+.conflict-copy .section-kicker, .graph-status-notice .section-kicker { margin-bottom: 0; color: var(--orange); }
+.graph-status-notice:not(.is-future) .section-kicker { color: var(--lime); }
+.conflict-copy strong, .graph-status-notice strong { color: var(--paper); font-size: 13px; }
+.conflict-copy p, .graph-status-notice p { margin: 0; color: var(--paper-dim); font-size: 11px; line-height: 1.55; }
+.conflict-note, .status-result, .status-error, .conflict-result, .conflict-action-error { color: var(--paper-dim); font-size: 10px; line-height: 1.5; overflow-wrap: anywhere; }
+.conflict-result, .status-result { color: var(--lime); }
+.conflict-action-error, .status-error { color: var(--orange); }
+.conflict-version { display: flex; flex-wrap: wrap; gap: 6px 16px; color: var(--paper-dim); font-size: 10px; }
+.conflict-version code { display: inline; margin: 0; color: var(--paper); font-size: 9px; }
+.conflict-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 4px; }
+.conflict-actions button, .graph-status-notice button {
+  border: 1px solid rgba(231, 234, 223, 0.32);
+  background: rgba(231, 234, 223, 0.06);
+  color: var(--paper);
+  padding: 9px 11px;
+  font-size: 10px;
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+.conflict-actions button:hover:not(:disabled), .graph-status-notice button:hover:not(:disabled), .conflict-actions button:focus-visible, .graph-status-notice button:focus-visible { border-color: var(--lime); color: var(--lime); outline: 0; transform: translateY(-2px); }
+.conflict-actions button.is-danger { border-color: rgba(255, 139, 94, 0.62); color: var(--orange); }
+.conflict-actions button.is-danger:hover:not(:disabled), .conflict-actions button.is-danger:focus-visible { border-color: var(--orange); background: rgba(255, 139, 94, 0.10); color: var(--orange); }
+.conflict-actions button:disabled, .graph-status-notice button:disabled { cursor: wait; opacity: 0.55; }
 
 .membership-panel {
   margin-top: 28px;

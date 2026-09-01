@@ -96,6 +96,31 @@ export interface GraphEdgeUpdate {
   label?: string | null;
 }
 
+export interface GraphDocumentNode {
+  title?: string;
+  tags?: string[];
+  status?: UserStatus;
+  note?: string;
+  hidden?: boolean;
+  layout?: NodeLayout;
+}
+
+export interface GraphDocument {
+  version: number;
+  project?: { name?: string };
+  nodes?: Record<string, GraphDocumentNode>;
+  edges?: GraphEdge[];
+  [key: string]: unknown;
+}
+
+export interface GraphCopyResult {
+  copyPath: string;
+}
+
+export interface GraphMigrationResponse extends DashboardSnapshot {
+  backupPath: string | null;
+}
+
 export interface DerivedConversationState {
   missing: boolean;
   unlinked: boolean;

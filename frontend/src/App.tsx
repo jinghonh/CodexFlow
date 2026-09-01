@@ -19,6 +19,9 @@ import type {
   GraphNode,
   HealthResponse,
   ConversationOverlayUpdate,
+  GraphDocument,
+  GraphDocumentNode,
+  GraphCopyResult,
   NodeLayout,
   ProjectView,
   TimelineGranularity,
@@ -30,6 +33,14 @@ interface AppProps {
 }
 
 type LoadState = "idle" | "loading" | "ready" | "error";
+
+interface GraphConflictState {
+  message: string;
+  document: GraphDocument;
+  expectedEtag: string | null;
+  currentEtag: string | null;
+  retry: () => Promise<DashboardSnapshot>;
+}
 
 export function App({ api }: AppProps) {
   const apiClient = useMemo(() => api ?? createApi(), [api]);
@@ -43,6 +54,14 @@ export function App({ api }: AppProps) {
   const [filters, setFilters] = useState<ConversationFilters>(DEFAULT_CONVERSATION_FILTERS);
   const [timelineLoading, setTimelineLoading] = useState(false);
   const [timelineError, setTimelineError] = useState<string | null>(null);
+  const [graphConflict, setGraphConflict] = useState<GraphConflictState | null>(null);
+  const [graphConflictAction, setGraphConflictAction] = useState<"idle" | "working" | "saved">("idle");
+  const [graphConflictCopyPath, setGraphConflictCopyPath] = useState<string | null>(null);
+  const [graphConflictActionError, setGraphConflictActionError] = useState<string | null>(null);
+  const [detailResetToken, setDetailResetToken] = useState(0);
+  const [graphMigrationState, setGraphMigrationState] = useState<"idle" | "working">("idle");
+  const [graphMigrationError, setGraphMigrationError] = useState<string | null>(null);
+  const [graphMigrationBackupPath, setGraphMigrationBackupPath] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -72,6 +91,12 @@ export function App({ api }: AppProps) {
     setSnapshot(null);
     setSelectedConversationId(null);
     setFilters(DEFAULT_CONVERSATION_FILTERS);
+    setGraphConflict(null);
+    setGraphConflictCopyPath(null);
+    setGraphConflictActionError(null);
+    setGraphMigrationState("idle");
+    setGraphMigrationError(null);
+    setGraphMigrationBackupPath(null);
     try {
       const selected = await apiClient.selectProject(trimmedPath);
       setProject(selected.project);
@@ -109,43 +134,174 @@ export function App({ api }: AppProps) {
     }
   }
 
-  async function handleNodeUpdate(
+  function publishSnapshot(updated: DashboardSnapshot, resetDetail = false): void {
+    setSnapshot(updated);
+    setProject(updated.project);
+    if (resetDetail) setDetailResetToken((token) => token + 1);
+  }
+
+  function rememberGraphConflict(
+    reason: unknown,
+    document: GraphDocument,
+    retry: () => Promise<DashboardSnapshot>,
+  ): void {
+    if (!isGraphConflict(reason)) return;
+    const details = reason.payload.details;
+    setGraphConflict({
+      message: reason.message,
+      document,
+      expectedEtag: typeof details?.expectedEtag === "string" ? details.expectedEtag : null,
+      currentEtag: typeof details?.currentEtag === "string" ? details.currentEtag : null,
+      retry,
+    });
+    setGraphConflictAction("idle");
+    setGraphConflictCopyPath(null);
+    setGraphConflictActionError(null);
+  }
+
+  async function runGraphMutation(
+    buildConflictDocument: (base: DashboardSnapshot) => GraphDocument,
+    execute: (etag: string, overwrite: boolean) => Promise<DashboardSnapshot>,
+    overwrite: boolean,
+  ): Promise<void> {
+    if (!snapshot) throw new Error("Load a Project before saving Graph changes.");
+    const baseSnapshot = snapshot;
+    try {
+      const updated = await execute(overwrite ? "*" : baseSnapshot.graph.etag, overwrite);
+      publishSnapshot(updated, overwrite);
+      if (overwrite) setGraphConflict(null);
+    } catch (reason: unknown) {
+      if (!overwrite) {
+        rememberGraphConflict(
+          reason,
+          buildConflictDocument(baseSnapshot),
+          async () => {
+            const updated = await execute("*", true);
+            publishSnapshot(updated, true);
+            setGraphConflict(null);
+            return updated;
+          },
+        );
+      }
+      throw reason;
+    }
+  }
+
+  function handleNodeUpdate(
     conversationId: string,
     changes: ConversationOverlayUpdate,
+    overwrite = false,
   ): Promise<void> {
-    if (!snapshot) {
-      throw new Error("Load a Project before saving Conversation changes.");
-    }
-    const updated = await apiClient.updateNode(conversationId, changes, snapshot.graph.etag);
-    setSnapshot(updated);
-    setProject(updated.project);
+    return runGraphMutation(
+      (base) => graphDocumentWithNode(base, conversationId, changes),
+      (etag, force) => force
+        ? apiClient.updateNode(conversationId, changes, etag, true)
+        : apiClient.updateNode(conversationId, changes, etag),
+      overwrite,
+    );
   }
 
-  async function handleEdgeCreate(edge: GraphEdgeCreate): Promise<void> {
-    if (!snapshot) {
-      throw new Error("Load a Project before saving a relationship.");
-    }
-    const updated = await apiClient.createEdge(edge, snapshot.graph.etag);
-    setSnapshot(updated);
-    setProject(updated.project);
+  function handleEdgeCreate(edge: GraphEdgeCreate, overwrite = false): Promise<void> {
+    return runGraphMutation(
+      (base) => graphDocumentWithCreatedEdge(base, edge),
+      (etag, force) => force
+        ? apiClient.createEdge(edge, etag, true)
+        : apiClient.createEdge(edge, etag),
+      overwrite,
+    );
   }
 
-  async function handleEdgeUpdate(edgeId: string, changes: GraphEdgeUpdate): Promise<void> {
-    if (!snapshot) {
-      throw new Error("Load a Project before saving a relationship.");
-    }
-    const updated = await apiClient.updateEdge(edgeId, changes, snapshot.graph.etag);
-    setSnapshot(updated);
-    setProject(updated.project);
+  function handleEdgeUpdate(
+    edgeId: string,
+    changes: GraphEdgeUpdate,
+    overwrite = false,
+  ): Promise<void> {
+    return runGraphMutation(
+      (base) => graphDocumentWithUpdatedEdge(base, edgeId, changes),
+      (etag, force) => force
+        ? apiClient.updateEdge(edgeId, changes, etag, true)
+        : apiClient.updateEdge(edgeId, changes, etag),
+      overwrite,
+    );
   }
 
-  async function handleEdgeDelete(edgeId: string): Promise<void> {
-    if (!snapshot) {
-      throw new Error("Load a Project before deleting a relationship.");
+  function handleEdgeDelete(edgeId: string, overwrite = false): Promise<void> {
+    return runGraphMutation(
+      (base) => graphDocumentWithDeletedEdge(base, edgeId),
+      (etag, force) => force
+        ? apiClient.deleteEdge(edgeId, etag, true)
+        : apiClient.deleteEdge(edgeId, etag),
+      overwrite,
+    );
+  }
+
+  async function reloadAfterGraphConflict(): Promise<void> {
+    setGraphConflictAction("working");
+    setGraphConflictActionError(null);
+    try {
+      const updated = await apiClient.refresh();
+      publishSnapshot(updated, true);
+      setGraphConflict(null);
+    } catch (reason: unknown) {
+      setGraphConflictAction("idle");
+      setGraphConflictActionError(asError(reason).message);
     }
-    const updated = await apiClient.deleteEdge(edgeId, snapshot.graph.etag);
-    setSnapshot(updated);
-    setProject(updated.project);
+  }
+
+  async function saveGraphConflictCopy(): Promise<void> {
+    if (!graphConflict) return;
+    setGraphConflictAction("working");
+    setGraphConflictActionError(null);
+    try {
+      const result: GraphCopyResult = await apiClient.saveCopy(graphConflict.document);
+      setGraphConflictCopyPath(result.copyPath);
+      setGraphConflictAction("saved");
+    } catch (reason: unknown) {
+      setGraphConflictAction("idle");
+      setGraphConflictActionError(asError(reason).message);
+    }
+  }
+
+  async function overwriteAfterGraphConflict(): Promise<void> {
+    if (!graphConflict) return;
+    setGraphConflictAction("working");
+    setGraphConflictActionError(null);
+    try {
+      await graphConflict.retry();
+      setGraphConflict(null);
+    } catch (reason: unknown) {
+      setGraphConflictAction("idle");
+      setGraphConflictActionError(asError(reason).message);
+    }
+  }
+
+  async function migrateGraphOverlay(): Promise<void> {
+    if (!snapshot) return;
+    const baseSnapshot = snapshot;
+    setGraphMigrationState("working");
+    setGraphMigrationError(null);
+    try {
+      const migrated = await apiClient.migrateGraph(snapshot.graph.etag);
+      publishSnapshot(migrated, true);
+      setGraphMigrationBackupPath(migrated.backupPath);
+      setGraphMigrationState("idle");
+    } catch (reason: unknown) {
+      setGraphMigrationState("idle");
+      if (isGraphConflict(reason)) {
+        rememberGraphConflict(
+          reason,
+          graphDocumentFromSnapshot(baseSnapshot),
+          async () => {
+            const migrated = await apiClient.migrateGraph("*", true);
+            publishSnapshot(migrated, true);
+            setGraphMigrationBackupPath(migrated.backupPath);
+            return migrated;
+          },
+        );
+      } else {
+        setGraphMigrationError(asError(reason).message);
+      }
+    }
   }
 
   const sourceUnavailable =
@@ -153,6 +309,8 @@ export function App({ api }: AppProps) {
     snapshot?.source.status === "unavailable" ||
     snapshot?.source.status === "incompatible";
   const sourceStale = snapshot?.source.status === "stale";
+  const graphFileStatus = snapshot?.graph.fileStatus ?? project?.graphFileStatus;
+  const graphReadOnly = graphFileStatus === "future" || graphFileStatus === "legacy";
   const runtimeLabel = health ? "Local runtime ready" : error && !project ? "Local runtime unavailable" : "Checking local runtime";
   const filteredConversations = useMemo(
     () => filterConversations(snapshot?.conversations ?? [], filters),
@@ -260,6 +418,28 @@ export function App({ api }: AppProps) {
         </div>
       )}
 
+      {graphConflict && (
+        <GraphConflictPanel
+          conflict={graphConflict}
+          action={graphConflictAction}
+          copyPath={graphConflictCopyPath}
+          actionError={graphConflictActionError}
+          onReload={reloadAfterGraphConflict}
+          onSaveCopy={saveGraphConflictCopy}
+          onOverwrite={overwriteAfterGraphConflict}
+        />
+      )}
+
+      {graphFileStatus === "future" || graphFileStatus === "legacy" || graphMigrationBackupPath ? (
+        <GraphStatusNotice
+          status={graphFileStatus ?? "ready"}
+          migrationState={graphMigrationState}
+          migrationError={graphMigrationError}
+          backupPath={graphMigrationBackupPath}
+          onMigrate={migrateGraphOverlay}
+        />
+      ) : null}
+
       {snapshot && !sourceUnavailable && snapshot.excludedConversations.length > 0 && (
         <ProjectMembershipNotice
           excluded={snapshot.excludedConversations}
@@ -287,6 +467,7 @@ export function App({ api }: AppProps) {
             onOptionsChange={handleTimelineOptionsChange}
           />
           <ConversationGraph
+            key={`graph:${detailResetToken}`}
             nodes={snapshot.graph.nodes}
             edges={snapshot.graph.edges}
             visibleIds={filteredConversationIds}
@@ -296,6 +477,7 @@ export function App({ api }: AppProps) {
             selectedId={selectedConversationId}
             onSelect={setSelectedConversationId}
             onLayoutChange={(conversationId, layout) => handleNodeUpdate(conversationId, { layout })}
+            readOnly={graphReadOnly}
           />
           <ConversationList
             conversations={filteredConversations}
@@ -307,8 +489,10 @@ export function App({ api }: AppProps) {
 
       {selectedConversationId && snapshot && (
         <ConversationDetail
+          key={`${selectedConversationId}:${detailResetToken}`}
           conversation={snapshot.conversations.find(({ id }) => id === selectedConversationId) ?? null}
           onSave={handleNodeUpdate}
+          readOnly={graphReadOnly}
         />
       )}
 
@@ -322,6 +506,98 @@ export function App({ api }: AppProps) {
         </div>
       )}
     </main>
+  );
+}
+
+function GraphConflictPanel({
+  conflict,
+  action,
+  copyPath,
+  actionError,
+  onReload,
+  onSaveCopy,
+  onOverwrite,
+}: {
+  conflict: GraphConflictState;
+  action: "idle" | "working" | "saved";
+  copyPath: string | null;
+  actionError: string | null;
+  onReload: () => Promise<void>;
+  onSaveCopy: () => Promise<void>;
+  onOverwrite: () => Promise<void>;
+}) {
+  const working = action === "working";
+  return (
+    <section className="graph-conflict-panel" role="alert" aria-label="Graph conflict">
+      <div className="conflict-symbol" aria-hidden="true">!</div>
+      <div className="conflict-copy">
+        <p className="section-kicker">PERSISTENCE / EXTERNAL CHANGE</p>
+        <strong>Graph changed elsewhere</strong>
+        <p>{conflict.message}</p>
+        <span className="conflict-note">
+          Your draft is still in the form. Choose how to resolve this version conflict.
+        </span>
+        {(conflict.expectedEtag || conflict.currentEtag) && (
+          <div className="conflict-version" aria-label="Graph version comparison">
+            <span>Draft base · <code>{conflict.expectedEtag ?? "unknown"}</code></span>
+            <span>File now · <code>{conflict.currentEtag ?? "unknown"}</code></span>
+          </div>
+        )}
+        {copyPath && <span className="conflict-result">Copy saved · {copyPath}</span>}
+        {actionError && <span className="conflict-action-error">Could not complete that action: {actionError}</span>}
+        <div className="conflict-actions">
+          <button type="button" onClick={() => void onReload()} disabled={working}>
+            Reload Graph
+          </button>
+          <button type="button" onClick={() => void onSaveCopy()} disabled={working}>
+            {action === "saved" ? "Save another copy" : "Save a copy"}
+          </button>
+          <button type="button" className="is-danger" onClick={() => void onOverwrite()} disabled={working}>
+            Overwrite explicitly
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function GraphStatusNotice({
+  status,
+  migrationState,
+  migrationError,
+  backupPath,
+  onMigrate,
+}: {
+  status: string;
+  migrationState: "idle" | "working";
+  migrationError: string | null;
+  backupPath: string | null;
+  onMigrate: () => Promise<void>;
+}) {
+  const isFuture = status === "future";
+  const isMigrated = status === "ready" && backupPath !== null;
+  return (
+    <section className={`graph-status-notice ${isFuture ? "is-future" : isMigrated ? "is-migrated" : "is-legacy"}`} role="status" aria-label="Graph overlay status">
+      <div className="status-symbol" aria-hidden="true">{isFuture ? "↗" : isMigrated ? "✓" : "↻"}</div>
+      <div>
+        <p className="section-kicker">GRAPH OVERLAY / {isFuture ? "FUTURE VERSION" : isMigrated ? "MIGRATION COMPLETE" : "MIGRATION AVAILABLE"}</p>
+        <strong>{isFuture ? "Graph overlay is read-only" : isMigrated ? "Graph overlay migrated safely" : "Graph overlay needs migration"}</strong>
+        <p>
+          {isFuture
+            ? "This CodexFlow version can display the file but will not save over a newer schema."
+            : isMigrated
+            ? "The original file was backed up before the schema upgrade."
+            : "The file will be backed up before it is upgraded to the current schema."}
+        </p>
+        {backupPath && <span className="status-result">Backup created · {backupPath}</span>}
+        {migrationError && <span className="status-error">Migration failed · {migrationError}</span>}
+        {!isFuture && !isMigrated && (
+          <button type="button" onClick={() => void onMigrate()} disabled={migrationState === "working"}>
+            {migrationState === "working" ? "Migrating…" : "Migrate with backup"}
+          </button>
+        )}
+      </div>
+    </section>
   );
 }
 
@@ -524,6 +800,7 @@ interface ConversationGraphProps {
   onCreateEdge: (edge: GraphEdgeCreate) => Promise<void>;
   onUpdateEdge: (edgeId: string, changes: GraphEdgeUpdate) => Promise<void>;
   onDeleteEdge: (edgeId: string) => Promise<void>;
+  readOnly: boolean;
 }
 
 interface GraphPoint {
@@ -555,6 +832,7 @@ function ConversationGraph({
   onCreateEdge,
   onUpdateEdge,
   onDeleteEdge,
+  readOnly,
 }: ConversationGraphProps) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState<GraphPoint>({ x: 0, y: 0 });
@@ -727,6 +1005,7 @@ function ConversationGraph({
                   aria-pressed={node.id === selectedId}
                   onMouseDown={(event) => {
                     event.stopPropagation();
+                    if (readOnly) return;
                     suppressClick.current = false;
                     const point = positions.get(node.id);
                     if (!point) return;
@@ -771,6 +1050,7 @@ function ConversationGraph({
         onCreate={onCreateEdge}
         onUpdate={onUpdateEdge}
         onDelete={onDeleteEdge}
+        readOnly={readOnly}
       />
     </section>
   );
@@ -800,6 +1080,7 @@ interface RelationshipEditorProps {
   onCreate: (edge: GraphEdgeCreate) => Promise<void>;
   onUpdate: (edgeId: string, changes: GraphEdgeUpdate) => Promise<void>;
   onDelete: (edgeId: string) => Promise<void>;
+  readOnly: boolean;
 }
 
 function RelationshipEditor({
@@ -808,6 +1089,7 @@ function RelationshipEditor({
   onCreate,
   onUpdate,
   onDelete,
+  readOnly,
 }: RelationshipEditorProps) {
   const [editingEdgeId, setEditingEdgeId] = useState<string | null>(null);
   const [source, setSource] = useState("");
@@ -916,27 +1198,30 @@ function RelationshipEditor({
           <input
             id="relationship-source"
             list="conversation-id-options"
-            value={source}
-            onChange={(event) => setSource(event.target.value)}
-            placeholder="Conversation ID"
-            autoComplete="off"
+          value={source}
+          onChange={(event) => setSource(event.target.value)}
+          placeholder="Conversation ID"
+          autoComplete="off"
+          disabled={readOnly}
           />
 
           <label htmlFor="relationship-target">Target</label>
           <input
             id="relationship-target"
             list="conversation-id-options"
-            value={target}
-            onChange={(event) => setTarget(event.target.value)}
-            placeholder="Conversation ID"
-            autoComplete="off"
+          value={target}
+          onChange={(event) => setTarget(event.target.value)}
+          placeholder="Conversation ID"
+          autoComplete="off"
+          disabled={readOnly}
           />
 
           <label htmlFor="relationship-type">Relationship type</label>
           <select
             id="relationship-type"
-            value={relationType}
-            onChange={(event) => changeRelationType(event.target.value)}
+          value={relationType}
+          onChange={(event) => changeRelationType(event.target.value)}
+          disabled={readOnly}
           >
             {BUILT_IN_RELATION_TYPES.map((type) => (
               <option key={type} value={type}>{type}</option>
@@ -952,6 +1237,7 @@ function RelationshipEditor({
                 onChange={(event) => setCustomType(event.target.value)}
                 placeholder="e.g. informs"
                 autoComplete="off"
+                disabled={readOnly}
               />
             </>
           )}
@@ -962,9 +1248,10 @@ function RelationshipEditor({
             value={label}
             onChange={(event) => setLabel(event.target.value)}
             placeholder="Explain the relationship"
+            disabled={readOnly}
           />
           <div className="relationship-form-actions">
-            <button type="submit" className="relationship-save" disabled={mutationState === "saving"}>
+            <button type="submit" className="relationship-save" disabled={readOnly || mutationState === "saving"}>
               {mutationState === "saving" ? "Saving…" : editingEdgeId ? "Save relationship" : "Add relationship"}
             </button>
             {editingEdgeId && (
@@ -1005,10 +1292,10 @@ function RelationshipEditor({
                     </div>
                     <code>{edge.source} {connector} {edge.target} · {edge.id}</code>
                     <div className="relationship-actions">
-                      <button type="button" onClick={() => beginEdit(edge)} aria-label={`Edit relationship ${edge.id}`}>
+                      <button type="button" onClick={() => beginEdit(edge)} disabled={readOnly} aria-label={`Edit relationship ${edge.id}`}>
                         Edit
                       </button>
-                      <button type="button" onClick={() => void deleteRelationship(edge)} aria-label={`Delete relationship ${edge.id}`}>
+                      <button type="button" onClick={() => void deleteRelationship(edge)} disabled={readOnly} aria-label={`Delete relationship ${edge.id}`}>
                         Delete
                       </button>
                     </div>
@@ -1130,9 +1417,11 @@ function ConversationRow({ conversation, selected, onSelect }: ConversationRowPr
 function ConversationDetail({
   conversation,
   onSave,
+  readOnly,
 }: {
   conversation: Conversation | null;
   onSave: (id: string, changes: ConversationOverlayUpdate) => Promise<void>;
+  readOnly: boolean;
 }) {
   const conversationId = conversation?.id ?? null;
   const [title, setTitle] = useState("");
@@ -1190,6 +1479,7 @@ function ConversationDetail({
         value={title}
         onChange={(event) => setTitle(event.target.value)}
         placeholder={conversation.codex.title ?? "Uses the Codex title"}
+        disabled={readOnly}
       />
 
       <label htmlFor="conversation-tags">Tags</label>
@@ -1198,6 +1488,7 @@ function ConversationDetail({
         value={tags}
         onChange={(event) => setTags(event.target.value)}
         placeholder="design, release, research"
+        disabled={readOnly}
       />
 
       <label htmlFor="conversation-status">User status</label>
@@ -1205,6 +1496,7 @@ function ConversationDetail({
         id="conversation-status"
         value={status}
         onChange={(event) => setStatus(event.target.value as UserStatus)}
+        disabled={readOnly}
       >
         <option value="none">None</option>
         <option value="active">Active</option>
@@ -1219,6 +1511,7 @@ function ConversationDetail({
         onChange={(event) => setNote(event.target.value)}
         rows={4}
         placeholder="Add context only you own."
+        disabled={readOnly}
       />
 
       <label className="detail-checkbox" htmlFor="conversation-hidden">
@@ -1227,6 +1520,7 @@ function ConversationDetail({
           type="checkbox"
           checked={hidden}
           onChange={(event) => setHidden(event.target.checked)}
+          disabled={readOnly}
         />
         <span>Hidden from Graph</span>
       </label>
@@ -1240,11 +1534,108 @@ function ConversationDetail({
       {saveState === "error" && saveError && (
         <span className="detail-error" role="alert">Could not save changes: {saveError}</span>
       )}
-      <button type="submit" className="detail-save" disabled={saveState === "saving"}>
+      <button type="submit" className="detail-save" disabled={readOnly || saveState === "saving"}>
         {saveState === "saving" ? "Saving…" : "Save changes"}
       </button>
     </form>
   );
+}
+
+function isGraphConflict(reason: unknown): reason is ApiError {
+  return reason instanceof ApiError && reason.payload.code === "graph_conflict";
+}
+
+function graphDocumentFromSnapshot(base: DashboardSnapshot): GraphDocument {
+  const nodes: Record<string, GraphDocumentNode> = {};
+  for (const conversation of base.conversations) {
+    const node = graphNodeDocument(conversation.overlay);
+    if (Object.keys(node).length > 0) nodes[conversation.id] = node;
+  }
+  return {
+    version: 1,
+    nodes,
+    edges: base.graph.edges.map((edge) => ({ ...edge })),
+  };
+}
+
+function graphDocumentWithNode(
+  base: DashboardSnapshot,
+  conversationId: string,
+  changes: ConversationOverlayUpdate,
+): GraphDocument {
+  const document = graphDocumentFromSnapshot(base);
+  const current = base.conversations.find(({ id }) => id === conversationId)?.overlay;
+  const overlay = {
+    title: changes.title !== undefined ? changes.title : current?.title ?? null,
+    tags: changes.tags !== undefined ? changes.tags : current?.tags ?? [],
+    status: changes.status !== undefined ? changes.status : current?.status ?? "none",
+    note: changes.note !== undefined ? changes.note : current?.note ?? null,
+    hidden: changes.hidden !== undefined ? changes.hidden : current?.hidden ?? false,
+    layout: changes.layout !== undefined ? changes.layout : current?.layout ?? null,
+  };
+  const node = graphNodeDocument(overlay);
+  if (Object.keys(node).length > 0) {
+    document.nodes = { ...(document.nodes ?? {}), [conversationId]: node };
+  } else if (document.nodes) {
+    delete document.nodes[conversationId];
+  }
+  return document;
+}
+
+function graphNodeDocument(overlay: Conversation["overlay"]): GraphDocumentNode {
+  const node: GraphDocumentNode = {};
+  if (overlay.title?.trim()) node.title = overlay.title.trim();
+  const tags = overlay.tags.map((tag) => tag.trim()).filter(Boolean);
+  if (tags.length > 0) node.tags = tags;
+  if (overlay.status !== "none") node.status = overlay.status;
+  if (overlay.note?.trim()) node.note = overlay.note.trim();
+  if (overlay.hidden) node.hidden = true;
+  if (overlay.layout) node.layout = { ...overlay.layout };
+  return node;
+}
+
+function graphDocumentWithCreatedEdge(
+  base: DashboardSnapshot,
+  edge: GraphEdgeCreate,
+): GraphDocument {
+  const document = graphDocumentFromSnapshot(base);
+  const draftId = `draft-edge-${base.graph.edges.length}`;
+  const draftEdge: GraphEdge = {
+    id: draftId,
+    source: edge.source,
+    target: edge.target,
+    type: edge.type,
+  };
+  if (edge.label) draftEdge.label = edge.label;
+  document.edges = [...(document.edges ?? []), draftEdge];
+  return document;
+}
+
+function graphDocumentWithUpdatedEdge(
+  base: DashboardSnapshot,
+  edgeId: string,
+  changes: GraphEdgeUpdate,
+): GraphDocument {
+  const document = graphDocumentFromSnapshot(base);
+  document.edges = (document.edges ?? []).map((edge) => {
+    if (edge.id !== edgeId) return edge;
+    const updated: GraphEdge = {
+      ...edge,
+      ...(changes.source !== undefined ? { source: changes.source } : {}),
+      ...(changes.target !== undefined ? { target: changes.target } : {}),
+      ...(changes.type !== undefined ? { type: changes.type } : {}),
+    };
+    if (changes.label === null) delete updated.label;
+    if (changes.label !== undefined && changes.label !== null) updated.label = changes.label;
+    return updated;
+  });
+  return document;
+}
+
+function graphDocumentWithDeletedEdge(base: DashboardSnapshot, edgeId: string): GraphDocument {
+  const document = graphDocumentFromSnapshot(base);
+  document.edges = (document.edges ?? []).filter((edge) => edge.id !== edgeId);
+  return document;
 }
 
 function normalizeTags(value: string): string[] {
