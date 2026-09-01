@@ -1,3 +1,9 @@
 .DS_Store
 docs/*
+!docs/SPEC.md
+!docs/PLAN.md
+!docs/agents/
+!docs/agents/**
+!docs/adr/
+!docs/adr/**
 .codex
