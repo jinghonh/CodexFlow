@@ -1,0 +1,221 @@
+from __future__ import annotations
+
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Protocol
+
+from .models import (
+    Conversation,
+    ConversationOverlay,
+    DashboardSnapshot,
+    DerivedConversationState,
+    GraphSummary,
+    ProjectView,
+)
+from .source import CodexThread, SourceReadResult
+
+
+class ProjectInvalidError(Exception):
+    def __init__(self, message: str, *, details: dict[str, object] | None = None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.details = details
+
+
+class ProjectNotSelectedError(Exception):
+    pass
+
+
+class SourceUnavailableError(Exception):
+    def __init__(self, result: SourceReadResult) -> None:
+        super().__init__(result.error.message if result.error else "Codex 来源不可用")
+        self.result = result
+
+
+class GitResolver(Protocol):
+    def root_for(self, path: Path) -> Path | None:
+        """Return the worktree root containing path, if any."""
+
+
+class SubprocessGitResolver:
+    def root_for(self, path: Path) -> Path | None:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if completed.returncode != 0:
+            return None
+        output = completed.stdout.strip()
+        if not output:
+            return None
+        try:
+            return Path(output).resolve(strict=True)
+        except OSError:
+            return None
+
+
+@dataclass(frozen=True)
+class _ProjectContext:
+    original_path: str
+    real_path: Path
+    git_root: Path | None
+
+
+class ProjectGraphService:
+    def __init__(self, source: object, *, git_resolver: GitResolver | None = None) -> None:
+        self._source = source
+        self._git_resolver = git_resolver or SubprocessGitResolver()
+        self._project: _ProjectContext | None = None
+
+    def select_project(self, path: str) -> ProjectView:
+        if not isinstance(path, str) or not path.strip():
+            raise ProjectInvalidError("Project 路径不能为空")
+        original_path = path
+        try:
+            candidate = Path(path).expanduser()
+            real_path = candidate.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ProjectInvalidError("Project 路径不存在或无法解析", details={"path": path}) from exc
+        if not real_path.is_dir():
+            raise ProjectInvalidError("Project 路径必须是目录", details={"path": path})
+        git_root = self._git_resolver.root_for(real_path)
+        self._project = _ProjectContext(
+            original_path=original_path,
+            real_path=real_path,
+            git_root=git_root,
+        )
+        return self.project_view()
+
+    def project_view(self) -> ProjectView:
+        project = self._require_project()
+        graph_path = project.real_path / ".codex" / "graph.yaml"
+        return ProjectView(
+            original_path=project.original_path,
+            real_path=str(project.real_path),
+            git_root=str(project.git_root) if project.git_root else None,
+            worktree_root=str(project.git_root) if project.git_root else None,
+            is_git_project=project.git_root is not None,
+            graph_file=str(graph_path),
+            graph_file_status="not_loaded",
+        )
+
+    def snapshot(self) -> DashboardSnapshot:
+        project = self._require_project()
+        result = self._source.read_snapshot()
+        if result.status in {"unavailable", "incompatible"}:
+            raise SourceUnavailableError(result)
+        included_threads = [
+            thread for thread in result.threads if self._belongs_to_project(thread, project)
+        ]
+        conversations = _merge_conversations(
+            included_threads,
+            source_available=result.has_complete_snapshot,
+        )
+        return DashboardSnapshot(
+            project=self.project_view(),
+            source_status=result.status,
+            generated_at=result.generated_at,
+            user_agent=result.user_agent,
+            source_error=_source_error(result),
+            graph=GraphSummary(),
+            conversations=tuple(conversations),
+        )
+
+    def _belongs_to_project(self, thread: CodexThread, project: _ProjectContext) -> bool:
+        raw_cwd = Path(thread.cwd)
+        if not raw_cwd.is_absolute():
+            return False
+        try:
+            cwd = raw_cwd.resolve(strict=True)
+        except (OSError, ValueError):
+            return False
+        if not cwd.is_dir() or not _is_relative_to(cwd, project.real_path):
+            return False
+        cwd_git_root = self._git_resolver.root_for(cwd)
+        if project.git_root is not None:
+            return cwd_git_root == project.git_root
+        return cwd_git_root is None
+
+    def _require_project(self) -> _ProjectContext:
+        if self._project is None:
+            raise ProjectNotSelectedError("尚未选择 Project")
+        return self._project
+
+
+def _merge_conversations(
+    threads: list[CodexThread],
+    *,
+    source_available: bool,
+) -> list[Conversation]:
+    thread_by_id = {thread.id: thread for thread in threads}
+    ids = list(thread_by_id)
+
+    conversations: list[Conversation] = []
+    for conversation_id in ids:
+        thread = thread_by_id.get(conversation_id)
+        overlay = ConversationOverlay()
+        missing = False
+        valid_range = bool(
+            thread
+            and thread.created_at is not None
+            and thread.updated_at is not None
+            and thread.created_at <= thread.updated_at
+        )
+        conversations.append(
+            Conversation(
+                id=conversation_id,
+                codex=thread,
+                overlay=overlay,
+                derived=DerivedConversationState(
+                    missing=missing,
+                    unlinked=True,
+                    source_available=source_available,
+                    valid_observation_range=valid_range,
+                ),
+                display_title=_display_title(conversation_id, thread, overlay),
+            )
+        )
+    return conversations
+
+
+def _display_title(
+    conversation_id: str,
+    thread: CodexThread | None,
+    overlay: ConversationOverlay,
+) -> str:
+    if overlay.title:
+        return overlay.title
+    if thread and thread.title and thread.title.strip():
+        return thread.title
+    if thread and thread.preview:
+        first_line = thread.preview.splitlines()[0].strip()
+        if first_line:
+            return first_line
+    return conversation_id
+
+
+def _source_error(result: SourceReadResult) -> dict[str, object] | None:
+    if result.error is None:
+        return None
+    return {
+        "code": result.error.code,
+        "message": result.error.message,
+        "details": result.error.details,
+        "retryable": result.error.retryable,
+    }
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True

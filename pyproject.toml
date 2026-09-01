@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codexflow"
+version = "0.1.0"
+description = "Local Codex conversation graph dashboard"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2.7,<3",
+  "pyyaml>=6.0,<7",
+  "uvicorn>=0.32,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "httpx>=0.27,<1",
+  "playwright>=1.50,<2",
+  "pytest>=8,<10",
+  "pytest-asyncio>=0.24,<1",
+]
+
+[project.scripts]
+codexflow = "codexflow.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codexflow"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"frontend/dist" = "codexflow/frontend/dist"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

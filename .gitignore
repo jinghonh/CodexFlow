@@ -7,3 +7,8 @@ docs/*
 !docs/adr/
 !docs/adr/**
 .codex
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+frontend/node_modules/
