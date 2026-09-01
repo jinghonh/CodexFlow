@@ -680,3 +680,138 @@ describe("Dashboard graph", () => {
     expect(targetInput).toHaveValue("archived-id");
   });
 });
+
+describe("Dashboard timeline", () => {
+  it("shows buckets, point markers, invalid-time warnings, and selects a conversation", async () => {
+    const user = userEvent.setup();
+    const timelineSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      conversations: [
+        ...snapshot.conversations,
+        {
+          ...snapshot.conversations[0],
+          id: "invalid-time-id",
+          displayTitle: "Needs time review",
+          codex: { ...snapshot.conversations[0].codex, createdAt: null },
+          derived: { ...snapshot.conversations[0].derived, validObservationRange: false },
+        },
+      ],
+      timeline: {
+        granularity: "day",
+        timezone: "UTC",
+        ranges: [
+          {
+            conversationId: "active-id",
+            start: "2024-01-01T00:00:00Z",
+            end: "2024-01-01T01:00:00Z",
+            valid: true,
+            isPoint: false,
+            error: null,
+          },
+          {
+            conversationId: "archived-id",
+            start: "2024-01-02T00:00:00Z",
+            end: "2024-01-02T00:00:00Z",
+            valid: true,
+            isPoint: true,
+            error: null,
+          },
+          {
+            conversationId: "invalid-time-id",
+            start: null,
+            end: "2024-01-02T01:00:00Z",
+            valid: false,
+            isPoint: false,
+            error: "createdAt invalid",
+          },
+        ],
+        buckets: [
+          {
+            start: "2024-01-01T00:00:00Z",
+            end: "2024-01-02T00:00:00Z",
+            label: "2024-01-01",
+            overlapCount: 1,
+          },
+          {
+            start: "2024-01-02T00:00:00Z",
+            end: "2024-01-03T00:00:00Z",
+            label: "2024-01-02",
+            overlapCount: 1,
+          },
+        ],
+        warnings: [
+          {
+            conversationId: "invalid-time-id",
+            code: "invalid_observation_range",
+            message: "createdAt invalid",
+          },
+        ],
+      },
+    };
+    const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(timelineSnapshot) });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const timeline = await screen.findByRole("region", { name: "Conversation timeline" });
+    expect(timeline).toHaveTextContent("Timeline");
+    expect(timeline).toHaveTextContent("2024-01-01");
+    expect(timeline).toHaveTextContent("2024-01-02");
+    expect(timeline).toHaveTextContent("Overlap count");
+    expect(timeline).toHaveTextContent("Invalid observation range");
+    expect(timeline).toHaveTextContent("Point");
+
+    const pointControls = within(timeline).getAllByRole("button", {
+      name: /Archive the first pass.*point/i,
+    });
+    await user.click(pointControls[pointControls.length - 1]);
+    await waitFor(() => {
+      expect(screen.getByRole("region", { name: "Conversation detail" })).toHaveTextContent(
+        "archived-id",
+      );
+    });
+  });
+
+  it("requests a new snapshot when the bucket scale or time zone changes", async () => {
+    const user = userEvent.setup();
+    const timelineSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      timeline: {
+        granularity: "day",
+        timezone: "UTC",
+        ranges: [],
+        buckets: [],
+        warnings: [],
+      },
+    };
+    const snapshotRequest = vi.fn().mockResolvedValue(timelineSnapshot);
+    const api = apiDouble({ snapshot: snapshotRequest });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    const timeline = await screen.findByRole("region", { name: "Conversation timeline" });
+
+    await user.click(within(timeline).getByRole("button", { name: "Week" }));
+    await waitFor(() => {
+      expect(snapshotRequest).toHaveBeenLastCalledWith({
+        granularity: "week",
+        timezone: "UTC",
+      });
+    });
+
+    const timezone = within(timeline).getByLabelText("Time zone");
+    await user.clear(timezone);
+    await user.type(timezone, "Asia/Shanghai");
+    await user.click(within(timeline).getByRole("button", { name: "Apply" }));
+    await waitFor(() => {
+      expect(snapshotRequest).toHaveBeenLastCalledWith({
+        granularity: "week",
+        timezone: "Asia/Shanghai",
+      });
+    });
+  });
+});

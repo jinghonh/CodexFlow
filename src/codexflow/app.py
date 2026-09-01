@@ -20,6 +20,7 @@ from .project import (
     SourceUnavailableError,
 )
 from .source import CodexThreadSource
+from .timeline import TimelineInputError
 
 
 class ProjectSelectRequest(BaseModel):
@@ -176,8 +177,17 @@ def create_app(*, source: object | None = None) -> FastAPI:
             raise ApiFailure(404, "project_not_selected", str(exc)) from exc
 
     @app.get("/api/snapshot")
-    def get_snapshot(response: Response) -> dict[str, Any]:
-        return _snapshot_payload(service, response=response)
+    def get_snapshot(
+        response: Response,
+        granularity: str = "day",
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
+        return _snapshot_payload(
+            service,
+            response=response,
+            granularity=granularity,
+            timezone=timezone,
+        )
 
     @app.patch("/api/graph/nodes/{conversation_id}")
     def patch_graph_node(
@@ -283,8 +293,17 @@ def create_app(*, source: object | None = None) -> FastAPI:
         return snapshot.to_dict()
 
     @app.post("/api/refresh")
-    def refresh(response: Response) -> dict[str, Any]:
-        return _snapshot_payload(service, response=response)
+    def refresh(
+        response: Response,
+        granularity: str = "day",
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
+        return _snapshot_payload(
+            service,
+            response=response,
+            granularity=granularity,
+            timezone=timezone,
+        )
 
     static_directories = (
         Path(__file__).resolve().parents[2] / "frontend" / "dist",
@@ -302,15 +321,22 @@ def _snapshot_payload(
     service: ProjectGraphService,
     *,
     response: Response | None = None,
+    granularity: str = "day",
+    timezone: str | None = None,
 ) -> dict[str, Any]:
     try:
-        snapshot: DashboardSnapshot = service.snapshot()
+        snapshot: DashboardSnapshot = service.snapshot(
+            granularity=granularity,
+            timezone=timezone,
+        )
     except ProjectNotSelectedError as exc:
         raise ApiFailure(404, "project_not_selected", str(exc)) from exc
     except SourceUnavailableError as exc:
         raise _source_api_failure(exc) from exc
     except GraphOverlayError as exc:
         raise _graph_api_failure(exc) from exc
+    except TimelineInputError as exc:
+        raise ApiFailure(400, "invalid_request", str(exc)) from exc
     if response is not None:
         response.headers["ETag"] = _quote_etag(snapshot.graph.etag)
     return snapshot.to_dict()

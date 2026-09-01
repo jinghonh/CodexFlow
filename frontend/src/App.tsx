@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, createApi } from "./api";
 import type { DashboardApi } from "./api";
+import { TimelineView } from "./Timeline";
 import type {
   Conversation,
   DashboardSnapshot,
@@ -14,6 +15,7 @@ import type {
   ConversationOverlayUpdate,
   NodeLayout,
   ProjectView,
+  TimelineGranularity,
   UserStatus,
 } from "./types";
 
@@ -32,6 +34,8 @@ export function App({ api }: AppProps) {
   const [loadState, setLoadState] = useState<LoadState>("idle");
   const [error, setError] = useState<ApiError | Error | null>(null);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
+  const [timelineLoading, setTimelineLoading] = useState(false);
+  const [timelineError, setTimelineError] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -57,6 +61,7 @@ export function App({ api }: AppProps) {
     }
     setLoadState("loading");
     setError(null);
+    setTimelineError(null);
     setSnapshot(null);
     setSelectedConversationId(null);
     try {
@@ -68,6 +73,31 @@ export function App({ api }: AppProps) {
     } catch (reason: unknown) {
       setLoadState("error");
       setError(asError(reason));
+    }
+  }
+
+  async function handleTimelineOptionsChange({
+    granularity,
+    timezone,
+  }: {
+    granularity: TimelineGranularity;
+    timezone: string;
+  }): Promise<void> {
+    setTimelineLoading(true);
+    setTimelineError(null);
+    try {
+      const updated = await apiClient.snapshot({ granularity, timezone });
+      setSnapshot(updated);
+      setProject(updated.project);
+    } catch (reason: unknown) {
+      const nextError = asError(reason);
+      setTimelineError(nextError.message);
+      if (nextError instanceof ApiError && nextError.status === 503) {
+        setError(nextError);
+      }
+      throw reason;
+    } finally {
+      setTimelineLoading(false);
     }
   }
 
@@ -213,6 +243,15 @@ export function App({ api }: AppProps) {
 
       {snapshot && !sourceUnavailable && (
         <>
+          <TimelineView
+            timeline={snapshot.timeline}
+            conversations={snapshot.conversations}
+            selectedId={selectedConversationId}
+            loading={timelineLoading}
+            error={timelineError}
+            onSelect={setSelectedConversationId}
+            onOptionsChange={handleTimelineOptionsChange}
+          />
           <ConversationGraph
             nodes={snapshot.graph.nodes}
             edges={snapshot.graph.edges}

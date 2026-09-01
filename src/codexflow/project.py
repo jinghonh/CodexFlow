@@ -24,6 +24,7 @@ from .models import (
     ProjectView,
 )
 from .source import CodexThread, SourceReadResult
+from .timeline import build_timeline, observation_range_for_thread
 
 
 class ProjectInvalidError(Exception):
@@ -131,14 +132,25 @@ class ProjectGraphService:
             graph_file_status=self._graph_file_status,
         )
 
-    def snapshot(self) -> DashboardSnapshot:
+    def snapshot(
+        self,
+        *,
+        granularity: str = "day",
+        timezone: str | None = None,
+    ) -> DashboardSnapshot:
         project = self._require_project()
         result = self._source.read_snapshot()
         if result.status in {"unavailable", "incompatible"}:
             raise SourceUnavailableError(result)
         graph_overlay = read_graph_overlay(project.real_path)
         self._graph_file_status = graph_overlay.file_status
-        return self._build_snapshot(result, graph_overlay, project)
+        return self._build_snapshot(
+            result,
+            graph_overlay,
+            project,
+            granularity=granularity,
+            timezone=timezone,
+        )
 
     def update_node_overlay(
         self,
@@ -222,6 +234,9 @@ class ProjectGraphService:
         result: SourceReadResult,
         graph_overlay: GraphOverlay,
         project: _ProjectContext,
+        *,
+        granularity: str = "day",
+        timezone: str | None = None,
     ) -> DashboardSnapshot:
         included_threads, excluded_conversations = self._partition_threads(
             result.threads, project
@@ -231,6 +246,11 @@ class ProjectGraphService:
             graph_overlay,
             source_ids={thread.id for thread in result.threads},
             source_available=result.has_complete_snapshot,
+        )
+        timeline = build_timeline(
+            conversations,
+            granularity=granularity,
+            timezone=timezone,
         )
         return DashboardSnapshot(
             project=self.project_view(),
@@ -246,6 +266,7 @@ class ProjectGraphService:
             ),
             conversations=tuple(conversations),
             excluded_conversations=tuple(excluded_conversations),
+            timeline=timeline,
         )
 
     def _partition_threads(
@@ -361,12 +382,7 @@ def _merge_conversations(
         thread = thread_by_id.get(conversation_id)
         overlay = graph_overlay.nodes.get(conversation_id, ConversationOverlay())
         missing = source_available and conversation_id not in source_ids
-        valid_range = bool(
-            thread
-            and thread.created_at is not None
-            and thread.updated_at is not None
-            and thread.created_at <= thread.updated_at
-        )
+        valid_range = bool(thread and observation_range_for_thread(thread).valid)
         conversations.append(
             Conversation(
                 id=conversation_id,

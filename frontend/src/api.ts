@@ -7,6 +7,7 @@ import type {
   HealthResponse,
   ProjectView,
   SourceSummary,
+  TimelineGranularity,
 } from "./types";
 
 export class ApiError extends Error {
@@ -21,11 +22,16 @@ export class ApiError extends Error {
   }
 }
 
+export interface TimelineOptions {
+  granularity: TimelineGranularity;
+  timezone: string;
+}
+
 export interface DashboardApi {
   health(): Promise<HealthResponse>;
   selectProject(path: string): Promise<{ project: ProjectView; source: SourceSummary }>;
-  snapshot(): Promise<DashboardSnapshot>;
-  refresh(): Promise<DashboardSnapshot>;
+  snapshot(options?: TimelineOptions): Promise<DashboardSnapshot>;
+  refresh(options?: TimelineOptions): Promise<DashboardSnapshot>;
   updateNode(
     conversationId: string,
     changes: ConversationOverlayUpdate,
@@ -47,8 +53,8 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path }),
       }),
-    snapshot: () => request<DashboardSnapshot>(fetchLike, "/api/snapshot"),
-    refresh: () => request<DashboardSnapshot>(fetchLike, "/api/refresh", { method: "POST" }),
+    snapshot: (options) => request<DashboardSnapshot>(fetchLike, withTimelineOptions("/api/snapshot", options)),
+    refresh: (options) => request<DashboardSnapshot>(fetchLike, withTimelineOptions("/api/refresh", options), { method: "POST" }),
     updateNode: (conversationId, changes, etag) =>
       request<DashboardSnapshot>(fetchLike, `/api/graph/nodes/${encodeURIComponent(conversationId)}`, {
         method: "PATCH",
@@ -82,6 +88,15 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
         headers: { "If-Match": etag },
       }),
   };
+}
+
+function withTimelineOptions(path: string, options?: TimelineOptions): string {
+  if (!options) return path;
+  const params = new URLSearchParams({
+    granularity: options.granularity,
+    timezone: options.timezone,
+  });
+  return `${path}?${params.toString()}`;
 }
 
 async function request<T>(fetchLike: FetchLike, url: string, init?: RequestInit): Promise<T> {

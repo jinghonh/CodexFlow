@@ -1,4 +1,5 @@
 export type SourceStatus = "ready" | "stale" | "unavailable" | "incompatible";
+export type TimelineGranularity = "day" | "week" | "month";
 
 export interface ApiErrorPayload {
   code: string;
@@ -90,6 +91,36 @@ export interface DerivedConversationState {
   validObservationRange: boolean;
 }
 
+export interface ObservationRange {
+  conversationId: string;
+  start: string | null;
+  end: string | null;
+  valid: boolean;
+  isPoint: boolean;
+  error: string | null;
+}
+
+export interface TimelineWarning {
+  conversationId: string;
+  code: string;
+  message: string;
+}
+
+export interface TimelineBucket {
+  start: string;
+  end: string;
+  label: string;
+  overlapCount: number;
+}
+
+export interface TimelineSnapshot {
+  granularity: TimelineGranularity;
+  timezone: string;
+  ranges: ObservationRange[];
+  buckets: TimelineBucket[];
+  warnings: TimelineWarning[];
+}
+
 export interface Conversation {
   id: string;
   displayTitle: string;
@@ -134,4 +165,5 @@ export interface DashboardSnapshot {
   graph: { etag: string; fileStatus: string; nodes: GraphNode[]; edges: GraphEdge[] };
   conversations: Conversation[];
   excludedConversations: ExcludedConversation[];
+  timeline?: TimelineSnapshot;
 }

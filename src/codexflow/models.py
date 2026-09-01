@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .source import CodexThread
+from .timeline import TimelineSnapshot
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,7 @@ class DashboardSnapshot:
     graph: GraphSummary
     conversations: tuple[Conversation, ...]
     excluded_conversations: tuple[ExcludedConversation, ...] = ()
+    timeline: TimelineSnapshot = field(default_factory=TimelineSnapshot)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -142,6 +144,7 @@ class DashboardSnapshot:
             "excludedConversations": [
                 conversation.to_dict() for conversation in self.excluded_conversations
             ],
+            "timeline": self.timeline.to_dict(),
         }
 
 
