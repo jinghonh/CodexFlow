@@ -9,7 +9,10 @@ import type {
   GraphEdge,
   GraphNode,
   HealthResponse,
+  ConversationOverlayUpdate,
+  NodeLayout,
   ProjectView,
+  UserStatus,
 } from "./types";
 
 interface AppProps {
@@ -64,6 +67,18 @@ export function App({ api }: AppProps) {
       setLoadState("error");
       setError(asError(reason));
     }
+  }
+
+  async function handleNodeUpdate(
+    conversationId: string,
+    changes: ConversationOverlayUpdate,
+  ): Promise<void> {
+    if (!snapshot) {
+      throw new Error("Load a Project before saving Conversation changes.");
+    }
+    const updated = await apiClient.updateNode(conversationId, changes, snapshot.graph.etag);
+    setSnapshot(updated);
+    setProject(updated.project);
   }
 
   const sourceUnavailable =
@@ -127,6 +142,7 @@ export function App({ api }: AppProps) {
             <span className="ribbon-meta">{project.isGitProject ? "GIT PROJECT" : "LOCAL DIRECTORY"}</span>
             {project.gitRoot && <span>Git root · {project.gitRoot}</span>}
             {project.worktreeRoot && <span>Worktree root · {project.worktreeRoot}</span>}
+            <span>Graph overlay · {snapshot?.project.graphFileStatus ?? project.graphFileStatus}</span>
           </div>
         </div>
       )}
@@ -173,6 +189,7 @@ export function App({ api }: AppProps) {
             edges={snapshot.graph.edges}
             selectedId={selectedConversationId}
             onSelect={setSelectedConversationId}
+            onLayoutChange={(conversationId, layout) => handleNodeUpdate(conversationId, { layout })}
           />
           <ConversationList
             conversations={snapshot.conversations}
@@ -185,6 +202,7 @@ export function App({ api }: AppProps) {
       {selectedConversationId && snapshot && (
         <ConversationDetail
           conversation={snapshot.conversations.find(({ id }) => id === selectedConversationId) ?? null}
+          onSave={handleNodeUpdate}
         />
       )}
 
@@ -262,6 +280,7 @@ interface ConversationGraphProps {
   edges: GraphEdge[];
   selectedId: string | null;
   onSelect: (id: string) => void;
+  onLayoutChange: (id: string, layout: NodeLayout) => Promise<void>;
 }
 
 interface GraphPoint {
@@ -274,15 +293,38 @@ interface PanOrigin extends GraphPoint {
   panY: number;
 }
 
-function ConversationGraph({ nodes, edges, selectedId, onSelect }: ConversationGraphProps) {
+interface NodeDragState {
+  id: string;
+  startX: number;
+  startY: number;
+  origin: GraphPoint;
+  current: GraphPoint;
+  moved: boolean;
+}
+
+function ConversationGraph({
+  nodes,
+  edges,
+  selectedId,
+  onSelect,
+  onLayoutChange,
+}: ConversationGraphProps) {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState<GraphPoint>({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
+  const [draggedPosition, setDraggedPosition] = useState<{ id: string; point: GraphPoint } | null>(null);
+  const [layoutError, setLayoutError] = useState<string | null>(null);
   const panOrigin = useRef<PanOrigin | null>(null);
+  const nodeDrag = useRef<NodeDragState | null>(null);
+  const suppressClick = useRef(false);
   const visibleNodes = useMemo(() => nodes.filter((node) => !node.hidden), [nodes]);
   const positions = useMemo(
-    () => new Map(visibleNodes.map((node, index) => [node.id, graphPosition(node, index)])),
-    [visibleNodes],
+    () => {
+      const next = new Map(visibleNodes.map((node, index) => [node.id, graphPosition(node, index)]));
+      if (draggedPosition) next.set(draggedPosition.id, draggedPosition.point);
+      return next;
+    },
+    [draggedPosition, visibleNodes],
   );
   const visibleEdges = edges.filter((edge) => positions.has(edge.source) && positions.has(edge.target));
 
@@ -301,6 +343,17 @@ function ConversationGraph({ nodes, edges, selectedId, onSelect }: ConversationG
   }
 
   function movePan(x: number, y: number) {
+    if (nodeDrag.current) {
+      const drag = nodeDrag.current;
+      const point = {
+        x: drag.origin.x + (x - drag.startX) / zoom,
+        y: drag.origin.y + (y - drag.startY) / zoom,
+      };
+      drag.current = point;
+      drag.moved = drag.moved || point.x !== drag.origin.x || point.y !== drag.origin.y;
+      setDraggedPosition({ id: drag.id, point });
+      return;
+    }
     if (!panOrigin.current) return;
     setPan({
       x: panOrigin.current.panX + x - panOrigin.current.x,
@@ -309,6 +362,37 @@ function ConversationGraph({ nodes, edges, selectedId, onSelect }: ConversationG
   }
 
   function endPan() {
+    const drag = nodeDrag.current;
+    if (drag) {
+      nodeDrag.current = null;
+      panOrigin.current = null;
+      setIsPanning(false);
+      if (drag.moved) {
+        suppressClick.current = true;
+        const attemptedPosition = drag.current;
+        setDraggedPosition({ id: drag.id, point: attemptedPosition });
+        setLayoutError(null);
+        void onLayoutChange(drag.id, attemptedPosition)
+          .then(() => {
+            setDraggedPosition((current) => {
+              if (
+                current?.id === drag.id &&
+                current.point.x === attemptedPosition.x &&
+                current.point.y === attemptedPosition.y
+              ) {
+                return null;
+              }
+              return current;
+            });
+          })
+          .catch((reason: unknown) => {
+            setLayoutError(describeMutationError(reason));
+          });
+      } else {
+        setDraggedPosition(null);
+      }
+      return;
+    }
     panOrigin.current = null;
     setIsPanning(false);
   }
@@ -317,7 +401,7 @@ function ConversationGraph({ nodes, edges, selectedId, onSelect }: ConversationG
     <section className="graph-section" aria-label="Conversation graph">
       <div className="graph-heading">
         <div>
-          <p className="section-kicker">Relationship surface / read only</p>
+          <p className="section-kicker">Relationship surface / editable nodes</p>
           <h2>Graph</h2>
         </div>
         <div className="graph-toolbar" role="toolbar" aria-label="Graph controls">
@@ -389,8 +473,28 @@ function ConversationGraph({ nodes, edges, selectedId, onSelect }: ConversationG
                   style={{ left: point.x, top: point.y }}
                   aria-label={`Conversation ${node.displayTitle} (${node.id})`}
                   aria-pressed={node.id === selectedId}
-                  onMouseDown={(event) => event.stopPropagation()}
-                  onClick={() => onSelect(node.id)}
+                  onMouseDown={(event) => {
+                    event.stopPropagation();
+                    suppressClick.current = false;
+                    const point = positions.get(node.id);
+                    if (!point) return;
+                    nodeDrag.current = {
+                      id: node.id,
+                      startX: event.clientX,
+                      startY: event.clientY,
+                      origin: point,
+                      current: point,
+                      moved: false,
+                    };
+                    setLayoutError(null);
+                  }}
+                  onClick={() => {
+                    if (suppressClick.current) {
+                      suppressClick.current = false;
+                      return;
+                    }
+                    onSelect(node.id);
+                  }}
                 >
                   <span className="graph-node-kind">{node.missing ? "Missing source" : "Conversation"}</span>
                   <strong>{node.displayTitle}</strong>
@@ -401,8 +505,13 @@ function ConversationGraph({ nodes, edges, selectedId, onSelect }: ConversationG
           </div>
         )}
       </div>
+      {layoutError && (
+        <p className="graph-error" role="alert">
+          Could not save node layout: {layoutError}
+        </p>
+      )}
       <p className="graph-caption">
-        {visibleNodes.length} visible node{visibleNodes.length === 1 ? "" : "s"} · drag the field to pan · source metadata stays upstream
+        {visibleNodes.length} visible node{visibleNodes.length === 1 ? "" : "s"} · drag nodes to save layout · drag the field to pan
       </p>
     </section>
   );
@@ -515,17 +624,147 @@ function ConversationRow({ conversation, selected, onSelect }: ConversationRowPr
   );
 }
 
-function ConversationDetail({ conversation }: { conversation: Conversation | null }) {
+function ConversationDetail({
+  conversation,
+  onSave,
+}: {
+  conversation: Conversation | null;
+  onSave: (id: string, changes: ConversationOverlayUpdate) => Promise<void>;
+}) {
+  const conversationId = conversation?.id ?? null;
+  const [title, setTitle] = useState("");
+  const [tags, setTags] = useState("");
+  const [status, setStatus] = useState<UserStatus>("none");
+  const [note, setNote] = useState("");
+  const [hidden, setHidden] = useState(false);
+  const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!conversation) return;
+    setTitle(conversation.overlay.title ?? "");
+    setTags(conversation.overlay.tags.join(", "));
+    setStatus(conversation.overlay.status);
+    setNote(conversation.overlay.note ?? "");
+    setHidden(conversation.overlay.hidden);
+    setSaveState("idle");
+    setSaveError(null);
+  }, [conversationId]);
+
   if (!conversation) return null;
+
+  async function saveChanges(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!conversationId) return;
+    setSaveState("saving");
+    setSaveError(null);
+    try {
+      await onSave(conversationId, {
+        title,
+        tags: normalizeTags(tags),
+        status,
+        note: note.trim() ? note : null,
+        hidden,
+      });
+      setSaveState("saved");
+    } catch (reason: unknown) {
+      setSaveState("error");
+      setSaveError(describeMutationError(reason));
+    }
+  }
+
   return (
-    <aside className="detail-panel" role="region" aria-label="Conversation detail">
+    <form className="detail-panel" role="region" aria-label="Conversation detail" onSubmit={saveChanges}>
       <span className="ribbon-label">SELECTED CONVERSATION</span>
       <strong>{conversation.displayTitle}</strong>
       <code>{conversation.id}</code>
       {conversation.derived.missing && <span className="missing-detail">Source record is no longer available.</span>}
-      <span>{conversation.codex.cwd}</span>
-    </aside>
+      <span className="detail-source">{conversation.codex.cwd || "No source working directory"}</span>
+
+      <label htmlFor="conversation-title">Custom title</label>
+      <input
+        id="conversation-title"
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+        placeholder={conversation.codex.title ?? "Uses the Codex title"}
+      />
+
+      <label htmlFor="conversation-tags">Tags</label>
+      <input
+        id="conversation-tags"
+        value={tags}
+        onChange={(event) => setTags(event.target.value)}
+        placeholder="design, release, research"
+      />
+
+      <label htmlFor="conversation-status">User status</label>
+      <select
+        id="conversation-status"
+        value={status}
+        onChange={(event) => setStatus(event.target.value as UserStatus)}
+      >
+        <option value="none">None</option>
+        <option value="active">Active</option>
+        <option value="done">Done</option>
+        <option value="blocked">Blocked</option>
+      </select>
+
+      <label htmlFor="conversation-note">Note</label>
+      <textarea
+        id="conversation-note"
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        rows={4}
+        placeholder="Add context only you own."
+      />
+
+      <label className="detail-checkbox" htmlFor="conversation-hidden">
+        <input
+          id="conversation-hidden"
+          type="checkbox"
+          checked={hidden}
+          onChange={(event) => setHidden(event.target.checked)}
+        />
+        <span>Hidden from Graph</span>
+      </label>
+
+      {conversation.overlay.layout && (
+        <span className="detail-layout">
+          Layout · x {formatLayoutValue(conversation.overlay.layout.x)} / y {formatLayoutValue(conversation.overlay.layout.y)}
+        </span>
+      )}
+      {saveState === "saved" && <span className="detail-success" role="status">Changes saved</span>}
+      {saveState === "error" && saveError && (
+        <span className="detail-error" role="alert">Could not save changes: {saveError}</span>
+      )}
+      <button type="submit" className="detail-save" disabled={saveState === "saving"}>
+        {saveState === "saving" ? "Saving…" : "Save changes"}
+      </button>
+    </form>
   );
+}
+
+function normalizeTags(value: string): string[] {
+  return value
+    .split(",")
+    .map((tag) => tag.trim())
+    .filter((tag, index, all) => tag.length > 0 && all.indexOf(tag) === index);
+}
+
+function formatLayoutValue(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function describeMutationError(reason: unknown): string {
+  const error = asError(reason);
+  if (error instanceof ApiError) {
+    const retryLabel = error.payload.retryable ? "Retryable: yes." : "Retryable: no.";
+    const nextStep = error.payload.retryable
+      ? "Try saving again, or reload the Graph if the conflict persists."
+      : "Review the field values before trying again.";
+    return `Error category: ${error.payload.code}. ${error.message} The last saved snapshot is unchanged and your current edits remain here. ${retryLabel} ${nextStep}`;
+  }
+  return `Error category: local_error. ${error.message} The last saved snapshot is unchanged and your current edits remain here. Retry the save when ready.`;
 }
 
 function formatTimestamp(timestamp: string | null): string {

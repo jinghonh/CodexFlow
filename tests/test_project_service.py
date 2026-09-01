@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
+import codexflow.graph as graph_module
 from codexflow.graph import GraphOverlayError
 from codexflow.project import ProjectGraphService, ProjectInvalidError
 from codexflow.source import CodexThread, SourceReadResult
@@ -167,6 +169,242 @@ def test_snapshot_uses_source_conversations_as_graph_nodes_without_an_overlay(
     )
     assert snapshot.conversations[0].overlay.title is None
     assert snapshot.conversations[0].overlay.hidden is False
+
+
+def test_service_updates_node_overlay_and_persists_it_across_project_reload(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("stable-id", project, title="Codex title")))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    updated = service.update_node_overlay(
+        "stable-id",
+        {
+            "title": "Local title",
+            "tags": [" alpha ", "alpha", "beta"],
+            "status": "active",
+            "note": "Keep this context",
+            "hidden": True,
+            "layout": {"x": 320, "y": 180},
+        },
+        expected_etag=before.graph.etag,
+    )
+
+    conversation = updated.conversations[0]
+    assert conversation.overlay.title == "Local title"
+    assert conversation.overlay.tags == ("alpha", "beta")
+    assert conversation.overlay.status == "active"
+    assert conversation.overlay.note == "Keep this context"
+    assert conversation.overlay.hidden is True
+    assert conversation.overlay.layout == {"x": 320.0, "y": 180.0}
+    assert updated.graph.etag != "absent"
+
+    reloaded = ProjectGraphService(source)
+    reloaded.select_project(str(project))
+    reloaded_conversation = reloaded.snapshot().conversations[0]
+    assert reloaded_conversation.overlay == conversation.overlay
+    assert reloaded_conversation.display_title == "Local title"
+
+
+def test_service_rejects_an_invalid_user_status_without_writing_the_overlay(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("stable-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    with pytest.raises(GraphOverlayError) as failure:
+        service.update_node_overlay(
+            "stable-id",
+            {"status": "archived"},
+            expected_etag=before.graph.etag,
+        )
+
+    assert failure.value.code == "graph_schema_error"
+    assert not (project / ".codex" / "graph.yaml").exists()
+
+
+def test_service_rejects_an_overflowing_layout_coordinate_without_writing(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("stable-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+    before = service.snapshot()
+
+    with pytest.raises(GraphOverlayError) as failure:
+        service.update_node_overlay(
+            "stable-id",
+            {"layout": {"x": 10**1000, "y": 180}},
+            expected_etag=before.graph.etag,
+        )
+
+    assert failure.value.code == "graph_schema_error"
+    assert not (project / ".codex" / "graph.yaml").exists()
+
+
+def test_service_rejects_a_stale_graph_etag_without_writing_the_overlay(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  stable-id:
+    title: Existing title
+""",
+    )
+    source = StubSource(ready(make_thread("stable-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    graph_path = project / ".codex" / "graph.yaml"
+    original = graph_path.read_text(encoding="utf-8")
+    with pytest.raises(GraphOverlayError) as failure:
+        service.update_node_overlay(
+            "stable-id",
+            {"title": "New title"},
+            expected_etag="stale-etag",
+        )
+
+    assert failure.value.code == "graph_conflict"
+    assert graph_path.read_text(encoding="utf-8") == original
+
+
+def test_service_does_not_accept_a_wildcard_etag_without_an_explicit_override(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("stable-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    with pytest.raises(GraphOverlayError) as failure:
+        service.update_node_overlay(
+            "stable-id",
+            {"title": "Local title"},
+            expected_etag="*",
+        )
+
+    assert failure.value.code == "graph_conflict"
+    assert not (project / ".codex" / "graph.yaml").exists()
+
+
+def test_service_uses_the_codex_title_when_a_custom_title_is_cleared(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  stable-id:
+    title: Local title
+""",
+    )
+    source = StubSource(ready(make_thread("stable-id", project, title="Codex title")))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    updated = service.update_node_overlay(
+        "stable-id",
+        {"title": "   "},
+        expected_etag=before.graph.etag,
+    )
+
+    assert updated.conversations[0].overlay.title is None
+    assert updated.conversations[0].display_title == "Codex title"
+
+
+def test_service_can_save_overlay_for_a_missing_conversation_id(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("present-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    updated = service.update_node_overlay(
+        "historical-id",
+        {"note": "Keep the historical context"},
+        expected_etag=before.graph.etag,
+    )
+
+    conversation = {item.id: item for item in updated.conversations}["historical-id"]
+    assert conversation.codex is None
+    assert conversation.derived.missing is True
+    assert conversation.overlay.note == "Keep the historical context"
+    assert {node["id"] for node in updated.graph.nodes} == {"present-id", "historical-id"}
+
+
+def test_service_treats_an_empty_note_as_unset(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    write_graph(
+        project,
+        """
+version: 1
+nodes:
+  stable-id:
+    note: Existing note
+""",
+    )
+    source = StubSource(ready(make_thread("stable-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+
+    before = service.snapshot()
+    updated = service.update_node_overlay(
+        "stable-id",
+        {"note": "   "},
+        expected_etag=before.graph.etag,
+    )
+
+    assert updated.conversations[0].overlay.note is None
+
+
+def test_service_reports_a_read_only_graph_overlay_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    source = StubSource(ready(make_thread("stable-id", project)))
+    service = ProjectGraphService(source)
+    service.select_project(str(project))
+    before = service.snapshot()
+
+    def reject_replace(source_path: str, target_path: Path) -> None:
+        raise PermissionError(errno.EACCES, "read-only fixture", str(target_path))
+
+    monkeypatch.setattr(graph_module.os, "replace", reject_replace)
+    with pytest.raises(GraphOverlayError) as failure:
+        service.update_node_overlay(
+            "stable-id",
+            {"title": "Local title"},
+            expected_etag=before.graph.etag,
+        )
+
+    assert failure.value.code == "graph_read_only"
+    assert not (project / ".codex" / "graph.yaml").exists()
 
 
 def test_snapshot_merges_sparse_overlay_and_keeps_dangling_ids_as_missing_nodes(

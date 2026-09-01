@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import subprocess
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .graph import GraphOverlay, read_graph_overlay, update_graph_node
 from .models import (
     Conversation,
     ConversationOverlay,
@@ -14,7 +16,6 @@ from .models import (
     GraphSummary,
     ProjectView,
 )
-from .graph import GraphOverlay, read_graph_overlay
 from .source import CodexThread, SourceReadResult
 
 
@@ -130,6 +131,34 @@ class ProjectGraphService:
             raise SourceUnavailableError(result)
         graph_overlay = read_graph_overlay(project.real_path)
         self._graph_file_status = graph_overlay.file_status
+        return self._build_snapshot(result, graph_overlay, project)
+
+    def update_node_overlay(
+        self,
+        conversation_id: str,
+        changes: Mapping[str, object],
+        *,
+        expected_etag: str,
+    ) -> DashboardSnapshot:
+        project = self._require_project()
+        result = self._source.read_snapshot()
+        if result.status in {"unavailable", "incompatible"}:
+            raise SourceUnavailableError(result)
+        graph_overlay = update_graph_node(
+            project.real_path,
+            conversation_id,
+            changes,
+            expected_etag=expected_etag,
+        )
+        self._graph_file_status = graph_overlay.file_status
+        return self._build_snapshot(result, graph_overlay, project)
+
+    def _build_snapshot(
+        self,
+        result: SourceReadResult,
+        graph_overlay: GraphOverlay,
+        project: _ProjectContext,
+    ) -> DashboardSnapshot:
         included_threads, excluded_conversations = self._partition_threads(
             result.threads, project
         )

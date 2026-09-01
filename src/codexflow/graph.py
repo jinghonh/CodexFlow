@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import errno
+import math
+import os
+import tempfile
+from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from hashlib import sha256
-import math
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .models import ConversationOverlay
-
 
 CURRENT_GRAPH_VERSION = 1
 BUILT_IN_EDGE_TYPES = {
@@ -22,6 +26,7 @@ BUILT_IN_EDGE_TYPES = {
     "related_to",
 }
 USER_STATUSES = {"none", "active", "done", "blocked"}
+GRAPH_NODE_FIELDS = ("title", "tags", "status", "note", "hidden", "layout")
 
 
 class GraphOverlayError(Exception):
@@ -127,6 +132,162 @@ def read_graph_overlay(project_root: Path) -> GraphOverlay:
     )
 
 
+def update_graph_node(
+    project_root: Path,
+    conversation_id: str,
+    changes: Mapping[str, Any],
+    *,
+    expected_etag: str,
+) -> GraphOverlay:
+    """Persist one sparse node overlay and return the validated new document."""
+
+    overlay = read_graph_overlay(project_root)
+    if overlay.file_status == "future":
+        raise GraphOverlayError(
+            "graph_read_only",
+            "Graph overlay 属于更高版本，只能只读打开",
+        )
+    if expected_etag == "*" or expected_etag != overlay.etag:
+        raise GraphOverlayError(
+            "graph_conflict",
+            "Graph overlay 已被其他修改更新，请重新加载后再保存",
+            details={"expectedEtag": expected_etag, "currentEtag": overlay.etag},
+        )
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise GraphOverlayError("graph_schema_error", "Graph 节点 ID 必须是非空字符串")
+    if not isinstance(changes, Mapping):
+        raise GraphOverlayError("graph_schema_error", "节点更新必须是映射")
+
+    allowed_fields = set(GRAPH_NODE_FIELDS)
+    unknown_fields = set(changes) - allowed_fields
+    if unknown_fields:
+        unknown = ", ".join(sorted(str(field) for field in unknown_fields))
+        raise GraphOverlayError("graph_schema_error", f"节点更新包含未知字段：{unknown}")
+
+    current = overlay.nodes.get(conversation_id, ConversationOverlay())
+    candidate = {
+        "title": current.title,
+        "tags": list(current.tags),
+        "status": current.status,
+        "note": current.note,
+        "hidden": current.hidden,
+        "layout": deepcopy(current.layout),
+    }
+    candidate.update(changes)
+    if candidate["tags"] is None:
+        candidate["tags"] = []
+    normalized = _parse_node(conversation_id, candidate)
+
+    document = _document_for_update(overlay, conversation_id, normalized)
+    _write_graph_document(project_root, document)
+    return read_graph_overlay(project_root)
+
+
+def _document_for_update(
+    overlay: GraphOverlay,
+    conversation_id: str,
+    node: ConversationOverlay,
+) -> dict[str, Any]:
+    document = deepcopy(overlay.raw_document) if overlay.raw_document is not None else {}
+    document["version"] = CURRENT_GRAPH_VERSION
+    raw_nodes = document.get("nodes", {})
+    if not isinstance(raw_nodes, dict):
+        raise GraphOverlayError("graph_schema_error", "Graph overlay nodes 必须是映射")
+    raw_node = raw_nodes.get(conversation_id, {})
+    if not isinstance(raw_node, dict):
+        raise GraphOverlayError(
+            "graph_schema_error",
+            f"Graph 节点 {conversation_id} 必须是映射",
+        )
+    raw_node = deepcopy(raw_node)
+    for field in GRAPH_NODE_FIELDS:
+        raw_node.pop(field, None)
+    raw_node.update(_node_document(node))
+    if raw_node:
+        raw_nodes[conversation_id] = raw_node
+    else:
+        raw_nodes.pop(conversation_id, None)
+    document["nodes"] = raw_nodes
+    document.setdefault("edges", [])
+
+    ordered: dict[str, Any] = {}
+    for key in ("version", "project", "nodes", "edges"):
+        if key in document:
+            ordered[key] = document[key]
+    for key, value in document.items():
+        if key not in ordered:
+            ordered[key] = value
+    return ordered
+
+
+def _node_document(node: ConversationOverlay) -> dict[str, Any]:
+    document: dict[str, Any] = {}
+    if node.title is not None:
+        document["title"] = node.title
+    if node.tags:
+        document["tags"] = list(node.tags)
+    if node.status != "none":
+        document["status"] = node.status
+    if node.note is not None:
+        document["note"] = node.note
+    if node.hidden:
+        document["hidden"] = True
+    if node.layout is not None:
+        document["layout"] = node.layout
+    return document
+
+
+def _write_graph_document(project_root: Path, document: dict[str, Any]) -> None:
+    graph_path = project_root / ".codex" / "graph.yaml"
+    graph_directory = graph_path.parent
+    temporary_path: str | None = None
+    try:
+        resolved_graph_path = graph_path.resolve(strict=False)
+        resolved_root = project_root.resolve(strict=True)
+        if not _is_relative_to(resolved_graph_path, resolved_root):
+            raise GraphOverlayError(
+                "graph_write_error",
+                "Graph overlay 路径超出 Project 根目录",
+            )
+        graph_directory.mkdir(parents=True, exist_ok=True)
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            prefix=".graph.yaml.tmp.",
+            dir=graph_directory,
+        )
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            yaml.safe_dump(document, temporary_file, allow_unicode=True, sort_keys=False)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, graph_path)
+        temporary_path = None
+    except GraphOverlayError:
+        raise
+    except OSError as exc:
+        code = (
+            "graph_read_only"
+            if exc.errno in {errno.EACCES, errno.EPERM, errno.EROFS}
+            else "graph_write_error"
+        )
+        message = (
+            "Graph overlay 当前不可写，请检查 Project 的写入权限后重试"
+            if code == "graph_read_only"
+            else "无法保存 Graph overlay，请检查 Project 的写入权限后重试"
+        )
+        raise GraphOverlayError(code, message, details={"error": str(exc)}) from exc
+    except (yaml.YAMLError, TypeError, ValueError) as exc:
+        raise GraphOverlayError(
+            "graph_write_error",
+            "无法保存 Graph overlay，请检查 Project 的写入权限后重试",
+            details={"error": str(exc)},
+        ) from exc
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+
+
 def _validate_project(project: Any) -> None:
     if project is None:
         return
@@ -189,6 +350,8 @@ def _parse_node(conversation_id: str, raw_node: dict[str, Any]) -> ConversationO
             "graph_schema_error",
             f"Graph 节点 {conversation_id} 的 note 必须是字符串",
         )
+    if isinstance(note, str) and not note.strip():
+        note = None
 
     hidden = raw_node.get("hidden", False)
     if not isinstance(hidden, bool):
@@ -219,12 +382,24 @@ def _parse_layout(conversation_id: str, raw_layout: Any) -> dict[str, float] | N
     values: dict[str, float] = {}
     for axis in ("x", "y"):
         value = raw_layout[axis]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise GraphOverlayError(
                 "graph_schema_error",
                 f"Graph 节点 {conversation_id} 的 layout.{axis} 必须是有限数字",
             )
-        values[axis] = float(value)
+        try:
+            numeric_value = float(value)
+        except (OverflowError, ValueError):
+            raise GraphOverlayError(
+                "graph_schema_error",
+                f"Graph 节点 {conversation_id} 的 layout.{axis} 必须是有限数字",
+            ) from None
+        if not math.isfinite(numeric_value):
+            raise GraphOverlayError(
+                "graph_schema_error",
+                f"Graph 节点 {conversation_id} 的 layout.{axis} 必须是有限数字",
+            )
+        values[axis] = numeric_value
     return values
 
 

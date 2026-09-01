@@ -309,6 +309,29 @@ code { display: block; margin-top: 8px; color: #748175; font-size: 10px; }
 .detail-panel { display: grid; gap: 9px; width: min(420px, 100%); margin: 35px 0 0 auto; border-left: 2px solid var(--lime); background: rgba(231, 234, 223, 0.045); padding: 20px; }
 .detail-panel strong { color: var(--paper); font: 400 25px/1 var(--serif); }
 .detail-panel span:not(.ribbon-label) { color: var(--paper-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-panel label { color: var(--paper); font-size: 10px; letter-spacing: 0.08em; margin-top: 8px; text-transform: uppercase; }
+.detail-panel input:not([type="checkbox"]), .detail-panel select, .detail-panel textarea {
+  width: 100%;
+  border: 1px solid rgba(231, 234, 223, 0.22);
+  border-radius: 0;
+  outline: 0;
+  background: var(--ink-soft);
+  color: var(--paper);
+  padding: 11px 12px;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.detail-panel textarea { min-height: 96px; resize: vertical; }
+.detail-panel input:not([type="checkbox"]):focus, .detail-panel select:focus, .detail-panel textarea:focus { border-color: var(--lime); box-shadow: 0 0 0 3px rgba(184, 226, 78, 0.13); }
+.detail-panel input::placeholder, .detail-panel textarea::placeholder { color: #657066; }
+.detail-checkbox { display: flex; align-items: center; gap: 9px; margin-top: 10px !important; letter-spacing: 0 !important; text-transform: none !important; }
+.detail-checkbox input { accent-color: var(--lime); }
+.detail-source, .detail-layout { overflow-wrap: anywhere; white-space: normal !important; }
+.detail-success { color: var(--lime) !important; }
+.detail-error, .graph-error { color: var(--orange) !important; line-height: 1.5; white-space: normal !important; }
+.detail-save { margin-top: 8px; border: 1px solid var(--lime); background: var(--lime); color: var(--ink); padding: 12px 15px; font-size: 11px; font-weight: 700; transition: transform 160ms ease, background 160ms ease; }
+.detail-save:hover:not(:disabled), .detail-save:focus-visible { background: #d2f477; transform: translate(-2px, -2px); }
+.detail-save:disabled { cursor: wait; opacity: 0.65; }
+.graph-error { margin: 12px 0 0; font-size: 11px; }
 .detail-panel .missing-detail { color: var(--orange); }
 
 @keyframes rise-in { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }

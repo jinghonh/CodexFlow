@@ -128,6 +128,149 @@ edges:
 
 
 @pytest.mark.asyncio
+async def test_http_patch_node_updates_overlay_and_returns_the_new_snapshot(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    app = create_app(source=ApiSource(ready(thread("stable-id", project))))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        assert initial.headers["etag"] == '"absent"'
+        updated = await client.patch(
+            "/api/graph/nodes/stable-id",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={
+                "title": "Local title",
+                "tags": [" alpha ", "alpha", "beta"],
+                "status": "active",
+                "note": "Keep this context",
+                "hidden": True,
+                "layout": {"x": 320, "y": 180},
+            },
+        )
+        reloaded = await client.get("/api/snapshot")
+
+    assert updated.status_code == 200
+    body = updated.json()
+    conversation = body["conversations"][0]
+    assert conversation["overlay"] == {
+        "title": "Local title",
+        "tags": ["alpha", "beta"],
+        "status": "active",
+        "note": "Keep this context",
+        "hidden": True,
+        "layout": {"x": 320.0, "y": 180.0},
+    }
+    assert body["graph"]["etag"] != "absent"
+    assert updated.headers["etag"] == f'"{body["graph"]["etag"]}"'
+    assert reloaded.json()["conversations"][0]["overlay"] == conversation["overlay"]
+
+
+@pytest.mark.asyncio
+async def test_http_patch_node_rejects_invalid_status_without_creating_a_file(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    app = create_app(source=ApiSource(ready(thread("stable-id", project))))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        response = await client.patch(
+            "/api/graph/nodes/stable-id",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={"status": "archived"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert not (project / ".codex" / "graph.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_http_patch_node_reports_an_etag_conflict_without_overwriting(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    graph_path = project / ".codex" / "graph.yaml"
+    graph_path.parent.mkdir()
+    graph_path.write_text("version: 1\nnodes: {}\n", encoding="utf-8")
+    app = create_app(source=ApiSource(ready(thread("stable-id", project))))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        original = graph_path.read_text(encoding="utf-8")
+        response = await client.patch(
+            "/api/graph/nodes/stable-id",
+            headers={"If-Match": "stale-etag"},
+            json={"title": "New title"},
+        )
+
+    assert response.status_code == 412
+    assert response.json()["error"]["code"] == "graph_conflict"
+    assert graph_path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.asyncio
+async def test_http_patch_node_requires_an_etag_header(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    app = create_app(source=ApiSource(ready(thread("stable-id", project))))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        response = await client.patch(
+            "/api/graph/nodes/stable-id",
+            json={"title": "Local title"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_http_patch_node_rejects_coerced_overlay_field_types(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    app = create_app(source=ApiSource(ready(thread("stable-id", project))))
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post("/api/project/select", json={"path": str(project)})
+        initial = await client.get("/api/snapshot")
+        response = await client.patch(
+            "/api/graph/nodes/stable-id",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={"hidden": 1, "layout": {"x": "320", "y": 180}},
+        )
+        huge_coordinate = await client.patch(
+            "/api/graph/nodes/stable-id",
+            headers={"If-Match": initial.json()["graph"]["etag"]},
+            json={"layout": {"x": 10**1000, "y": 180}},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert huge_coordinate.status_code == 400
+    assert huge_coordinate.json()["error"]["code"] == "invalid_request"
+    assert not (project / ".codex" / "graph.yaml").exists()
+
+
+@pytest.mark.asyncio
 async def test_http_snapshot_explains_source_threads_excluded_by_project_membership(
     tmp_path: Path,
 ) -> None:

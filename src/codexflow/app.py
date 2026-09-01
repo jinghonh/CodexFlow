@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr, field_validator
 
 from .graph import GraphOverlayError
 from .models import DashboardSnapshot, ProjectView
@@ -23,6 +24,37 @@ from .source import CodexThreadSource
 
 class ProjectSelectRequest(BaseModel):
     path: str
+
+
+class GraphNodeLayoutRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    x: float
+    y: float
+
+    @field_validator("x", "y", mode="before")
+    @classmethod
+    def validate_coordinate(cls, value: object) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("布局坐标必须是数字")  # noqa: TRY004
+        try:
+            numeric_value = float(value)
+        except (OverflowError, ValueError):
+            raise ValueError("布局坐标必须是有限数字") from None
+        if not math.isfinite(numeric_value):
+            raise ValueError("布局坐标必须是有限数字")
+        return numeric_value
+
+
+class GraphNodePatchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: StrictStr | None = None
+    tags: list[StrictStr] | None = None
+    status: Literal["none", "active", "done", "blocked"] | None = None
+    note: StrictStr | None = None
+    hidden: StrictBool | None = None
+    layout: GraphNodeLayoutRequest | None = None
 
 
 class ApiFailure(Exception):
@@ -76,7 +108,12 @@ def create_app(*, source: object | None = None) -> FastAPI:
             400,
             "invalid_request",
             "请求字段无效",
-            details={"errors": exc.errors()},
+            details={
+                "errors": [
+                    {key: value for key, value in error.items() if key != "ctx"}
+                    for error in exc.errors()
+                ]
+            },
         )
 
     @app.get("/api/health")
@@ -121,12 +158,45 @@ def create_app(*, source: object | None = None) -> FastAPI:
             raise ApiFailure(404, "project_not_selected", str(exc)) from exc
 
     @app.get("/api/snapshot")
-    def get_snapshot() -> dict[str, Any]:
-        return _snapshot_payload(service)
+    def get_snapshot(response: Response) -> dict[str, Any]:
+        return _snapshot_payload(service, response=response)
+
+    @app.patch("/api/graph/nodes/{conversation_id}")
+    def patch_graph_node(
+        conversation_id: str,
+        payload: GraphNodePatchRequest,
+        response: Response,
+        if_match: str | None = Header(default=None, alias="If-Match"),
+    ) -> dict[str, Any]:
+        if if_match is None or not if_match.strip():
+            raise ApiFailure(
+                400,
+                "invalid_request",
+                "保存 Graph 节点需要 If-Match 版本标记",
+            )
+        changes = payload.model_dump(exclude_unset=True)
+        if not changes:
+            raise ApiFailure(400, "invalid_request", "至少需要修改一个 Graph 节点字段")
+        if "layout" in changes and changes["layout"] is not None:
+            changes["layout"] = dict(changes["layout"])
+        try:
+            snapshot = service.update_node_overlay(
+                conversation_id,
+                changes,
+                expected_etag=_unquote_etag(if_match),
+            )
+        except ProjectNotSelectedError as exc:
+            raise ApiFailure(404, "project_not_selected", str(exc)) from exc
+        except SourceUnavailableError as exc:
+            raise _source_api_failure(exc) from exc
+        except GraphOverlayError as exc:
+            raise _graph_api_failure(exc) from exc
+        response.headers["ETag"] = _quote_etag(snapshot.graph.etag)
+        return snapshot.to_dict()
 
     @app.post("/api/refresh")
-    def refresh() -> dict[str, Any]:
-        return _snapshot_payload(service)
+    def refresh(response: Response) -> dict[str, Any]:
+        return _snapshot_payload(service, response=response)
 
     static_directories = (
         Path(__file__).resolve().parents[2] / "frontend" / "dist",
@@ -140,37 +210,70 @@ def create_app(*, source: object | None = None) -> FastAPI:
     return app
 
 
-def _snapshot_payload(service: ProjectGraphService) -> dict[str, Any]:
+def _snapshot_payload(
+    service: ProjectGraphService,
+    *,
+    response: Response | None = None,
+) -> dict[str, Any]:
     try:
         snapshot: DashboardSnapshot = service.snapshot()
     except ProjectNotSelectedError as exc:
         raise ApiFailure(404, "project_not_selected", str(exc)) from exc
     except SourceUnavailableError as exc:
-        result = exc.result
-        code = "source_incompatible" if result.status == "incompatible" else "source_unavailable"
-        message = (
-            result.error.message
-            if result.error
-            else "Codex 来源不可用，尚未形成完整 source snapshot"
-        )
-        raise ApiFailure(
-            503,
-            code,
-            message,
-            details={
-                "sourceStatus": result.status,
-                "userAgent": result.user_agent,
-                "hasCompleteSnapshot": result.has_complete_snapshot,
-            },
-            retryable=result.error.retryable if result.error else True,
-        ) from exc
+        raise _source_api_failure(exc) from exc
     except GraphOverlayError as exc:
         raise _graph_api_failure(exc) from exc
+    if response is not None:
+        response.headers["ETag"] = _quote_etag(snapshot.graph.etag)
     return snapshot.to_dict()
 
 
 def _graph_api_failure(exc: GraphOverlayError) -> ApiFailure:
-    return ApiFailure(422, exc.code, exc.message, details=exc.details)
+    status_code = {
+        "graph_conflict": 412,
+        "graph_busy": 409,
+        "duplicate_edge": 409,
+        "self_edge": 409,
+        "graph_read_only": 423,
+    }.get(exc.code, 422 if exc.code in {
+        "graph_parse_error",
+        "graph_schema_error",
+        "graph_version_error",
+    } else 500)
+    return ApiFailure(
+        status_code,
+        exc.code,
+        exc.message,
+        details=exc.details,
+        retryable=exc.code in {"graph_conflict", "graph_busy", "graph_write_error"},
+    )
+
+
+def _source_api_failure(exc: SourceUnavailableError) -> ApiFailure:
+    result = exc.result
+    code = "source_incompatible" if result.status == "incompatible" else "source_unavailable"
+    return ApiFailure(
+        503,
+        code,
+        result.error.message if result.error else "Codex 来源不可用，尚未形成完整 source snapshot",
+        details={
+            "sourceStatus": result.status,
+            "userAgent": result.user_agent,
+            "hasCompleteSnapshot": result.has_complete_snapshot,
+        },
+        retryable=result.error.retryable if result.error else True,
+    )
+
+
+def _unquote_etag(value: str) -> str:
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+        return stripped[1:-1]
+    return stripped
+
+
+def _quote_etag(value: str) -> str:
+    return f'"{value}"'
 
 
 def _current_project_view(service: ProjectGraphService) -> ProjectView | None:

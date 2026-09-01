@@ -47,10 +47,26 @@ export interface CodexMetadata {
 export interface ConversationOverlay {
   title: string | null;
   tags: string[];
-  status: string;
+  status: UserStatus;
   note: string | null;
   hidden: boolean;
-  layout: { x: number; y: number } | null;
+  layout: NodeLayout | null;
+}
+
+export type UserStatus = "none" | "active" | "done" | "blocked";
+
+export interface NodeLayout {
+  x: number;
+  y: number;
+}
+
+export interface ConversationOverlayUpdate {
+  title?: string | null;
+  tags?: string[];
+  status?: UserStatus;
+  note?: string | null;
+  hidden?: boolean;
+  layout?: NodeLayout | null;
 }
 
 export interface DerivedConversationState {
@@ -82,7 +98,7 @@ export interface GraphNode {
   displayTitle: string;
   missing: boolean;
   hidden: boolean;
-  layout: { x: number; y: number } | null;
+  layout: NodeLayout | null;
 }
 
 export interface GraphEdge {

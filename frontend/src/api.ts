@@ -1,6 +1,7 @@
 import type {
   ApiErrorPayload,
   DashboardSnapshot,
+  ConversationOverlayUpdate,
   HealthResponse,
   ProjectView,
   SourceSummary,
@@ -23,6 +24,11 @@ export interface DashboardApi {
   selectProject(path: string): Promise<{ project: ProjectView; source: SourceSummary }>;
   snapshot(): Promise<DashboardSnapshot>;
   refresh(): Promise<DashboardSnapshot>;
+  updateNode(
+    conversationId: string,
+    changes: ConversationOverlayUpdate,
+    etag: string,
+  ): Promise<DashboardSnapshot>;
 }
 
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -38,6 +44,15 @@ export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThi
       }),
     snapshot: () => request<DashboardSnapshot>(fetchLike, "/api/snapshot"),
     refresh: () => request<DashboardSnapshot>(fetchLike, "/api/refresh", { method: "POST" }),
+    updateNode: (conversationId, changes, etag) =>
+      request<DashboardSnapshot>(fetchLike, `/api/graph/nodes/${encodeURIComponent(conversationId)}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          "If-Match": etag,
+        },
+        body: JSON.stringify(changes),
+      }),
   };
 }
 

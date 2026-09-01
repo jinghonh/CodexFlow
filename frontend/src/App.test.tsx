@@ -104,12 +104,14 @@ function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
     selectProject: vi.fn().mockResolvedValue({ project, source: health.source }),
     snapshot: vi.fn().mockResolvedValue(snapshot),
     refresh: vi.fn().mockResolvedValue(snapshot),
+    updateNode: vi.fn().mockResolvedValue(snapshot),
   };
   return {
     health: overrides.health ?? defaults.health,
     selectProject: overrides.selectProject ?? defaults.selectProject,
     snapshot: overrides.snapshot ?? defaults.snapshot,
     refresh: overrides.refresh ?? defaults.refresh,
+    updateNode: overrides.updateNode ?? defaults.updateNode,
   };
 }
 
@@ -282,6 +284,153 @@ describe("Dashboard conversation list", () => {
 });
 
 describe("Dashboard graph", () => {
+  it("edits Conversation metadata through the detail panel and refreshes the snapshot", async () => {
+    const user = userEvent.setup();
+    const updatedSnapshot: DashboardSnapshot = {
+      ...snapshot,
+      graph: {
+        ...snapshot.graph,
+        etag: "saved-etag",
+        nodes: snapshot.graph.nodes.map((node) =>
+          node.id === "active-id"
+            ? { ...node, displayTitle: "Local title", hidden: true }
+            : node,
+        ),
+      },
+      conversations: snapshot.conversations.map((conversation) =>
+        conversation.id === "active-id"
+          ? {
+              ...conversation,
+              displayTitle: "Local title",
+              overlay: {
+                ...conversation.overlay,
+                title: "Local title",
+                tags: ["alpha", "beta"],
+                status: "done",
+                note: "Need this context",
+                hidden: true,
+              },
+            }
+          : conversation,
+      ),
+    };
+    const updateNode = vi.fn().mockResolvedValue(updatedSnapshot);
+    const api = apiDouble({ updateNode });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    await user.clear(within(detail).getByLabelText("Custom title"));
+    await user.type(within(detail).getByLabelText("Custom title"), "Local title");
+    await user.clear(within(detail).getByLabelText("Tags"));
+    await user.type(within(detail).getByLabelText("Tags"), "alpha, beta");
+    await user.selectOptions(within(detail).getByLabelText("User status"), "done");
+    await user.type(within(detail).getByLabelText("Note"), "Need this context");
+    await user.click(within(detail).getByLabelText("Hidden from Graph"));
+    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+
+    expect(updateNode).toHaveBeenCalledWith(
+      "active-id",
+      {
+        title: "Local title",
+        tags: ["alpha", "beta"],
+        status: "done",
+        note: "Need this context",
+        hidden: true,
+      },
+      "absent",
+    );
+    await waitFor(() => expect(screen.getByText("Changes saved")).toBeInTheDocument());
+    expect(within(detail).getByLabelText("Custom title")).toHaveValue("Local title");
+    expect(within(detail).getByLabelText("Tags")).toHaveValue("alpha, beta");
+    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "Conversation graph" })).queryByRole("button", { name: /Map the local runtime/ })).not.toBeInTheDocument();
+  });
+
+  it("keeps unsaved form values and explains a failed metadata update", async () => {
+    const user = userEvent.setup();
+    const updateNode = vi.fn().mockRejectedValue(
+      new ApiError(412, {
+        code: "graph_conflict",
+        message: "The Graph changed elsewhere; reload before saving.",
+        details: null,
+        retryable: true,
+      }),
+    );
+    const api = apiDouble({ updateNode });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+
+    const detail = await screen.findByRole("region", { name: "Conversation detail" });
+    const titleInput = within(detail).getByLabelText("Custom title");
+    const noteInput = within(detail).getByLabelText("Note");
+    await user.type(titleInput, "Draft title");
+    await user.type(noteInput, "Draft note");
+    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+
+    const alert = await within(detail).findByRole("alert");
+    expect(alert).toHaveTextContent("Could not save changes");
+    expect(alert).toHaveTextContent("The Graph changed elsewhere; reload before saving.");
+    expect(titleInput).toHaveValue("Draft title");
+    expect(noteInput).toHaveValue("Draft note");
+  });
+
+  it("saves a node layout only after the node drag ends", async () => {
+    const user = userEvent.setup();
+    const updateNode = vi.fn().mockResolvedValue(snapshot);
+    const api = apiDouble({ updateNode });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const graph = await screen.findByRole("region", { name: "Conversation graph" });
+    const canvas = within(graph).getByRole("application", { name: "Graph canvas" });
+    const node = within(graph).getByRole("button", { name: /Map the local runtime/ });
+    fireEvent.mouseDown(node, { clientX: 50, clientY: 50, button: 0 });
+    fireEvent.mouseMove(canvas, { clientX: 90, clientY: 70 });
+    expect(updateNode).not.toHaveBeenCalled();
+    fireEvent.mouseUp(canvas, { clientX: 90, clientY: 70 });
+
+    await waitFor(() => {
+      expect(updateNode).toHaveBeenCalledWith(
+        "active-id",
+        { layout: { x: 72, y: 54 } },
+        "absent",
+      );
+    });
+  });
+
+  it("keeps the attempted node position when layout persistence fails", async () => {
+    const user = userEvent.setup();
+    const updateNode = vi.fn().mockRejectedValue(new Error("Graph is read-only."));
+    const api = apiDouble({ updateNode });
+    render(<App api={api} />);
+
+    await screen.findByText("Local runtime ready");
+    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "Load Project" }));
+
+    const graph = await screen.findByRole("region", { name: "Conversation graph" });
+    const canvas = within(graph).getByRole("application", { name: "Graph canvas" });
+    const node = within(graph).getByRole("button", { name: /Map the local runtime/ });
+    fireEvent.mouseDown(node, { clientX: 50, clientY: 50, button: 0 });
+    fireEvent.mouseMove(canvas, { clientX: 90, clientY: 70 });
+    fireEvent.mouseUp(canvas, { clientX: 90, clientY: 70 });
+
+    expect(await within(graph).findByRole("alert")).toHaveTextContent("Graph is read-only.");
+    expect(node).toHaveStyle({ left: "72px", top: "54px" });
+  });
+
   it("renders source and missing nodes, selects a node, and supports zoom and pan", async () => {
     const user = userEvent.setup();
     const graphSnapshot = {
