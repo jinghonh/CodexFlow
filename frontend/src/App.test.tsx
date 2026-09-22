@@ -7,123 +7,7 @@ import { App } from "./App";
 import type { DashboardApi } from "./api";
 import type { DashboardSnapshot, HealthResponse, ProjectView } from "./types";
 
-const project: ProjectView = {
-  originalPath: "/projects/codexflow",
-  realPath: "/projects/codexflow",
-  gitRoot: null,
-  worktreeRoot: null,
-  isGitProject: false,
-  graphFile: "/projects/codexflow/.codex/graph.yaml",
-  graphFileStatus: "absent",
-};
-
-const health: HealthResponse = {
-  status: "ok",
-  listenHost: "127.0.0.1",
-  source: { status: "unavailable", userAgent: null, error: null },
-  project: null,
-};
-
-const snapshot: DashboardSnapshot = {
-  project,
-  source: {
-    status: "ready",
-    generatedAt: "2024-01-01T02:00:00Z",
-    userAgent: "Codex Desktop/0.150.1 fixture",
-    error: null,
-  },
-  graph: {
-    etag: "absent",
-    fileStatus: "absent",
-    nodes: [
-      {
-        id: "active-id",
-        displayTitle: "Map the local runtime",
-        missing: false,
-        hidden: false,
-        layout: null,
-      },
-      {
-        id: "archived-id",
-        displayTitle: "Archive the first pass",
-        missing: false,
-        hidden: false,
-        layout: null,
-      },
-    ],
-    edges: [],
-  },
-  conversations: [
-    {
-      id: "active-id",
-      displayTitle: "Map the local runtime",
-      codex: {
-        title: "Map the local runtime",
-        preview: "Map the local runtime",
-        createdAt: "2024-01-01T00:00:00Z",
-        updatedAt: "2024-01-01T01:00:00Z",
-        recencyAt: "2024-01-01T01:00:00Z",
-        cwd: "/projects/codexflow",
-        source: "cli",
-        archived: false,
-        historyMode: null,
-        status: "idle",
-        projectId: null,
-        gitInfo: null,
-      },
-      overlay: { title: null, tags: [], status: "none", note: null, hidden: false, layout: null },
-      derived: { missing: false, unlinked: true, sourceAvailable: true, validObservationRange: true },
-    },
-    {
-      id: "archived-id",
-      displayTitle: "Archive the first pass",
-      codex: {
-        title: null,
-        preview: "Archive the first pass",
-        createdAt: "2024-01-02T00:00:00Z",
-        updatedAt: "2024-01-02T00:00:00Z",
-        recencyAt: null,
-        cwd: "/projects/codexflow",
-        source: "vscode",
-        archived: true,
-        historyMode: null,
-        status: "notLoaded",
-        projectId: null,
-        gitInfo: null,
-      },
-      overlay: { title: null, tags: [], status: "none", note: null, hidden: false, layout: null },
-      derived: { missing: false, unlinked: true, sourceAvailable: true, validObservationRange: true },
-    },
-  ],
-  excludedConversations: [],
-};
-
-function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
-  const defaults: DashboardApi = {
-    health: vi.fn().mockResolvedValue(health),
-    selectProject: vi.fn().mockResolvedValue({ project, source: health.source }),
-    snapshot: vi.fn().mockResolvedValue(snapshot),
-    refresh: vi.fn().mockResolvedValue(snapshot),
-    migrateGraph: vi.fn().mockResolvedValue({ ...snapshot, backupPath: null }),
-    saveCopy: vi.fn().mockResolvedValue({ copyPath: "/projects/codexflow/.codex/graph.yaml.copy.fixture" }),
-    updateNode: vi.fn().mockResolvedValue(snapshot),
-    createEdge: vi.fn().mockResolvedValue(snapshot),
-    updateEdge: vi.fn().mockResolvedValue(snapshot),
-    deleteEdge: vi.fn().mockResolvedValue(snapshot),
-  };
-  return {
-    health: overrides.health ?? defaults.health,
-    selectProject: overrides.selectProject ?? defaults.selectProject,
-    snapshot: overrides.snapshot ?? defaults.snapshot,
-    refresh: overrides.refresh ?? defaults.refresh,
-    migrateGraph: overrides.migrateGraph ?? defaults.migrateGraph,
-    saveCopy: overrides.saveCopy ?? defaults.saveCopy,
-    updateNode: overrides.updateNode ?? defaults.updateNode,
-    createEdge: overrides.createEdge ?? defaults.createEdge,
-    updateEdge: overrides.updateEdge ?? defaults.updateEdge,
-    deleteEdge: overrides.deleteEdge ?? defaults.deleteEdge,
-  };
-}
+import { project, health, snapshot, apiDouble } from "./test/dashboard";
 
 function httpApiDouble(snapshotToServe: DashboardSnapshot): DashboardApi {
   const fetchLike = vi.fn(async (input: RequestInfo | URL) => {
@@ -732,7 +616,7 @@ describe("Dashboard graph", () => {
     expect(conflict).toHaveTextContent("draft-etag");
     expect(conflict).toHaveTextContent("external-etag");
     expect(within(detail).getByLabelText("Custom title")).toHaveValue("Draft title");
-    expect(within(conflict).getByRole("button", { name: "Reload Graph" })).toBeInTheDocument();
+    expect(within(conflict).getByRole("button", { name: "Discard all drafts & reload Graph" })).toBeInTheDocument();
     expect(within(conflict).getByRole("button", { name: "Save a copy" })).toBeInTheDocument();
     expect(within(conflict).getByRole("button", { name: "Overwrite explicitly" })).toBeInTheDocument();
 
@@ -858,7 +742,7 @@ describe("Dashboard graph", () => {
     await user.click(within(detail).getByRole("button", { name: "Save changes" }));
 
     const conflict = await screen.findByRole("alert", { name: "Graph conflict" });
-    await user.click(within(conflict).getByRole("button", { name: "Reload Graph" }));
+    await user.click(within(conflict).getByRole("button", { name: "Discard all drafts & reload Graph" }));
 
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole("alert", { name: "Graph conflict" })).not.toBeInTheDocument();

@@ -48,7 +48,15 @@ def main() -> None:
         dialog.get_by_role("button", name="Cancel").click()
         expect(title).to_have_value("Keep this draft")
 
+        conversations = page.get_by_role("table", name="Conversation list")
+        conversations.get_by_text("fixture-archived-thread", exact=True).click()
+        detail.get_by_label("Custom title").fill("Keep another draft")
+        conversations.get_by_text("fixture-active-thread", exact=True).click()
+        expect(detail.get_by_label("Custom title")).to_have_value("Keep this draft")
+
         page.get_by_role("button", name="Refresh source").click()
+        expect(dialog).to_contain_text("2 unsaved Graph drafts are open")
+        expect(dialog.get_by_role("list", name="Unsaved Graph drafts").get_by_role("listitem")).to_have_count(2)
         refresh_button = page.get_by_role("button", name="Refresh source")
         with page.expect_response(lambda response: response.url.split("?", 1)[0].endswith("/api/refresh")):
             page.get_by_role("dialog", name="Save your Graph changes first?").get_by_role(
@@ -66,6 +74,13 @@ def main() -> None:
         ).click()
         expect(page.get_by_text("Saved by refresh gate").first).to_be_visible()
         expect(page.get_by_role("dialog", name="Save your Graph changes first?")).not_to_be_visible()
+
+        graph = page.get_by_role("region", name="Conversation graph")
+        graph.get_by_role("button", name="Zoom in").click()
+        canvas = graph.get_by_role("application", name="Graph canvas")
+        refresh_button.click()
+        expect(refresh_button).to_be_enabled()
+        expect(canvas).to_have_attribute("data-zoom", "1.1")
 
         print("browser refresh and dirty-draft acceptance test passed")
         browser.close()

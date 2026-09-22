@@ -33,6 +33,9 @@ _避免_：Activity Range、任务工期
 **Graph overlay**：
 项目为 Conversation 保存的用户自有信息层，不复制 Codex 的来源字段。没有 overlay 记录表示该 Conversation 没有用户自定义信息，不表示 Conversation 不存在。
 
+**图谱草稿**：
+用户对会话本地元数据、人工关系或布局做出但尚未被成功提交确认的修改。一次提交成功只确认该次提交包含的内容，未包含其中的后续修改仍属于草稿；其他草稿保存失败不撤销已经成功的提交。
+
 **hidden**：
 用户对 Graph 显示的隐藏选择。hidden 不表示 Conversation 缺失，也不改变它是否已建立关系。
 

@@ -221,6 +221,7 @@ h1 {
 .refresh-dialog h2 { margin: 0 0 12px; color: var(--paper); font: 400 clamp(28px, 5vw, 42px)/0.95 var(--serif); letter-spacing: -0.05em; }
 .refresh-dialog > p:not(.section-kicker):not(.refresh-dialog-error) { margin: 0; color: var(--paper-dim); font-size: 11px; line-height: 1.6; }
 .refresh-dialog-error { margin: 15px 0 0; color: var(--orange); font-size: 10px; line-height: 1.5; }
+.draft-summary { margin: 14px 0 0; padding-left: 18px; max-height: 180px; overflow-y: auto; color: var(--paper-dim); font-size: 11px; line-height: 1.7; }
 .refresh-dialog-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
 .refresh-dialog-actions button { border: 1px solid rgba(231, 234, 223, 0.30); background: rgba(231, 234, 223, 0.06); color: var(--paper); padding: 10px 12px; font-size: 10px; transition: border-color 160ms ease, background 160ms ease, color 160ms ease, transform 160ms ease; }
 .refresh-dialog-actions button:hover:not(:disabled), .refresh-dialog-actions button:focus-visible { border-color: var(--lime); color: var(--lime); outline: 0; transform: translateY(-2px); }
