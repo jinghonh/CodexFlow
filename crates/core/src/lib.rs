@@ -1,6 +1,7 @@
 mod analysis_batch;
 mod candidates;
 mod facts;
+mod inferred;
 mod projects;
 mod relations;
 mod summary;
@@ -622,9 +623,40 @@ impl SourceService {
     pub fn project_graph(&self, project_id: &str) -> Result<ProjectGraph, AppError> {
         let sessions = self.sessions.project_sessions(project_id)?;
         let relations = self.sessions.observed_relations(project_id)?;
-        let (_, derived) = self.automatic_candidates(&sessions)?;
+        let (preview, derived) = self.automatic_candidates(&sessions)?;
         let mut graph = relations::project_graph(sessions, relations);
         graph.derived_relations = derived;
+        for result in self.sessions.inferred_pair_outcomes(project_id)? {
+            if let Some(candidate) = preview
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == result.candidate_id)
+            {
+                if inferred::candidate_version(self, candidate)? == result.input_version {
+                    for relation in &result.relations {
+                        if relation.input_version == result.input_version
+                            && relation.from_thread_id != relation.to_thread_id
+                            && relation.source == "jev"
+                            && [
+                                relation.from_thread_id.as_str(),
+                                relation.to_thread_id.as_str(),
+                            ]
+                            .iter()
+                            .all(|id| {
+                                *id == candidate.left_thread_id || *id == candidate.right_thread_id
+                            })
+                            && candidate.evidence.pairs.contains(&relation.evidence)
+                            && (0.0..=1.0).contains(&relation.confidence)
+                            && inferred::valid_evidence(self, project_id, &relation.evidence.left)?
+                            && inferred::valid_evidence(self, project_id, &relation.evidence.right)?
+                        {
+                            graph.inferred_relations.push(relation.clone());
+                        }
+                    }
+                    graph.inference_outcomes.push(result);
+                }
+            }
+        }
         Ok(graph)
     }
 

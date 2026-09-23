@@ -110,3 +110,35 @@ test("规则关系显示灰色事实依据和来源定位", async () => {
   fireEvent.click(screen.getByRole("button", { name: "定位来源条目" }));
   expect(onSelectEvidence).toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn-1", itemId: "item-1" }));
 });
+
+test("推断关系按置信度隐藏并能查看双侧证据", async () => {
+  const proof = (id: string, threadId: string) => ({ id, threadId, turnId: `turn-${threadId}`, itemId: `item-${threadId}`, excerpt: `${threadId} 的真实摘录`, contentVersion: "v1" });
+  vi.mocked(invoke).mockResolvedValue({
+    project: { id: "project", name: "示例项目" },
+    nodes: [{ id: "thread-a", title: "甲", referenceOnly: false }, { id: "thread-b", title: "乙", referenceOnly: false }],
+    relations: [], derivedRelations: [], diagnostics: [],
+    inferredRelations: [{ id: "inferred", projectId: "project", candidateId: "candidate", fromThreadId: "thread-a", toThreadId: "thread-b",
+      kind: "FIXES", source: "jev", requestedModel: "jev-latest", actualModel: "jev-1.13.0", confidence: 0.65,
+      probabilities: { SUPPORTS: 0.7, REJECTS: 0.2, UNKNOWN: 0.1 }, evidenceConfidence: 0.9,
+      evidenceProbabilities: { p0: 0.9, INSUFFICIENT: 0.1 }, evidence: { id: "pair", left: proof("left", "thread-a"), right: proof("right", "thread-b") },
+      timeCheck: "unverifiable", explanation: "Jev 判定 FIXES；本地依据摘录整理。", inputVersion: "v1" }],
+    inferenceOutcomes: [{ candidateId: "candidate", status: "valid", unknownCount: 0 }, { candidateId: "none", status: "none", unknownCount: 0 }],
+  });
+  const onSelectEvidence = vi.fn();
+  render(<ProjectGraphView projectId="project" refreshVersion={0} onSelectEvidence={onSelectEvidence} />);
+  expect(await screen.findByText(/低于 0.70 的推断关系/)).toBeTruthy();
+  expect(screen.queryByRole("button", { name: /推断 · 修复/ })).toBeNull();
+  fireEvent.click(screen.getByRole("checkbox", { name: /低于 0.70/ }));
+  const edge = await screen.findByRole("button", { name: "推断 · 修复 · 0.65" });
+  expect(edge.dataset.source).toBe("thread-a");
+  expect(edge.dataset.target).toBe("thread-b");
+  fireEvent.click(edge);
+  expect(screen.getByRole("heading", { name: "推断关系 · 修复" })).toBeTruthy();
+  expect(screen.getByText(/Jev · jev-1.13.0/)).toBeTruthy();
+  expect(screen.getByText("来源时间不足，无法验证顺序")).toBeTruthy();
+  const buttons = screen.getAllByRole("button", { name: "定位来源条目" });
+  expect(buttons).toHaveLength(2);
+  fireEvent.click(buttons[1]);
+  expect(onSelectEvidence).toHaveBeenCalledWith(expect.objectContaining({ threadId: "thread-b", itemId: "item-thread-b" }));
+  expect(screen.getByText(/无关系 1/)).toBeTruthy();
+});

@@ -178,7 +178,7 @@ function App() {
     let active = true;
     let unlisten: (() => void) | undefined;
     listen<{ state: string }>("analysis-run", (event) => {
-      if (active && ["complete", "partial", "failed", "cancelled"].includes(event.payload.state)) {
+      if (active && ["paused", "complete", "partial", "failed", "cancelled"].includes(event.payload.state)) {
         setGraphVersion((version) => version + 1);
       }
     }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});

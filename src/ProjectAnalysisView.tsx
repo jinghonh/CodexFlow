@@ -77,7 +77,10 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
 
   const active = run?.state === "queued" || run?.state === "running" || run?.state === "cancelling";
   const summary = preview?.stages[0];
-  const canStart = !!summary?.available && (summary?.pendingItems ?? 0) > 0 && !active && run?.state !== "paused" && !busy;
+  const canStart = (!!summary?.available || (summary?.pendingItems ?? 0) === 0) &&
+    (((summary?.pendingItems ?? 0) > 0) ||
+      (!!preview?.stages[1]?.available && (preview?.stages[1]?.pendingItems ?? 0) > 0)) &&
+    !active && run?.state !== "paused" && !busy;
   const valid = Number.isInteger(limits.callLimit) && limits.callLimit > 0 && Number.isInteger(limits.timeoutSeconds) && limits.timeoutSeconds > 0 &&
     Number.isInteger(limits.concurrencyLimit) && limits.concurrencyLimit >= 1 && limits.concurrencyLimit <= 2 &&
     Number.isInteger(limits.retryLimit) && limits.retryLimit >= 0 && limits.retryLimit <= 2 &&
@@ -86,7 +89,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   return <section className="panel analysis-panel" aria-label="项目分析批次">
     <div className="panel-kicker">06 / 项目分析</div>
     <h2>预览与批次</h2>
-    <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的 Jev 设置；修改后需保存才生效。当前批次只执行会话总结；关系判断、证据选择和命名仍待接入。调用次数是上限，不是费用或令牌估计。</p>
+    <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的 Jev 设置；修改后需保存才生效。Codex 负责会话总结，Jev 负责关系判断和证据选择；工作流命名尚未接入。调用次数是上限，不是费用或令牌估计。</p>
     <div className="analysis-limits">
       <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={limits.callLimit} onChange={(event) => setLimits({ ...limits, callLimit: Number(event.target.value) })} /></label>
       <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max="2" value={limits.concurrencyLimit} onChange={(event) => setLimits({ ...limits, concurrencyLimit: Number(event.target.value) })} /></label>
@@ -105,9 +108,9 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
         <span>待处理 {stage.pendingItems}；调用上界 {stage.maximumCalls}</span>
         <small>{stage.sendScope}</small><small>{stage.note}</small>
       </div>)}</div>
-      <p className="analysis-note">候选最多 {preview.maximumCandidates} 对，证据选择最多 {preview.evidenceSelectionCallLimit} 次 Jev POST；待命名分组尚未知。Jev {preview.jevConfigured ? "已配置" : "未配置"}，关系材料将发送到预览所示服务。GET 模型列表与缓存命中不计推理，重试另计调用。</p>
+      <p className="analysis-note">候选最多 {preview.maximumCandidates} 对，证据选择最多 {preview.evidenceSelectionCallLimit} 次 Jev POST；每对两阶段合计最多两次推理请求。待命名分组尚未知。Jev {preview.jevConfigured ? "已配置" : "未配置"}，关系材料将发送到预览所示服务。GET 模型列表与缓存命中不计推理，重试另计调用。</p>
     </>}
-    <div className="summary-actions"><button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits })}>启动总结批次</button>
+    <div className="summary-actions"><button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits })}>启动项目分析</button>
       {active && run?.state !== "cancelling" && <button className="browse-button" disabled={busy || !!run.pauseReason} onClick={() => void operate("pause_analysis_run", { runId: run.id })}>暂停</button>}
       {(active || run?.state === "paused") && <button className="browse-button" disabled={busy || run?.state === "cancelling"} onClick={() => void operate("cancel_analysis_run", { runId: run!.id })}>取消</button>}
       {run && ["paused", "cancelled", "partial", "failed"].includes(run.state) && <button className="browse-button" disabled={busy || !valid} onClick={() => void operate("continue_analysis_run", { runId: run.id, callLimit: limits.callLimit })}>继续未完成项</button>}

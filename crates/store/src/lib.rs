@@ -2,9 +2,9 @@ use codexflow_domain::{
     AnalysisRun, AnalysisRunState, AnalysisUnitState, AppError, AttributedThread, CandidatePreview,
     DerivedRelation, EvidencePage, FactPage, HistoryCoverage, HistoryItem, HistoryItemLocation,
     HistoryItemPage, HistorySnapshot, HistoryTurn, HistoryTurnPage, IndexRun, IndexRunState,
-    ListScopeStatus, LocalProject, ObservedRelation, Preferences, ProjectCatalog, ProjectSessions,
-    SessionList, SourceEvidence, SourceFact, SummaryRun, SummaryRunState, ThreadAttribution,
-    ThreadMetadata, ThreadSummary,
+    InferredPairOutcome, ListScopeStatus, LocalProject, ObservedRelation, Preferences,
+    ProjectCatalog, ProjectSessions, SessionList, SourceEvidence, SourceFact, SummaryRun,
+    SummaryRunState, ThreadAttribution, ThreadMetadata, ThreadSummary,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
@@ -119,7 +119,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 10 {
+        if version > 11 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -375,6 +375,19 @@ impl SessionStore {
             transaction
                 .commit()
                 .map_err(|_| AppError::migration("提交分析运行数据库迁移失败，原数据已保留。"))?;
+        }
+        if version < 11 {
+            connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS inferred_pair_outcomes (
+                candidate_id TEXT PRIMARY KEY NOT NULL,
+                project_id TEXT NOT NULL,
+                result_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS inferred_pair_project ON inferred_pair_outcomes(project_id);
+            PRAGMA user_version = 11;",
+                )
+                .map_err(|_| AppError::migration("迁移推断关系数据库失败，原数据已保留。"))?;
         }
         store.recover_interrupted_runs()?;
         store.recover_interrupted_summary_runs()?;
@@ -780,6 +793,26 @@ impl SessionStore {
             offset,
             limit,
         })
+    }
+
+    pub fn history_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<HistoryTurn>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT turn_json FROM history_turns WHERE thread_id=?1 AND id=?2",
+                params![thread_id, turn_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取证据回合失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("证据回合缓存损坏。"))
+        })
+        .transpose()
     }
 
     pub fn project_turns(&self, project_id: &str) -> Result<Vec<HistoryTurn>, AppError> {
@@ -1573,6 +1606,65 @@ impl SessionStore {
         Ok(())
     }
 
+    pub fn save_inferred_pair_outcome(&self, result: &InferredPairOutcome) -> Result<(), AppError> {
+        let json =
+            serde_json::to_string(result).map_err(|_| AppError::store("序列化推断关系失败。"))?;
+        self.connection()?.execute(
+            "INSERT INTO inferred_pair_outcomes(candidate_id,project_id,result_json) VALUES (?1,?2,?3)
+             ON CONFLICT(candidate_id) DO UPDATE SET project_id=excluded.project_id,result_json=excluded.result_json",
+            params![result.candidate_id, result.project_id, json],
+        ).map_err(|_| AppError::store("保存推断关系失败。"))?;
+        Ok(())
+    }
+
+    pub fn save_analysis_with_outcome(
+        &self,
+        run: &AnalysisRun,
+        result: &InferredPairOutcome,
+    ) -> Result<(), AppError> {
+        let run_json =
+            serde_json::to_string(run).map_err(|_| AppError::store("序列化分析运行失败。"))?;
+        let result_json =
+            serde_json::to_string(result).map_err(|_| AppError::store("序列化推断关系失败。"))?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始保存分析结果失败。"))?;
+        transaction.execute(
+            "INSERT INTO inferred_pair_outcomes(candidate_id,project_id,result_json) VALUES (?1,?2,?3)
+             ON CONFLICT(candidate_id) DO UPDATE SET project_id=excluded.project_id,result_json=excluded.result_json",
+            params![result.candidate_id, result.project_id, result_json],
+        ).map_err(|_| AppError::store("保存推断关系失败。"))?;
+        transaction
+            .execute(
+                "INSERT INTO analysis_runs(id,project_id,started_at,run_json) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(id) DO UPDATE SET run_json=excluded.run_json",
+                params![run.id, run.project_id, run.started_at_unix_ms, run_json],
+            )
+            .map_err(|_| AppError::store("保存分析运行失败。"))?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交分析结果失败，旧数据已保留。"))?;
+        Ok(())
+    }
+
+    pub fn inferred_pair_outcomes(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<InferredPairOutcome>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection.prepare("SELECT result_json FROM inferred_pair_outcomes WHERE project_id=?1 ORDER BY candidate_id")
+            .map_err(|_| AppError::store("读取推断关系失败。"))?;
+        let rows = query
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询推断关系失败。"))?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| AppError::store("读取推断关系失败。"))?)
+                .map_err(|_| AppError::store("推断关系缓存内容损坏。"))
+        })
+        .collect()
+    }
+
     pub fn selection(&self) -> Result<(Option<String>, Vec<String>), AppError> {
         let connection = self.connection()?;
         let (selected, recent_json): (Option<String>, String) = connection
@@ -1832,7 +1924,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 11;")
+            .execute_batch("PRAGMA user_version = 12;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -1843,12 +1935,12 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn either_issue_v8_database_upgrades_to_the_complete_v10_schema() {
+    fn either_issue_v8_database_upgrades_to_the_complete_v11_schema() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1890,12 +1982,13 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 10);
+            assert_eq!(version, 11);
             for table in [
                 "automatic_candidate_views",
                 "thread_summaries",
                 "summary_runs",
                 "analysis_runs",
+                "inferred_pair_outcomes",
             ] {
                 let exists: bool = connection
                     .query_row(
@@ -2242,7 +2335,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2303,7 +2396,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -2464,7 +2557,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (10, 1));
+        assert_eq!((version, count), (11, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2497,7 +2590,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2600,7 +2693,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 10);
+            assert_eq!(version, 11);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

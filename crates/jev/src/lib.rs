@@ -10,6 +10,9 @@ use std::{
 };
 use url::{Host, Url};
 
+mod relation;
+pub use relation::JevRelationAnalyzer;
+
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 
 fn error(code: ErrorCode, message: &'static str, retryable: bool) -> AppError {

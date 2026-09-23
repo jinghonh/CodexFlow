@@ -21,7 +21,7 @@ const run = { id: "analysis-1", projectId: "project", state: "running", pauseRea
   batchNumber: 1, batchCalls: 1, totalCalls: 1, totalQuestions: 0, inputTokens: null, outputTokens: null,
   processed: 0, succeeded: 0, failed: 0, pending: 2, interrupted: false, error: null, limits, units: [] };
 
-test("预览明确未接入阶段，手动启动后可暂停和继续", async () => {
+test("预览明确未配置阶段，手动启动后可暂停和继续", async () => {
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "get_analysis_preview") return preview;
     if (command === "get_latest_analysis_run") return null;
@@ -35,7 +35,7 @@ test("预览明确未接入阶段，手动启动后可暂停和继续", async ()
   expect(screen.getAllByText(/尚不可执行/)).toHaveLength(3);
   expect(screen.getByText(/Jev 未配置/)).toBeTruthy();
   expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("start_project_analysis", expect.anything());
-  fireEvent.click(screen.getByRole("button", { name: "启动总结批次" }));
+  fireEvent.click(screen.getByRole("button", { name: "启动项目分析" }));
   await waitFor(() => expect(screen.getByText(/分析执行中/)).toBeTruthy());
   fireEvent.click(screen.getByRole("button", { name: "暂停" }));
   expect(await screen.findByText("用户暂停")).toBeTruthy();
@@ -54,10 +54,10 @@ test("配置错误保留预览并允许修正预算后启动", async () => {
   render(<ProjectAnalysisView projectId="project" refreshVersion="1" />);
   await screen.findByText("2 条待总结");
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "0" } });
-  expect(screen.getByRole("button", { name: "启动总结批次" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(true);
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "5" } });
   await screen.findByText("2 条待总结");
-  fireEvent.click(screen.getByRole("button", { name: "启动总结批次" }));
+  fireEvent.click(screen.getByRole("button", { name: "启动项目分析" }));
   expect(await screen.findByText("来源配置已变化")).toBeTruthy();
   expect(screen.getByText(/候选最多 2 对/)).toBeTruthy();
 });
@@ -99,11 +99,11 @@ test("Jev 设置版本变化后清除旧预览，取得新服务范围前不可�
   const { rerender } = render(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={0} />);
   expect(await screen.findByText("发送到 https://old.example")).toBeTruthy();
   rerender(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={1} />);
-  expect(screen.getByRole("button", { name: "启动总结批次" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(true);
   expect(screen.queryByText("发送到 https://old.example")).toBeNull();
   resolveNew?.({ ...preview, stages: preview.stages.map((stage) => stage.stage === "relation"
     ? { ...stage, model: "jev-new", sendScope: "发送到 https://new.example" } : stage) });
   expect(await screen.findByText("发送到 https://new.example")).toBeTruthy();
   expect(screen.getByText("Jev / jev-new")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "启动总结批次" }).hasAttribute("disabled")).toBe(false);
+  expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(false);
 });

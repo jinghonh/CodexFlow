@@ -209,6 +209,8 @@ pub struct AnalysisUnit {
     pub requested_model: String,
     pub actual_model: Option<String>,
     pub error: Option<AppError>,
+    #[serde(default)]
+    pub relation_classification: Option<JevRelationClassification>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -237,6 +239,8 @@ pub struct AnalysisRun {
     pub failed: u32,
     pub pending: u32,
     pub units: Vec<AnalysisUnit>,
+    #[serde(default)]
+    pub relations_planned: bool,
     pub started_at_unix_ms: i64,
     pub finished_at_unix_ms: Option<i64>,
     pub interrupted: bool,
@@ -746,6 +750,10 @@ pub struct ProjectGraph {
     pub relations: Vec<ObservedRelation>,
     #[serde(default)]
     pub derived_relations: Vec<DerivedRelation>,
+    #[serde(default)]
+    pub inferred_relations: Vec<InferredRelation>,
+    #[serde(default)]
+    pub inference_outcomes: Vec<InferredPairOutcome>,
     pub diagnostics: Vec<GraphDiagnostic>,
 }
 
@@ -758,7 +766,7 @@ pub enum DerivedRelationKind {
     ExplicitReference,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateEvidence {
     pub id: String,
@@ -772,7 +780,7 @@ pub struct CandidateEvidence {
     pub fact_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidencePair {
     pub id: String,
@@ -832,6 +840,127 @@ pub struct DerivedRelation {
     pub source: String,
     pub basis: String,
     pub evidence: Vec<CandidateEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum InferredRelationKind {
+    Continues,
+    Implements,
+    Fixes,
+    Validates,
+    Investigates,
+    AlternativeTo,
+    Supersedes,
+    MotivatedBy,
+    Related,
+}
+
+impl InferredRelationKind {
+    pub fn directed(self) -> bool {
+        !matches!(self, Self::AlternativeTo | Self::Related)
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Continues => "CONTINUES",
+            Self::Implements => "IMPLEMENTS",
+            Self::Fixes => "FIXES",
+            Self::Validates => "VALIDATES",
+            Self::Investigates => "INVESTIGATES",
+            Self::AlternativeTo => "ALTERNATIVE_TO",
+            Self::Supersedes => "SUPERSEDES",
+            Self::MotivatedBy => "MOTIVATED_BY",
+            Self::Related => "RELATED",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RelationJudgment {
+    Supported,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationChoice {
+    pub key: String,
+    pub kind: InferredRelationKind,
+    pub from_thread_id: String,
+    pub to_thread_id: String,
+    pub judgment: RelationJudgment,
+    pub answer: JevChoiceAnswer,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevRelationClassification {
+    pub requested_model: String,
+    pub actual_model: String,
+    pub choices: Vec<RelationChoice>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevEvidenceChoice {
+    pub relation_key: String,
+    pub pair_id: Option<String>,
+    pub answer: JevChoiceAnswer,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevEvidenceSelection {
+    pub actual_model: String,
+    pub choices: Vec<JevEvidenceChoice>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CausalTimeCheck {
+    Verified,
+    Unverifiable,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferredRelation {
+    pub id: String,
+    pub project_id: String,
+    pub candidate_id: String,
+    pub from_thread_id: String,
+    pub to_thread_id: String,
+    pub kind: InferredRelationKind,
+    pub source: String,
+    pub requested_model: String,
+    pub actual_model: String,
+    pub confidence: f64,
+    pub probabilities: std::collections::BTreeMap<String, f64>,
+    pub evidence_confidence: f64,
+    pub evidence_probabilities: std::collections::BTreeMap<String, f64>,
+    pub evidence: EvidencePair,
+    pub time_check: CausalTimeCheck,
+    pub explanation: String,
+    pub input_version: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferredPairOutcome {
+    pub candidate_id: String,
+    pub project_id: String,
+    pub input_version: String,
+    pub status: String,
+    pub unknown_count: u32,
+    #[serde(default)]
+    pub decisions: Vec<RelationChoice>,
+    pub relations: Vec<InferredRelation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -1,10 +1,11 @@
 use super::summary::SummaryBatchSnapshot;
-use super::{now_ms, SourceService};
+use super::{inferred, now_ms, SourceService};
 use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisRunState, AnalysisStage,
     AnalysisStagePlan, AnalysisUnit, AnalysisUnitState, AppError, CapabilityState, ErrorCode,
-    SummaryRun, SummaryRunState,
+    RelationJudgment, SummaryRun, SummaryRunState,
 };
+use codexflow_jev::JevRelationAnalyzer;
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
@@ -16,6 +17,11 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
+
+enum JevUnitResult {
+    Classification(codexflow_domain::JevRelationClassification),
+    Evidence(codexflow_domain::JevEvidenceSelection),
+}
 
 type Update = Arc<dyn Fn(AnalysisRun) + Send + Sync>;
 
@@ -149,11 +155,28 @@ impl SourceService {
             ) && codexflow_codex::analysis_isolation_issue(self.analysis_auth_home.as_deref())
                 .is_none();
         let jev_configured = jev.credential_configured && jev.credential_error.is_none();
-        let candidate_count = candidate.candidate_count;
+        let max_pairs = candidate
+            .thread_count
+            .saturating_mul(candidate.thread_count.saturating_sub(1))
+            / 2;
+        let candidate_upper_bound = max_pairs.min(
+            candidate
+                .thread_count
+                .saturating_mul(u64::from(candidate.neighbor_limit))
+                / 2,
+        );
+        let existing = self.sessions.inferred_pair_outcomes(project_id)?;
+        let mut pending_candidates = 0;
+        for pair in &candidate.candidates {
+            let version = inferred::candidate_version(self, pair)?;
+            if !existing
+                .iter()
+                .any(|result| result.candidate_id == pair.id && result.input_version == version)
+            {
+                pending_candidates += 1;
+            }
+        }
         let attempts = u64::from(limits.retry_limit) + 1;
-        // Until a pinned-version parser is shared with the Jev adapter, reserve
-        // one possible alias probe in the preview's upper bound.
-        let alias_probe = u64::from(candidate_count > 0);
         let stages = vec![
             AnalysisStagePlan {
                 stage: AnalysisStage::Summary,
@@ -178,18 +201,16 @@ impl SourceService {
                 service: "Jev".into(),
                 model: jev.config.model.clone(),
                 send_scope: format!(
-                    "候选关系材料将发送到配置的 Jev 服务 {}；本阶段尚未接入。",
+                    "候选关系材料将发送到配置的 Jev 服务 {}。",
                     jev.config.base_url
                 ),
-                pending_items: candidate_count,
-                maximum_calls: candidate_count
-                    .saturating_mul(attempts)
-                    .saturating_add(alias_probe),
-                available: false,
+                pending_items: pending_candidates,
+                maximum_calls: candidate_upper_bound.saturating_mul(attempts),
+                available: jev_configured,
                 note: if jev_configured {
-                    "关系判断尚未接入；别名版本探测及重试也计调用。"
+                    "每对候选一次分类 POST；重试另计。"
                 } else {
-                    "Jev 未配置或关系判断尚未接入。"
+                    "Jev 未配置，关系阶段暂不可执行。"
                 }
                 .into(),
             },
@@ -197,11 +218,12 @@ impl SourceService {
                 stage: AnalysisStage::EvidenceSelection,
                 service: "Jev".into(),
                 model: jev.config.model.clone(),
-                send_scope: "候选两侧证据将发送到配置的 Jev 服务；本阶段尚未接入。".into(),
-                pending_items: candidate_count,
-                maximum_calls: candidate_count.saturating_mul(2).saturating_mul(attempts),
-                available: false,
-                note: "每对候选最多 2 次证据选择 POST；只展示预算上界。".into(),
+                send_scope: "最多 20 组候选两侧证据发送到配置的 Jev 服务。".into(),
+                pending_items: pending_candidates,
+                maximum_calls: candidate_upper_bound.saturating_mul(attempts),
+                available: jev_configured,
+                note: "每对有支持关系的候选最多一次证据选择 POST；两阶段合计最多两次推理请求。"
+                    .into(),
             },
             AnalysisStagePlan {
                 stage: AnalysisStage::Naming,
@@ -220,8 +242,8 @@ impl SourceService {
             stages,
             cached_summaries: cached,
             unavailable_summaries: unavailable,
-            maximum_candidates: candidate_count,
-            evidence_selection_call_limit: candidate_count.saturating_mul(2),
+            maximum_candidates: candidate_upper_bound,
+            evidence_selection_call_limit: candidate_upper_bound,
             pending_groups: None,
             limits,
             jev_configured,
@@ -261,6 +283,30 @@ impl SourceService {
         Ok(())
     }
 
+    fn save_analysis_outcome(
+        &self,
+        run: &mut AnalysisRun,
+        result: &codexflow_domain::InferredPairOutcome,
+        update: &Update,
+    ) -> Result<(), AppError> {
+        let _guard = self.analysis_update_lock.lock().unwrap();
+        if self
+            .sessions
+            .analysis_run(&run.id)?
+            .is_some_and(|current| current.state == AnalysisRunState::Cancelling)
+        {
+            return Err(core_error(
+                ErrorCode::AnalysisCancelled,
+                "分析运行已取消，结果已丢弃。",
+                false,
+            ));
+        }
+        recalculate(run);
+        self.sessions.save_analysis_with_outcome(run, result)?;
+        update(run.clone());
+        Ok(())
+    }
+
     pub async fn start_project_analysis(
         self: &Arc<Self>,
         project_id: String,
@@ -268,7 +314,7 @@ impl SourceService {
         on_update: impl Fn(AnalysisRun) + Send + Sync + 'static,
     ) -> Result<AnalysisRun, AppError> {
         let (preview, pending) = self.analysis_material(&project_id, limits.clone()).await?;
-        if !preview.stages[0].available {
+        if !preview.stages[0].available && !pending.is_empty() {
             return Err(core_error(
                 ErrorCode::AnalysisUnavailable,
                 "Codex 总结尚不可用；请检查连接能力与隔离配置。",
@@ -329,6 +375,21 @@ impl SourceService {
             dispatch: Arc::new(tokio::sync::Mutex::new(())),
             update: Arc::new(on_update),
         };
+        let units: Vec<AnalysisUnit> = pending
+            .into_iter()
+            .map(|(id, input_version)| AnalysisUnit {
+                id,
+                stage: AnalysisStage::Summary,
+                input_version,
+                state: AnalysisUnitState::Pending,
+                attempts: 0,
+                active_summary_run_id: None,
+                requested_model: preview.stages[0].model.clone(),
+                actual_model: None,
+                error: None,
+                relation_classification: None,
+            })
+            .collect();
         let mut run = AnalysisRun {
             id,
             project_id: project_id.clone(),
@@ -351,21 +412,9 @@ impl SourceService {
             processed: 0,
             succeeded: 0,
             failed: 0,
-            pending: pending.len() as u32,
-            units: pending
-                .into_iter()
-                .map(|(id, input_version)| AnalysisUnit {
-                    id,
-                    stage: AnalysisStage::Summary,
-                    input_version,
-                    state: AnalysisUnitState::Pending,
-                    attempts: 0,
-                    active_summary_run_id: None,
-                    requested_model: preview.stages[0].model.clone(),
-                    actual_model: None,
-                    error: None,
-                })
-                .collect(),
+            pending: units.len() as u32,
+            units,
+            relations_planned: false,
             started_at_unix_ms: self.analysis_now(),
             finished_at_unix_ms: None,
             interrupted: false,
@@ -508,7 +557,11 @@ impl SourceService {
                 false,
             ));
         }
-        if !preview.stages[0].available {
+        if !preview.stages[0].available
+            && run.units.iter().any(|unit| {
+                unit.stage == AnalysisStage::Summary && unit.state != AnalysisUnitState::Succeeded
+            })
+        {
             return Err(core_error(
                 ErrorCode::AnalysisUnavailable,
                 "Codex 总结当前不可用。",
@@ -660,6 +713,40 @@ impl SourceService {
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
             }
+            if !run.relations_planned
+                && !run.units.iter().any(|unit| {
+                    unit.stage == AnalysisStage::Summary && unit.state == AnalysisUnitState::Pending
+                })
+            {
+                if self.jev_status().await?.credential_configured
+                    && self.preferences.lock().await.jev_revision == run.jev_config_revision
+                {
+                    let preview = self.candidate_preview(&run.project_id)?;
+                    let existing = self.sessions.inferred_pair_outcomes(&run.project_id)?;
+                    for pair in &preview.candidates {
+                        let version = inferred::candidate_version(self, pair)?;
+                        if existing.iter().any(|result| {
+                            result.candidate_id == pair.id && result.input_version == version
+                        }) {
+                            continue;
+                        }
+                        run.units.push(AnalysisUnit {
+                            id: pair.id.clone(),
+                            stage: AnalysisStage::Relation,
+                            input_version: version,
+                            state: AnalysisUnitState::Pending,
+                            attempts: 0,
+                            active_summary_run_id: None,
+                            requested_model: run.jev_model.clone(),
+                            actual_model: None,
+                            error: None,
+                            relation_classification: None,
+                        });
+                    }
+                }
+                run.relations_planned = true;
+                self.save_analysis(&mut run, &control.update)?;
+            }
             let Some(index) = run
                 .units
                 .iter()
@@ -683,11 +770,19 @@ impl SourceService {
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
             }
-            if run.units[index].stage != AnalysisStage::Summary {
-                run.state = AnalysisRunState::Paused;
-                run.pause_reason = Some("此阶段尚未接入执行器。".into());
-                self.save_analysis(&mut run, &control.update)?;
-                return Ok(());
+            if matches!(
+                run.units[index].stage,
+                AnalysisStage::Relation | AnalysisStage::EvidenceSelection
+            ) {
+                self.run_jev_unit(control, index, run).await?;
+                if self
+                    .sessions
+                    .analysis_run(&control.id)?
+                    .is_some_and(|run| run.state == AnalysisRunState::Paused)
+                {
+                    return Ok(());
+                }
+                continue;
             }
             let source = self.status().await;
             let jev_revision = self.preferences.lock().await.jev_revision;
@@ -914,6 +1009,294 @@ impl SourceService {
         }
     }
 
+    async fn run_jev_unit(
+        &self,
+        control: &AnalysisControl,
+        index: usize,
+        mut run: AnalysisRun,
+    ) -> Result<(), AppError> {
+        let preview = self.candidate_preview(&run.project_id)?;
+        let Some(candidate) = preview
+            .candidates
+            .iter()
+            .find(|pair| pair.id == run.units[index].id)
+        else {
+            run.units[index].state = AnalysisUnitState::Failed;
+            run.units[index].error = Some(core_error(
+                ErrorCode::SourceReadFailed,
+                "候选关系已变化，请启动新运行。",
+                true,
+            ));
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        };
+        if inferred::candidate_version(self, candidate)? != run.units[index].input_version {
+            run.units[index].state = AnalysisUnitState::Failed;
+            run.units[index].error = Some(core_error(
+                ErrorCode::SourceReadFailed,
+                "候选材料版本已变化，请启动新运行。",
+                true,
+            ));
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        }
+        let phase = run.units[index].stage;
+        let supported = run.units[index]
+            .relation_classification
+            .as_ref()
+            .map(|classification| {
+                classification
+                    .choices
+                    .iter()
+                    .filter(|choice| choice.judgment == RelationJudgment::Supported)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let questions = if phase == AnalysisStage::Relation {
+            16
+        } else {
+            supported.len() as u32
+        };
+        let credential_cancel = self.jev_cancel.lock().await.clone();
+        let permit = tokio::select! {
+            _ = control.cancel.cancelled() => return Ok(()),
+            _ = control.queue_pause.cancelled() => return Ok(()),
+            _ = credential_cancel.cancelled() => return Ok(()),
+            value = self.model_slots.acquire() => value.map_err(|_| core_error(ErrorCode::AnalysisUnavailable, "模型并发队列已关闭。", true))?,
+        };
+        let gate = tokio::select! {
+            _ = control.cancel.cancelled() => return Ok(()),
+            _ = credential_cancel.cancelled() => return Ok(()),
+            value = self.jev_gate.read() => value,
+        };
+        let (credential, model) = match self.jev_request_settings().await {
+            Ok(settings) => settings,
+            Err(error) => {
+                run.state = AnalysisRunState::Paused;
+                run.pause_reason = Some(error.message.clone());
+                run.units[index].error = Some(error);
+                self.save_analysis(&mut run, &control.update)?;
+                return Ok(());
+            }
+        };
+        let revision = self.preferences.lock().await.jev_revision;
+        if revision != run.jev_config_revision
+            || credential.base_url != run.jev_base_url
+            || model != run.jev_model
+        {
+            run.state = AnalysisRunState::Paused;
+            run.pause_reason = Some("Jev 配置已变化；旧运行不会混入新配置。".into());
+            run.units[index].error = Some(core_error(
+                ErrorCode::AnalysisConfigChanged,
+                "请取消旧运行并启动新批次。",
+                false,
+            ));
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        }
+        let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let analyzer = JevRelationAnalyzer::with_timeout_and_material_limit(
+            Duration::from_secs(run.limits.timeout_seconds),
+            run.limits.input_character_limit,
+        )?;
+        if let Err(error) = analyzer.validate_material(candidate) {
+            run.units[index].state = AnalysisUnitState::Failed;
+            run.units[index].error = Some(error);
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        }
+        reserve_attempt(&mut run, index, questions)?;
+        self.save_analysis(&mut run, &control.update)?;
+        drop(dispatch);
+        let response = if phase == AnalysisStage::Relation {
+            tokio::select! {
+                _ = control.cancel.cancelled() => Err(core_error(ErrorCode::JevCancelled, "Jev 本地请求已取消。", false)),
+                _ = credential_cancel.cancelled() => Err(core_error(ErrorCode::JevCancelled, "Jev 配置变化，请启动新运行。", false)),
+                value = analyzer.classify(&credential, &model, candidate) => value.map(JevUnitResult::Classification),
+            }
+        } else {
+            tokio::select! {
+                _ = control.cancel.cancelled() => Err(core_error(ErrorCode::JevCancelled, "Jev 本地请求已取消。", false)),
+                _ = credential_cancel.cancelled() => Err(core_error(ErrorCode::JevCancelled, "Jev 配置变化，请启动新运行。", false)),
+                value = analyzer.select_evidence(&credential, &model, candidate, &supported) => value.map(JevUnitResult::Evidence),
+            }
+        };
+        drop(permit);
+        drop(gate);
+        let _dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        let mut current = self
+            .sessions
+            .analysis_run(&control.id)?
+            .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
+        if control.cancel.is_cancelled() || current.state == AnalysisRunState::Cancelling {
+            current.units[index].state = AnalysisUnitState::Pending;
+            self.save_analysis(&mut current, &control.update)?;
+            return Ok(());
+        }
+        let latest = self
+            .candidate_preview(&current.project_id)?
+            .candidates
+            .into_iter()
+            .find(|pair| pair.id == candidate.id);
+        let latest_version = latest
+            .as_ref()
+            .map(|pair| inferred::candidate_version(self, pair))
+            .transpose()?;
+        if self.preferences.lock().await.jev_revision != current.jev_config_revision
+            || latest_version.as_deref() != Some(current.units[index].input_version.as_str())
+        {
+            current.units[index].state = AnalysisUnitState::Pending;
+            current.state = AnalysisRunState::Paused;
+            current.pause_reason = Some("Jev 配置或候选来源已变化；迟到结果已丢弃。".into());
+            self.save_analysis(&mut current, &control.update)?;
+            return Ok(());
+        }
+        let mut outcome = None;
+        match response {
+            Ok(JevUnitResult::Classification(classification)) => {
+                current.input_tokens = Some(
+                    current
+                        .input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(classification.input_tokens),
+                );
+                current.output_tokens = Some(
+                    current
+                        .output_tokens
+                        .unwrap_or(0)
+                        .saturating_add(classification.output_tokens),
+                );
+                current.units[index].actual_model = Some(classification.actual_model.clone());
+                current.units[index].error = None;
+                if classification
+                    .choices
+                    .iter()
+                    .any(|choice| choice.judgment == RelationJudgment::Supported)
+                {
+                    current.units[index].relation_classification = Some(classification);
+                    current.units[index].stage = AnalysisStage::EvidenceSelection;
+                    current.units[index].state = AnalysisUnitState::Pending;
+                    current.units[index].attempts = 0;
+                } else {
+                    let result = inferred::outcome(
+                        self,
+                        &current.project_id,
+                        candidate,
+                        &current.units[index].input_version,
+                        &classification,
+                        None,
+                    )?;
+                    outcome = Some(result);
+                    current.units[index].state = AnalysisUnitState::Succeeded;
+                }
+            }
+            Ok(JevUnitResult::Evidence(selection)) => {
+                current.input_tokens = Some(
+                    current
+                        .input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(selection.input_tokens),
+                );
+                current.output_tokens = Some(
+                    current
+                        .output_tokens
+                        .unwrap_or(0)
+                        .saturating_add(selection.output_tokens),
+                );
+                if current.units[index]
+                    .relation_classification
+                    .as_ref()
+                    .is_some_and(|classification| {
+                        classification.actual_model != selection.actual_model
+                    })
+                {
+                    current.units[index].state = AnalysisUnitState::Pending;
+                    current.units[index].error = Some(core_error(
+                        ErrorCode::AnalysisConfigChanged,
+                        "两次 Jev 请求的实际模型不同；请启动新运行。",
+                        false,
+                    ));
+                    current.state = AnalysisRunState::Paused;
+                    current.pause_reason = Some("Jev 模型别名在运行中发生变化。".into());
+                    self.save_analysis(&mut current, &control.update)?;
+                    return Ok(());
+                }
+                let classification = current.units[index]
+                    .relation_classification
+                    .as_ref()
+                    .ok_or_else(|| {
+                        core_error(ErrorCode::AnalysisInvalidResult, "分类结果丢失。", false)
+                    })?;
+                let result = inferred::outcome(
+                    self,
+                    &current.project_id,
+                    candidate,
+                    &current.units[index].input_version,
+                    classification,
+                    Some(&selection),
+                )?;
+                outcome = Some(result);
+                current.units[index].state = AnalysisUnitState::Succeeded;
+                current.units[index].actual_model = Some(selection.actual_model);
+                current.units[index].error = None;
+            }
+            Err(error) => {
+                let temporary = matches!(
+                    error.code,
+                    ErrorCode::JevRateLimited
+                        | ErrorCode::JevOverloaded
+                        | ErrorCode::JevTimeout
+                        | ErrorCode::JevConnectionFailed
+                ) && error.retryable;
+                let pause = matches!(
+                    error.code,
+                    ErrorCode::JevQuotaExceeded
+                        | ErrorCode::JevAuthenticationFailed
+                        | ErrorCode::JevNotConfigured
+                        | ErrorCode::JevModelUnsupported
+                        | ErrorCode::JevCancelled
+                        | ErrorCode::AnalysisConfigChanged
+                );
+                current.units[index].error = Some(error.clone());
+                if pause {
+                    current.state = AnalysisRunState::Paused;
+                    current.pause_reason = Some(error.message);
+                    current.units[index].state = AnalysisUnitState::Pending;
+                } else if temporary
+                    && current.units[index].attempts <= u32::from(current.limits.retry_limit)
+                {
+                    current.units[index].state = AnalysisUnitState::Pending;
+                } else {
+                    current.units[index].state = AnalysisUnitState::Failed;
+                }
+            }
+        }
+        if let Some(result) = outcome {
+            self.save_analysis_outcome(&mut current, &result, &control.update)?;
+        } else {
+            self.save_analysis(&mut current, &control.update)?;
+        }
+        if current.units[index].state == AnalysisUnitState::Pending
+            && current.state != AnalysisRunState::Paused
+            && current.units[index].error.is_some()
+            && !control.pause.load(Ordering::SeqCst)
+        {
+            let delay = (250 * current.units[index].attempts.min(2) as u64).max(
+                current.units[index]
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.retry_after_ms)
+                    .unwrap_or(0),
+            );
+            tokio::select! { _ = control.cancel.cancelled() => {}, _ = tokio::time::sleep(Duration::from_millis(delay)) => {} }
+        }
+        Ok(())
+    }
+
     async fn wait_summary(
         &self,
         id: &str,
@@ -954,7 +1337,37 @@ mod tests {
         HistoryCoverage, HistoryItem, HistoryReadPath, HistorySnapshot, HistoryTurn, LocalProject,
         ThreadAttribution, ThreadMetadata,
     };
-    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+    use codexflow_jev::{Credential, CredentialStore};
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        os::unix::fs::PermissionsExt,
+        path::PathBuf,
+        sync::Mutex,
+    };
+
+    #[derive(Default)]
+    struct TestCredentials(Mutex<Option<Credential>>);
+    impl CredentialStore for TestCredentials {
+        fn load(&self) -> Result<Option<Credential>, AppError> {
+            Ok(self.0.lock().unwrap().as_ref().map(|value| Credential {
+                base_url: value.base_url.clone(),
+                key: value.key.clone(),
+            }))
+        }
+        fn save(&self, value: &Credential) -> Result<(), AppError> {
+            *self.0.lock().unwrap() = Some(Credential {
+                base_url: value.base_url.clone(),
+                key: value.key.clone(),
+            });
+            Ok(())
+        }
+        fn delete(&self) -> Result<(), AppError> {
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
 
     fn root(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -1004,7 +1417,11 @@ mod tests {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let home = root.join("safe-auth-home");
         fs::create_dir_all(&home).unwrap();
-        let mut service = SourceService::new(root.join("data")).unwrap();
+        let mut service = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
         service.analysis_auth_home = Some(home);
         service.analysis_clock = Arc::new(|| 12345);
         let service = Arc::new(service);
@@ -1658,5 +2075,575 @@ mod tests {
             ..AnalysisLimits::default()
         })
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn native_jev_two_post_path_persists_a_locatable_inferred_edge() {
+        let root = root("jev-two-post");
+        let service = service(&root, "ok", 2).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for phase in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 8192];
+                let request: serde_json::Value = loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    bytes.extend_from_slice(&buffer[..count]);
+                    let Some(split) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let header = String::from_utf8_lossy(&bytes[..split]);
+                    assert!(header.starts_with("POST /v1/systemone HTTP/1.1"));
+                    assert!(header
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer synthetic-key"));
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.parse().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= split + 4 + length {
+                        break serde_json::from_slice(&bytes[split + 4..split + 4 + length])
+                            .unwrap();
+                    }
+                };
+                let answers: serde_json::Map<String, serde_json::Value> = request["questions"].as_object().unwrap().iter().map(|(key, question)| {
+                    let options: Vec<&str> = question["criteria"].as_object().unwrap().keys().map(String::as_str).collect();
+                    let chosen = if phase == 0 { if key == "fixes_ab" { "SUPPORTS" } else { "REJECTS" } } else { "p0" };
+                    let probabilities: serde_json::Map<String, serde_json::Value> = options.iter().map(|option| {
+                        ((*option).into(), serde_json::json!(if *option == chosen { 0.8 } else { 0.2 / (options.len()-1) as f64 }))
+                    }).collect();
+                    (key.clone(), serde_json::json!({"type":"choice","choice":chosen,"confidence":0.76,"probabilities":probabilities}))
+                }).collect();
+                let body = serde_json::json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":25,"output_tokens":7}}).to_string();
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                seen.push(request);
+            }
+            seen
+        });
+        service
+            .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let preview = service
+            .analysis_preview("project-test", AnalysisLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(preview.maximum_candidates, 1);
+        assert!(preview.stages[1].available);
+        let started = service
+            .start_project_analysis(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 3,
+                    ..AnalysisLimits::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(paused.total_calls, 3);
+        assert!(paused
+            .units
+            .iter()
+            .any(|unit| unit.stage == AnalysisStage::EvidenceSelection
+                && unit.relation_classification.is_some()));
+        service
+            .continue_analysis_run(&started.id, 1, |_| {})
+            .await
+            .unwrap();
+        let completed = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(completed.total_calls, 4); // two Codex summaries plus two Jev POSTs
+        assert_eq!(completed.total_questions, 17);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 16);
+        assert_eq!(requests[1]["questions"].as_object().unwrap().len(), 1);
+        let graph = service.project_graph("project-test").unwrap();
+        assert_eq!(graph.inferred_relations.len(), 1);
+        let relation = &graph.inferred_relations[0];
+        assert_eq!(
+            (&relation.from_thread_id[..], &relation.to_thread_id[..]),
+            ("thread-0", "thread-1")
+        );
+        assert_eq!(relation.kind.as_str(), "FIXES");
+        assert_eq!(relation.actual_model, "jev-1.13.0");
+        assert_eq!(relation.confidence, 0.76);
+        assert_eq!(relation.evidence.left.thread_id, "thread-0");
+        assert_eq!(relation.evidence.right.thread_id, "thread-1");
+        assert_eq!(graph.inference_outcomes[0].status, "valid");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn inferred_outcomes_exclude_none_unknown_bad_evidence_and_conflicting_time() {
+        use codexflow_domain::{
+            InferredRelationKind, JevChoiceAnswer, JevEvidenceChoice, JevEvidenceSelection,
+            JevRelationClassification, RelationChoice,
+        };
+        let root = root("inferred-validation");
+        let service = service(&root, "ok", 2).await;
+        let candidate = service
+            .candidate_preview("project-test")
+            .unwrap()
+            .candidates
+            .remove(0);
+        let version = inferred::candidate_version(&service, &candidate).unwrap();
+        let answer = |choice: &str, confidence| JevChoiceAnswer {
+            choice: choice.into(),
+            confidence,
+            probabilities: std::collections::BTreeMap::from([
+                (
+                    "SUPPORTS".into(),
+                    if choice == "SUPPORTS" { 0.8 } else { 0.1 },
+                ),
+                (
+                    "REJECTS".into(),
+                    if choice == "REJECTS" { 0.8 } else { 0.1 },
+                ),
+                (
+                    "UNKNOWN".into(),
+                    if choice == "UNKNOWN" { 0.8 } else { 0.1 },
+                ),
+            ]),
+        };
+        let mut classification = JevRelationClassification {
+            requested_model: "jev-latest".into(),
+            actual_model: "jev-1.13.0".into(),
+            choices: vec![RelationChoice {
+                key: "fixes_ab".into(),
+                kind: InferredRelationKind::Fixes,
+                from_thread_id: candidate.left_thread_id.clone(),
+                to_thread_id: candidate.right_thread_id.clone(),
+                judgment: RelationJudgment::Rejected,
+                answer: answer("REJECTS", 0.8),
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        };
+        let none = inferred::outcome(
+            &service,
+            "project-test",
+            &candidate,
+            &version,
+            &classification,
+            None,
+        )
+        .unwrap();
+        assert_eq!(none.status, "none");
+        assert!(none.relations.is_empty());
+        service.sessions.save_inferred_pair_outcome(&none).unwrap();
+        assert!(service
+            .project_graph("project-test")
+            .unwrap()
+            .inferred_relations
+            .is_empty());
+        classification.choices[0].judgment = RelationJudgment::Unknown;
+        classification.choices[0].answer = answer("UNKNOWN", 0.8);
+        assert_eq!(
+            inferred::outcome(
+                &service,
+                "project-test",
+                &candidate,
+                &version,
+                &classification,
+                None
+            )
+            .unwrap()
+            .status,
+            "undetermined"
+        );
+        classification.choices[0].judgment = RelationJudgment::Supported;
+        classification.choices[0].answer = answer("SUPPORTS", 0.55);
+        let selection = |pair_id: Option<String>| JevEvidenceSelection {
+            actual_model: "jev-1.13.0".into(),
+            choices: vec![JevEvidenceChoice {
+                relation_key: "fixes_ab".into(),
+                pair_id,
+                answer: JevChoiceAnswer {
+                    choice: "p0".into(),
+                    confidence: 0.91,
+                    probabilities: std::collections::BTreeMap::from([
+                        ("p0".into(), 0.9),
+                        ("INSUFFICIENT".into(), 0.1),
+                    ]),
+                },
+            }],
+            input_tokens: 10,
+            output_tokens: 2,
+        };
+        assert_eq!(
+            inferred::outcome(
+                &service,
+                "project-test",
+                &candidate,
+                &version,
+                &classification,
+                Some(&selection(None))
+            )
+            .unwrap()
+            .status,
+            "insufficientEvidence"
+        );
+        assert_eq!(
+            inferred::outcome(
+                &service,
+                "project-test",
+                &candidate,
+                &version,
+                &classification,
+                Some(&selection(Some("outside-candidate".into())))
+            )
+            .unwrap()
+            .status,
+            "insufficientEvidence"
+        );
+        let mut wrong_excerpt = candidate.clone();
+        wrong_excerpt.evidence.pairs[0].left.excerpt = "不存在的摘录".into();
+        assert_eq!(
+            inferred::outcome(
+                &service,
+                "project-test",
+                &wrong_excerpt,
+                &version,
+                &classification,
+                Some(&selection(Some(wrong_excerpt.evidence.pairs[0].id.clone())))
+            )
+            .unwrap()
+            .status,
+            "insufficientEvidence"
+        );
+        let mut wrong_endpoint = classification.clone();
+        wrong_endpoint.choices[0].from_thread_id = "outside-project".into();
+        assert_eq!(
+            inferred::outcome(
+                &service,
+                "project-test",
+                &candidate,
+                &version,
+                &wrong_endpoint,
+                Some(&selection(Some(candidate.evidence.pairs[0].id.clone())))
+            )
+            .unwrap()
+            .status,
+            "insufficientEvidence"
+        );
+        let chosen = selection(Some(candidate.evidence.pairs[0].id.clone()));
+        let valid = inferred::outcome(
+            &service,
+            "project-test",
+            &candidate,
+            &version,
+            &classification,
+            Some(&chosen),
+        )
+        .unwrap();
+        assert_eq!(valid.status, "valid");
+        assert_eq!(valid.relations[0].confidence, 0.55);
+        let mut multiple = classification.clone();
+        let mut multiple_selection = chosen.clone();
+        for (key, kind) in [
+            ("validates_ba", InferredRelationKind::Validates),
+            ("alternative_to_ab", InferredRelationKind::AlternativeTo),
+        ] {
+            multiple.choices.push(RelationChoice {
+                key: key.into(),
+                kind,
+                from_thread_id: candidate.right_thread_id.clone(),
+                to_thread_id: candidate.left_thread_id.clone(),
+                judgment: RelationJudgment::Supported,
+                answer: answer("SUPPORTS", 0.8),
+            });
+            multiple_selection.choices.push(JevEvidenceChoice {
+                relation_key: key.into(),
+                pair_id: Some(candidate.evidence.pairs[0].id.clone()),
+                answer: chosen.choices[0].answer.clone(),
+            });
+        }
+        let multi = inferred::outcome(
+            &service,
+            "project-test",
+            &candidate,
+            &version,
+            &multiple,
+            Some(&multiple_selection),
+        )
+        .unwrap();
+        assert_eq!(multi.relations.len(), 3);
+        assert!(multi
+            .relations
+            .iter()
+            .any(|item| item.kind == InferredRelationKind::Validates
+                && item.from_thread_id == candidate.right_thread_id));
+        assert!(multi
+            .relations
+            .iter()
+            .any(|item| item.kind == InferredRelationKind::AlternativeTo
+                && item.from_thread_id == candidate.left_thread_id));
+        assert_eq!(valid.relations[0].evidence_confidence, 0.91);
+        service.sessions.save_inferred_pair_outcome(&valid).unwrap();
+        assert_eq!(
+            service
+                .project_graph("project-test")
+                .unwrap()
+                .inferred_relations
+                .len(),
+            1
+        );
+        let reopened = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .project_graph("project-test")
+                .unwrap()
+                .inferred_relations
+                .len(),
+            1
+        );
+        drop(reopened);
+        let connection = rusqlite::Connection::open(root.join("data/sessions.sqlite3")).unwrap();
+        let mut later = service
+            .sessions
+            .history_turn(&candidate.left_thread_id, "turn-1")
+            .unwrap()
+            .unwrap();
+        later.started_at_unix_ms = Some(300);
+        later.completed_at_unix_ms = Some(301);
+        connection
+            .execute(
+                "UPDATE history_turns SET turn_json=?1 WHERE thread_id=?2 AND id='turn-1'",
+                rusqlite::params![
+                    serde_json::to_string(&later).unwrap(),
+                    candidate.left_thread_id
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            inferred::outcome(
+                &service,
+                "project-test",
+                &candidate,
+                &version,
+                &classification,
+                Some(&chosen)
+            )
+            .unwrap()
+            .status,
+            "insufficientEvidence"
+        );
+        let mut changed = service
+            .sessions
+            .thread(&candidate.left_thread_id)
+            .unwrap()
+            .unwrap();
+        changed.updated_at += 1;
+        service.sessions.save_collection(&[changed], &[]).unwrap();
+        assert!(service
+            .project_graph("project-test")
+            .unwrap()
+            .inferred_relations
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn in_flight_jev_result_is_rejected_after_cancel_or_config_change() {
+        for config_change in [false, true] {
+            let root = root(if config_change {
+                "jev-config-change"
+            } else {
+                "jev-cancel"
+            });
+            let service = service(&root, "ok", 2).await;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 8192];
+                loop {
+                    let count = stream.read(&mut buffer).unwrap();
+                    bytes.extend_from_slice(&buffer[..count]);
+                    let Some(split) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let header = String::from_utf8_lossy(&bytes[..split]);
+                    let length: usize = header
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.parse().ok())
+                        })
+                        .unwrap();
+                    if bytes.len() >= split + 4 + length {
+                        break;
+                    }
+                }
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}");
+            });
+            service
+                .save_jev(
+                    base_url.clone(),
+                    "jev-latest".into(),
+                    Some("synthetic-key".into()),
+                )
+                .await
+                .unwrap();
+            let run = service
+                .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || started_rx.recv().unwrap()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if config_change {
+                service
+                    .save_jev(base_url, "jev-new".into(), None)
+                    .await
+                    .unwrap();
+                wait_state(&service, &run.id, AnalysisRunState::Paused).await;
+            } else {
+                service.cancel_analysis_run(&run.id).await.unwrap();
+                wait_state(&service, &run.id, AnalysisRunState::Cancelled).await;
+            }
+            release_tx.send(()).unwrap();
+            server.join().unwrap();
+            assert!(service
+                .project_graph("project-test")
+                .unwrap()
+                .inferred_relations
+                .is_empty());
+            assert!(service
+                .sessions
+                .inferred_pair_outcomes("project-test")
+                .unwrap()
+                .is_empty());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn jev_authentication_pauses_and_rate_limit_retry_is_budgeted() {
+        for authentication in [true, false] {
+            let root = root(if authentication { "jev-401" } else { "jev-429" });
+            let service = service(&root, "ok", 2).await;
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let count = if authentication { 1 } else { 2 };
+                for attempt in 0..count {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0u8; 8192];
+                    let request: serde_json::Value = loop {
+                        let read = stream.read(&mut buffer).unwrap();
+                        bytes.extend_from_slice(&buffer[..read]);
+                        let Some(split) = bytes.windows(4).position(|part| part == b"\r\n\r\n")
+                        else {
+                            continue;
+                        };
+                        let header = String::from_utf8_lossy(&bytes[..split]);
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse().ok())
+                            })
+                            .unwrap();
+                        if bytes.len() >= split + 4 + length {
+                            break serde_json::from_slice(&bytes[split + 4..split + 4 + length])
+                                .unwrap();
+                        }
+                    };
+                    let (status, body) = if authentication {
+                        (401, "{}".to_string())
+                    } else if attempt == 0 {
+                        (429, "{}".to_string())
+                    } else {
+                        let answers: serde_json::Map<String, serde_json::Value> = request["questions"].as_object().unwrap().keys().map(|key| {
+                                (key.clone(), serde_json::json!({"type":"choice","choice":"REJECTS","confidence":0.8,
+                                    "probabilities":{"SUPPORTS":0.1,"REJECTS":0.8,"UNKNOWN":0.1}}))
+                            }).collect();
+                        (
+                            200,
+                            serde_json::json!({"model":"jev-1.13.0","answers":answers,
+                                "usage":{"input_tokens":20,"output_tokens":5}})
+                            .to_string(),
+                        )
+                    };
+                    write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                }
+            });
+            service
+                .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+                .await
+                .unwrap();
+            let run = service
+                .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+                .await
+                .unwrap();
+            if authentication {
+                let paused = wait_state(&service, &run.id, AnalysisRunState::Paused).await;
+                assert_eq!(paused.total_calls, 3);
+                assert_eq!(
+                    paused
+                        .units
+                        .iter()
+                        .find(|unit| unit.stage == AnalysisStage::Relation)
+                        .unwrap()
+                        .attempts,
+                    1
+                );
+                assert!(paused.pause_reason.unwrap().contains("认证"));
+                assert!(service
+                    .sessions
+                    .inferred_pair_outcomes("project-test")
+                    .unwrap()
+                    .is_empty());
+            } else {
+                let complete = wait_state(&service, &run.id, AnalysisRunState::Complete).await;
+                assert_eq!(complete.total_calls, 4);
+                assert_eq!(complete.total_questions, 32);
+                assert_eq!(
+                    service
+                        .project_graph("project-test")
+                        .unwrap()
+                        .inference_outcomes[0]
+                        .status,
+                    "none"
+                );
+            }
+            server.join().unwrap();
+            let _ = fs::remove_dir_all(root);
+        }
     }
 }
