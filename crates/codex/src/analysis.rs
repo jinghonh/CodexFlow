@@ -53,17 +53,51 @@ fn protocol(error: ProbeError) -> AppError {
     }
 }
 
-fn isolated_home() -> Result<PathBuf, AppError> {
+fn original_codex_home(override_home: Option<&Path>) -> Option<PathBuf> {
+    override_home.map(Path::to_path_buf).or_else(|| {
+        env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
+    })
+}
+
+pub fn analysis_isolation_issue(override_home: Option<&Path>) -> Option<String> {
+    // Read-only permits file inspection. Reject file-backed login before a model
+    // turn; observing a tool event afterwards would be too late to protect it.
+    if original_codex_home(override_home).is_some_and(|home| home.join("auth.json").exists()) {
+        return Some("当前 Codex 认证保存在 auth.json 文件中，无法保证模型工具不能读取。请改用系统钥匙串保存认证，并移除该文件后再启用总结。".into());
+    }
+    if ["OPENAI_API_KEY", "CODEX_API_KEY"]
+        .iter()
+        .any(|key| env::var_os(key).is_some())
+    {
+        return Some(
+            "当前进程含有模型可读取的认证环境变量，已禁用临时总结。请使用系统钥匙串认证。".into(),
+        );
+    }
+    None
+}
+
+struct AnalysisWorkspace {
+    root: PathBuf,
+    home: PathBuf,
+    cwd: PathBuf,
+}
+
+fn isolated_workspace(override_home: Option<&Path>) -> Result<AnalysisWorkspace, AppError> {
+    if let Some(message) = analysis_isolation_issue(override_home) {
+        return Err(failure(ErrorCode::AnalysisUnavailable, &message, false));
+    }
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = env::temp_dir().join(format!(
+    let root = env::temp_dir().join(format!(
         "codexflow-analysis-{}-{nonce}-{}",
         std::process::id(),
         NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
     ));
-    fs::create_dir(&dir).map_err(|_| {
+    fs::create_dir(&root).map_err(|_| {
         failure(
             ErrorCode::AnalysisUnavailable,
             "无法创建隔离分析目录。",
@@ -73,7 +107,7 @@ fn isolated_home() -> Result<PathBuf, AppError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).map_err(|_| {
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).map_err(|_| {
             failure(
                 ErrorCode::AnalysisUnavailable,
                 "无法保护隔离分析目录。",
@@ -81,27 +115,22 @@ fn isolated_home() -> Result<PathBuf, AppError> {
             )
         })?;
     }
-    // A separate home removes configured MCP servers and skills. Authentication is
-    // read through the existing file, never copied into CodexFlow storage.
-    let original = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")));
-    #[cfg(unix)]
-    if let Some(auth) = original
-        .map(|home| home.join("auth.json"))
-        .filter(|path| path.is_file())
-    {
-        std::os::unix::fs::symlink(auth, dir.join("auth.json")).map_err(|_| {
+    // The model's cwd never contains authentication material. Keyring login is
+    // required, and the effective config is checked before thread/start.
+    let home = root.join("codex-home");
+    let cwd = root.join("workspace");
+    fs::create_dir(&home)
+        .and_then(|_| fs::create_dir(&cwd))
+        .map_err(|_| {
             failure(
                 ErrorCode::AnalysisUnavailable,
-                "无法引用现有 Codex 认证。",
+                "无法创建独立分析工作区。",
                 true,
             )
         })?;
-    }
     fs::write(
-        dir.join("config.toml"),
-        "web_search = \"disabled\"\n[features]\nmulti_agent = false\n",
+        home.join("config.toml"),
+        "cli_auth_credentials_store = \"keyring\"\nweb_search = \"disabled\"\n[features]\nshell_tool = false\nunified_exec = false\napps = false\nhooks = false\nmulti_agent = false\nremote_plugin = false\nplugins = false\nview_image = false\nbrowser_use = false\nbrowser_use_external = false\nbrowser_use_full_cdp_access = false\ncomputer_use = false\nin_app_browser = false\nin_app_local_automation = false\nimage_generation = false\nshell_snapshot = false\nskill_search = false\nskill_mcp_dependency_install = false\ntool_call_mcp_elicitation = false\ntool_suggest = false\nworkspace_dependencies = false\ngoals = false\n",
     )
     .map_err(|_| {
         failure(
@@ -110,7 +139,7 @@ fn isolated_home() -> Result<PathBuf, AppError> {
             true,
         )
     })?;
-    Ok(dir)
+    Ok(AnalysisWorkspace { root, home, cwd })
 }
 
 pub fn configured_summary_model() -> Option<String> {
@@ -141,6 +170,63 @@ async fn frame(session: &mut Session) -> Result<Value, ProbeError> {
     }
     let line = std::mem::take(&mut session.pending_line);
     serde_json::from_slice(&line).map_err(|_| ProbeError::InvalidResponse)
+}
+
+async fn verify_isolated_config(session: &mut Session) -> Result<(), AppError> {
+    let response = session
+        .request("config/read", json!({"includeLayers":false}))
+        .await
+        .map_err(protocol)?;
+    let config = response.get("config").ok_or_else(|| {
+        failure(
+            ErrorCode::AnalysisUnavailable,
+            "无法确认分析进程的有效配置，已禁用临时总结。",
+            false,
+        )
+    })?;
+    let disabled = [
+        "shell_tool",
+        "apps",
+        "hooks",
+        "multi_agent",
+        "remote_plugin",
+        "plugins",
+        "view_image",
+        "browser_use",
+        "browser_use_external",
+        "browser_use_full_cdp_access",
+        "computer_use",
+        "in_app_browser",
+        "in_app_local_automation",
+        "image_generation",
+        "shell_snapshot",
+        "skill_search",
+        "skill_mcp_dependency_install",
+        "tool_call_mcp_elicitation",
+        "tool_suggest",
+        "workspace_dependencies",
+        "goals",
+    ];
+    let safe = disabled
+        .iter()
+        .all(|key| config.pointer(&format!("/features/{key}")) == Some(&Value::Bool(false)))
+        && config.get("web_search").and_then(Value::as_str) == Some("disabled")
+        && config
+            .get("cli_auth_credentials_store")
+            .and_then(Value::as_str)
+            == Some("keyring")
+        && config
+            .get("mcp_servers")
+            .and_then(Value::as_object)
+            .is_some_and(|servers| servers.is_empty());
+    if !safe {
+        return Err(failure(
+            ErrorCode::AnalysisUnavailable,
+            "Codex 未确认关闭分析工具、连接器或网络；已禁用此分析配置。",
+            false,
+        ));
+    }
+    Ok(())
 }
 
 async fn reject_server_request(session: &mut Session, event: &Value) -> Result<(), ProbeError> {
@@ -333,6 +419,7 @@ async fn await_turn(
 pub async fn analyze_summary(
     binary_choice: Option<&str>,
     model_choice: Option<&str>,
+    origin_home: Option<&Path>,
     prompt: String,
     cancel: CancellationToken,
     mut on_event: impl FnMut(AnalysisEvent) -> Result<(), AppError>,
@@ -341,30 +428,40 @@ pub async fn analyze_summary(
         return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false));
     }
     let binary = resolve_binary(binary_choice)?;
-    let home = isolated_home()?;
-    let result =
-        analyze_in_home(&binary, &home, model_choice, prompt, &cancel, &mut on_event).await;
-    let _ = fs::remove_dir_all(&home);
+    let workspace = isolated_workspace(origin_home)?;
+    let result = analyze_in_home(
+        &binary,
+        &workspace.home,
+        &workspace.cwd,
+        model_choice,
+        prompt,
+        &cancel,
+        &mut on_event,
+    )
+    .await;
+    let _ = fs::remove_dir_all(&workspace.root);
     result
 }
 
 async fn analyze_in_home(
     binary: &Path,
     home: &Path,
+    cwd: &Path,
     model_choice: Option<&str>,
     prompt: String,
     cancel: &CancellationToken,
     on_event: &mut impl FnMut(AnalysisEvent) -> Result<(), AppError>,
 ) -> Result<AnalysisOutput, AppError> {
-    let mut session = Session::start_with_home(binary, Some(home)).await?;
+    let mut session = Session::start_with_home(binary, Some(home), Some(cwd)).await?;
     let result = async {
         session.initialize(false).await.map_err(protocol)?;
+        verify_isolated_config(&mut session).await?;
         if cancel.is_cancelled() { return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)); }
         let started = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)),
             result = session.request("thread/start", json!({
-            "ephemeral":true,"cwd":home,"sandbox":"read-only","approvalPolicy":"never","model":model_choice,
+            "ephemeral":true,"cwd":cwd,"sandbox":"read-only","approvalPolicy":"never","model":model_choice,
             "config":{"web_search":"disabled","features":{"multi_agent":false}},
             })) => result.map_err(protocol)?,
         };

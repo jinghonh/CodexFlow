@@ -3,7 +3,7 @@ use codexflow_domain::{
     AppError, DisplayTheme, EvidenceCheck, EvidencePage, FactPage, HistoryCoverage,
     HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, JevConnectionResult,
     JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph, ProjectSessions, ProjectTimeline,
-    SessionList, SourceStatus, SummaryPreview, SummaryRun,
+    SessionList, SourceStatus, SummaryEvidenceCheck, SummaryPreview, SummaryRun,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -137,6 +137,15 @@ fn get_summary_run(
     run_id: String,
 ) -> Result<Option<SummaryRun>, AppError> {
     service(&state)?.summary_run(&run_id)
+}
+
+#[tauri::command]
+fn inspect_summary_evidence(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    evidence_id: String,
+) -> Result<SummaryEvidenceCheck, AppError> {
+    service(&state)?.inspect_summary_evidence(&thread_id, &evidence_id)
 }
 
 #[tauri::command]
@@ -309,6 +318,7 @@ fn main() {
             start_thread_summary,
             get_latest_summary_run,
             get_summary_run,
+            inspect_summary_evidence,
             cancel_summary_run,
             get_history_turns,
             get_history_items,

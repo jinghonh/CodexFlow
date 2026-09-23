@@ -276,3 +276,6 @@ button:disabled { cursor: wait; opacity: .6; }
 .summary-fields { display: grid; gap: .8rem; margin-top: 1rem; }
 .summary-fields > div { border-top: 1px solid var(--line, #ddd); padding-top: .6rem; }
 .summary-fields p { margin: .25rem 0 0; white-space: pre-wrap; }
+.summary-evidence > div { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-top: .5rem; }
+.summary-evidence code { overflow-wrap: anywhere; }
+.summary-evidence blockquote { width: 100%; margin: .2rem 0 .5rem; white-space: pre-wrap; }

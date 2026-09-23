@@ -322,12 +322,38 @@ pub struct ThreadSummary {
     pub content: ThreadSummaryContent,
     #[serde(default)]
     pub evidence_ids: Vec<String>,
+    #[serde(default)]
+    pub evidence_refs: Vec<ThreadSummaryEvidence>,
     pub model: String,
     #[serde(default)]
     pub binary_version: Option<String>,
     pub input_digest: String,
     pub source_updated_at: i64,
+    #[serde(default)]
+    pub history_generation: i64,
     pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSummaryEvidence {
+    pub id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub content_version: String,
+    pub excerpt: String,
+    pub is_fact: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryEvidenceCheck {
+    pub id: String,
+    pub state: EvidenceState,
+    pub message: String,
+    pub item_id: Option<String>,
+    pub location: Option<HistoryItemLocation>,
+    pub excerpt: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -348,6 +374,7 @@ pub struct SummaryPreview {
     pub content_available: bool,
     pub cached_summary: Option<ThreadSummary>,
     pub cache_current: bool,
+    pub analysis_blocked_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -734,6 +734,27 @@ impl SessionStore {
         .collect()
     }
 
+    pub fn history_item(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<Option<HistoryItem>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT item_json FROM history_items WHERE thread_id=?1 AND turn_id=?2 AND id=?3",
+                params![thread_id, turn_id, item_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取总结证据条目失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("总结证据条目损坏。"))
+        })
+        .transpose()
+    }
+
     pub fn history_generation(&self, thread_id: &str) -> Result<i64, AppError> {
         self.connection()?
             .query_row(

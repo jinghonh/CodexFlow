@@ -43,6 +43,7 @@ pub struct SourceService {
     refresh_active: std::sync::Mutex<Option<(String, CancellationToken)>>,
     summary_active:
         std::sync::Mutex<std::collections::HashMap<String, (String, CancellationToken)>>,
+    analysis_auth_home: Option<PathBuf>,
 }
 
 struct State {
@@ -78,6 +79,7 @@ impl SourceService {
             jev_cancel: Mutex::new(CancellationToken::new()),
             refresh_active: std::sync::Mutex::new(None),
             summary_active: std::sync::Mutex::new(std::collections::HashMap::new()),
+            analysis_auth_home: None,
         };
         service.reconcile_projects()?;
         Ok(service)

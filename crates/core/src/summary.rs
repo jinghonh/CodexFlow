@@ -1,8 +1,9 @@
 use super::{now_ms, SourceService};
 use codexflow_codex::{analyze_summary, AnalysisEvent, AnalysisOutput};
 use codexflow_domain::{
-    AppError, CapabilityState, ErrorCode, SourceEvidence, SourceFact, SummaryPreview, SummaryRun,
-    SummaryRunState, ThreadMetadata, ThreadSummary, ThreadSummaryContent,
+    AppError, CapabilityState, ErrorCode, EvidenceState, SourceEvidence, SourceFact,
+    SummaryEvidenceCheck, SummaryPreview, SummaryRun, SummaryRunState, ThreadMetadata,
+    ThreadSummary, ThreadSummaryContent, ThreadSummaryEvidence,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -29,9 +30,10 @@ pub trait SummaryAnalyzer: Send + Sync + 'static {
     ) -> impl Future<Output = Result<AnalysisOutput, AppError>> + Send;
 }
 
-pub struct CodexEphemeralAnalyzer {
-    pub binary: Option<String>,
-    pub model: Option<String>,
+struct CodexEphemeralAnalyzer {
+    binary: Option<String>,
+    model: Option<String>,
+    origin_home: Option<std::path::PathBuf>,
 }
 
 impl SummaryAnalyzer for CodexEphemeralAnalyzer {
@@ -44,6 +46,7 @@ impl SummaryAnalyzer for CodexEphemeralAnalyzer {
         analyze_summary(
             self.binary.as_deref(),
             self.model.as_deref(),
+            self.origin_home.as_deref(),
             prompt,
             cancel,
             on_event,
@@ -61,6 +64,7 @@ struct Prepared {
     configured_model: Option<String>,
     allowed_evidence_ids: HashSet<String>,
     fact_evidence_ids: HashSet<String>,
+    included_evidence_refs: HashMap<String, ThreadSummaryEvidence>,
     preview: SummaryPreview,
 }
 
@@ -96,7 +100,7 @@ fn build_input(
         .iter()
         .map(|item| (item.id.as_str(), item))
         .collect();
-    let mut candidates = Vec::<(bool, String, String)>::new();
+    let mut candidates = Vec::<(bool, String, ThreadSummaryEvidence)>::new();
     let mut content_clipped = thread.preview.chars().count() > 1000
         || thread
             .title
@@ -108,7 +112,11 @@ fn build_input(
         candidates.push((true, record("sourceFact", json!({"id":fact.id,"turnId":fact.turn_id,"itemId":fact.item_id,
             "factKind":fact.kind,"subject":fact.subject,"operation":fact.operation,"outcome":fact.outcome,
             "evidenceId":fact.evidence_id,"excerpt":source.map(|item|clip(&item.excerpt,700)),
-            "contentVersion":fact.content_version})), fact.evidence_id.clone()));
+            "contentVersion":fact.content_version})), ThreadSummaryEvidence {
+                id: fact.evidence_id.clone(), turn_id: fact.turn_id.clone(), item_id: fact.item_id.clone(),
+                content_version: fact.content_version.clone(),
+                excerpt: source.map(|item| clip(&item.excerpt,300)).unwrap_or_default(), is_fact: true,
+            }));
     }
     for item in items {
         if let Some(text) = item.text.as_deref().filter(|text| !text.trim().is_empty()) {
@@ -116,7 +124,10 @@ fn build_input(
             let evidence_id = format!("item:{}:{}", item.turn_id, item.id);
             candidates.push((false, record("message", json!({"turnId":item.turn_id,"itemId":item.id,
                 "sourceType":item.source_type,"text":clip(text,1200),"contentVersion":item.content_version,
-                "evidenceId":evidence_id})), evidence_id));
+                "evidenceId":evidence_id})), ThreadSummaryEvidence {
+                    id: evidence_id, turn_id: item.turn_id.clone(), item_id: item.id.clone(),
+                    content_version: item.content_version.clone(), excerpt: clip(text,300), is_fact: false,
+                }));
         }
     }
     // Preserve beginning, middle and end when a long history exceeds the budget.
@@ -147,21 +158,23 @@ fn build_input(
     let mut included_messages = 0;
     let mut allowed_evidence_ids = HashSet::new();
     let mut fact_evidence_ids = HashSet::new();
+    let mut included_evidence_refs = HashMap::new();
     let mut truncated = content_clipped;
     let mut remaining = LIMIT.saturating_sub(prompt.chars().count() + 300);
     for index in order {
-        let (fact, line, evidence_id) = &candidates[index];
+        let (fact, line, evidence_ref) = &candidates[index];
         let count = line.chars().count();
         if count > remaining {
             truncated = true;
             continue;
         }
         prompt.push_str(line);
-        allowed_evidence_ids.insert(evidence_id.clone());
+        allowed_evidence_ids.insert(evidence_ref.id.clone());
+        included_evidence_refs.insert(evidence_ref.id.clone(), evidence_ref.clone());
         remaining -= count;
         if *fact {
             included_facts += 1;
-            fact_evidence_ids.insert(evidence_id.clone());
+            fact_evidence_ids.insert(evidence_ref.id.clone());
         } else {
             included_messages += 1;
         }
@@ -194,6 +207,7 @@ fn build_input(
         content_available: !candidates.is_empty(),
         cached_summary: None,
         cache_current: false,
+        analysis_blocked_reason: None,
     };
     Prepared {
         prompt,
@@ -204,6 +218,7 @@ fn build_input(
         configured_model: configured_model.map(str::to_owned),
         allowed_evidence_ids,
         fact_evidence_ids,
+        included_evidence_refs,
         preview,
     }
 }
@@ -386,6 +401,8 @@ impl SourceService {
                     .is_none_or(|version| summary.binary_version.as_ref() == Some(version))
         });
         prepared.preview.cached_summary = cached;
+        prepared.preview.analysis_blocked_reason =
+            codexflow_codex::analysis_isolation_issue(self.analysis_auth_home.as_deref());
         Ok(prepared.preview)
     }
 
@@ -395,6 +412,157 @@ impl SourceService {
 
     pub fn summary_run(&self, id: &str) -> Result<Option<SummaryRun>, AppError> {
         self.sessions.summary_run(id)
+    }
+
+    pub fn inspect_summary_evidence(
+        &self,
+        thread_id: &str,
+        evidence_id: &str,
+    ) -> Result<SummaryEvidenceCheck, AppError> {
+        let summary = self.sessions.summary(thread_id)?.ok_or_else(|| {
+            AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "此会话没有已保存的总结。",
+                false,
+            )
+        })?;
+        if !summary.evidence_ids.iter().any(|id| id == evidence_id) {
+            return Err(AppError::codex(
+                ErrorCode::AnalysisInvalidResult,
+                "该标识不属于当前会话总结的引用。",
+                false,
+            ));
+        }
+        let result = |state, message: &str, reference: Option<&ThreadSummaryEvidence>, location| {
+            SummaryEvidenceCheck {
+                id: evidence_id.to_owned(),
+                state,
+                message: message.into(),
+                item_id: reference.map(|item| item.item_id.clone()),
+                location,
+                excerpt: reference.map(|item| item.excerpt.clone()),
+            }
+        };
+        let Some(reference) = summary
+            .evidence_refs
+            .iter()
+            .find(|item| item.id == evidence_id)
+        else {
+            return Ok(result(
+                EvidenceState::MissingItem,
+                "旧总结缺少证据定位，请重新生成总结。",
+                None,
+                None,
+            ));
+        };
+        let Some(thread) = self.sessions.thread(thread_id)? else {
+            return Ok(result(
+                EvidenceState::MissingThread,
+                "来源会话已不存在。",
+                Some(reference),
+                None,
+            ));
+        };
+        if thread.updated_at != summary.source_updated_at
+            || self.sessions.history_generation(thread_id)? != summary.history_generation
+        {
+            return Ok(result(
+                EvidenceState::StaleVersion,
+                "总结引用的是旧版历史，请重新读取并生成总结。",
+                Some(reference),
+                None,
+            ));
+        }
+        if reference.is_fact {
+            let Some(snapshot) = self.sessions.stored_evidence_snapshot(evidence_id)? else {
+                return Ok(result(
+                    EvidenceState::MissingFact,
+                    "事实证据已被替换或删除。",
+                    Some(reference),
+                    None,
+                ));
+            };
+            if snapshot.evidence.thread_id != thread_id
+                || snapshot.evidence.turn_id != reference.turn_id
+                || snapshot.evidence.item_id != reference.item_id
+                || snapshot.evidence.content_version != reference.content_version
+            {
+                return Ok(result(
+                    EvidenceState::WrongHierarchy,
+                    "事实证据定位与已保存总结不一致。",
+                    Some(reference),
+                    None,
+                ));
+            }
+            if reference.excerpt.is_empty()
+                || !snapshot.evidence.excerpt.starts_with(&reference.excerpt)
+            {
+                return Ok(result(
+                    EvidenceState::ExcerptMissing,
+                    "总结保存的事实摘录无法与当前证据匹配。",
+                    Some(reference),
+                    None,
+                ));
+            }
+            let check = Self::check_evidence_snapshot(snapshot);
+            return Ok(result(
+                check.state,
+                &check.message,
+                Some(reference),
+                check.location,
+            ));
+        }
+        let Some(item) =
+            self.sessions
+                .history_item(thread_id, &reference.turn_id, &reference.item_id)?
+        else {
+            return Ok(result(
+                EvidenceState::MissingItem,
+                "引用的来源条目已不存在。",
+                Some(reference),
+                None,
+            ));
+        };
+        if item.content_version != reference.content_version
+            || item.source_updated_at != thread.updated_at
+        {
+            return Ok(result(
+                EvidenceState::StaleVersion,
+                "来源条目内容版本已变化。",
+                Some(reference),
+                None,
+            ));
+        }
+        if reference.excerpt.is_empty()
+            || !item
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(&reference.excerpt))
+        {
+            return Ok(result(
+                EvidenceState::ExcerptMissing,
+                "已保存摘录无法在来源条目中定位。",
+                Some(reference),
+                None,
+            ));
+        }
+        let location =
+            self.sessions
+                .locate_history_item(thread_id, &reference.turn_id, &reference.item_id)?;
+        if location.is_none() {
+            return Ok(result(
+                EvidenceState::MissingItem,
+                "引用的来源条目无法定位。",
+                Some(reference),
+                None,
+            ));
+        }
+        Ok(result(
+            EvidenceState::Valid,
+            "证据有效，可定位到来源条目。",
+            Some(reference),
+            location,
+        ))
     }
 
     pub fn cancel_summary_run(&self, id: &str) -> Result<SummaryRun, AppError> {
@@ -417,6 +585,15 @@ impl SourceService {
         self: &Arc<Self>,
         thread_id: String,
     ) -> Result<SummaryRun, AppError> {
+        if let Some(message) =
+            codexflow_codex::analysis_isolation_issue(self.analysis_auth_home.as_deref())
+        {
+            return Err(AppError::codex(
+                ErrorCode::AnalysisUnavailable,
+                message,
+                false,
+            ));
+        }
         let status = self.status().await;
         if !matches!(
             status.capabilities.codex_summary.state,
@@ -492,6 +669,7 @@ impl SourceService {
         let analyzer = CodexEphemeralAnalyzer {
             binary: status.resolved_binary,
             model: prepared.configured_model.clone(),
+            origin_home: self.analysis_auth_home.clone(),
         };
         tokio::spawn(async move {
             service
@@ -550,11 +728,13 @@ impl SourceService {
                         let summary = ThreadSummary {
                             thread_id: run.thread_id.clone(),
                             content,
+                            evidence_refs: evidence_ids.iter().filter_map(|id| prepared.included_evidence_refs.get(id).cloned()).collect(),
                             evidence_ids,
                             model: output.model.clone(),
                             binary_version: prepared.binary_version,
                             input_digest: prepared.digest,
                             source_updated_at: prepared.source_updated_at,
+                            history_generation: prepared.generation,
                             created_at_unix_ms: now_ms() as i64,
                         };
                         match self
@@ -697,7 +877,11 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-        let service = Arc::new(SourceService::new(root.join("data")).unwrap());
+        let auth_home = root.join("safe-auth-home");
+        fs::create_dir(&auth_home).unwrap();
+        let mut service = SourceService::new(root.join("data")).unwrap();
+        service.analysis_auth_home = Some(auth_home);
+        let service = Arc::new(service);
         service
             .connect(Some(binary.to_string_lossy().into_owned()))
             .await
@@ -732,6 +916,12 @@ mod tests {
         let cached = service.summary_preview("thread-h").await.unwrap();
         assert!(cached.cache_current);
         assert_eq!(cached.cached_summary.unwrap().content.goal, "实现测试");
+        let check = service
+            .inspect_summary_evidence("thread-h", "item:turn-1:item-1")
+            .unwrap();
+        assert!(matches!(check.state, EvidenceState::Valid));
+        assert_eq!(check.item_id.as_deref(), Some("item-1"));
+        assert!(check.location.is_some());
         let reused = service
             .start_thread_summary("thread-h".into())
             .await
@@ -746,6 +936,128 @@ mod tests {
                 .unwrap()
                 .cache_current
         );
+        let mut changed = thread();
+        changed.updated_at = 201;
+        reopened.sessions.save_collection(&[changed], &[]).unwrap();
+        let stale = reopened
+            .inspect_summary_evidence("thread-h", "item:turn-1:item-1")
+            .unwrap();
+        assert!(matches!(stale.state, EvidenceState::StaleVersion));
+        assert!(stale.location.is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fact_citation_uses_source_evidence_validation_and_location() {
+        let root = std::env::temp_dir().join(format!(
+            "codexflow-summary-fact-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let service = SourceService::new(root.join("data")).unwrap();
+        service.sessions.save_collection(&[thread()], &[]).unwrap();
+        service
+            .sessions
+            .save_history(&codexflow_domain::HistorySnapshot {
+                coverage: HistoryCoverage {
+                    thread_id: "thread-h".into(),
+                    source_updated_at: 200,
+                    attempted_at_unix_ms: 1,
+                    path: HistoryReadPath::FullRead,
+                    turns_complete: true,
+                    items_complete: true,
+                    turn_pages: 0,
+                    item_pages: 0,
+                    loaded_turns: 1,
+                    loaded_items: 1,
+                    incompatible: false,
+                    error: None,
+                },
+                turns: vec![codexflow_domain::HistoryTurn {
+                    thread_id: "thread-h".into(),
+                    id: "turn-1".into(),
+                    ordinal: 0,
+                    status: "completed".into(),
+                    started_at_unix_ms: None,
+                    completed_at_unix_ms: None,
+                    duration_ms: None,
+                    time_error: None,
+                    source_updated_at: 200,
+                    content_version: "turn-v1".into(),
+                }],
+                items: vec![codexflow_domain::HistoryItem {
+                    thread_id: "thread-h".into(),
+                    turn_id: "turn-1".into(),
+                    id: "command-1".into(),
+                    ordinal: 0,
+                    source_type: "commandExecution".into(),
+                    supported: true,
+                    text: None,
+                    command: Some("cargo test".into()),
+                    cwd: None,
+                    output: Some("test passed".into()),
+                    exit_code: Some(0),
+                    status: Some("completed".into()),
+                    changes: vec![],
+                    source_updated_at: 200,
+                    content_version: "item-v1".into(),
+                }],
+            })
+            .unwrap();
+        let evidence = service.source_evidence("thread-h", 0, 10).unwrap().evidence;
+        assert!(!evidence.is_empty());
+        let cited = &evidence[0];
+        let summary = ThreadSummary {
+            thread_id: "thread-h".into(),
+            content: ThreadSummaryContent {
+                goal: "测试".into(),
+                activity: "运行命令".into(),
+                outcome: "通过".into(),
+                decisions: "未知".into(),
+                issues: "未知".into(),
+            },
+            evidence_ids: vec![cited.id.clone()],
+            evidence_refs: vec![ThreadSummaryEvidence {
+                id: cited.id.clone(),
+                turn_id: cited.turn_id.clone(),
+                item_id: cited.item_id.clone(),
+                content_version: cited.content_version.clone(),
+                excerpt: cited.excerpt.clone(),
+                is_fact: true,
+            }],
+            model: "test".into(),
+            binary_version: None,
+            input_digest: "test".into(),
+            source_updated_at: 200,
+            history_generation: service.sessions.history_generation("thread-h").unwrap(),
+            created_at_unix_ms: 1,
+        };
+        assert!(service
+            .sessions
+            .save_summary_if_current(&summary, summary.history_generation)
+            .unwrap());
+        let valid = service
+            .inspect_summary_evidence("thread-h", &cited.id)
+            .unwrap();
+        assert!(matches!(valid.state, EvidenceState::Valid));
+        assert_eq!(valid.item_id.as_deref(), Some("command-1"));
+        assert!(valid.location.is_some());
+        assert!(matches!(
+            service.inspect_summary_evidence("thread-h", "not-cited"),
+            Err(AppError {
+                code: ErrorCode::AnalysisInvalidResult,
+                ..
+            })
+        ));
+        let connection = rusqlite::Connection::open(root.join("data/sessions.sqlite3")).unwrap();
+        connection
+            .execute("DELETE FROM source_evidence WHERE id=?1", [&cited.id])
+            .unwrap();
+        let missing = service
+            .inspect_summary_evidence("thread-h", &cited.id)
+            .unwrap();
+        assert!(matches!(missing.state, EvidenceState::MissingFact));
+        assert!(missing.location.is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -765,7 +1077,11 @@ mod tests {
             )
             .unwrap();
             fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
-            let service = Arc::new(SourceService::new(root.join("data")).unwrap());
+            let auth_home = root.join("safe-auth-home");
+            fs::create_dir(&auth_home).unwrap();
+            let mut service = SourceService::new(root.join("data")).unwrap();
+            service.analysis_auth_home = Some(auth_home);
+            let service = Arc::new(service);
             service
                 .connect(Some(binary.to_string_lossy().into_owned()))
                 .await
@@ -782,10 +1098,12 @@ mod tests {
                     issues: "旧问题".into(),
                 },
                 evidence_ids: vec![],
+                evidence_refs: vec![],
                 model: "old-model".into(),
                 binary_version: Some("older".into()),
                 input_digest: "old-input".into(),
                 source_updated_at: 200,
+                history_generation: service.sessions.history_generation("thread-h").unwrap(),
                 created_at_unix_ms: 1,
             };
             service
@@ -857,101 +1175,5 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
-    }
-
-    #[tokio::test]
-    #[ignore = "手动受控真实 Codex 端到端冒烟，会调用模型"]
-    async fn real_summary_saves_only_valid_synthetic_evidence() {
-        let root = std::env::temp_dir().join(format!(
-            "codexflow-real-summary-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        let original_home = std::env::var_os("CODEX_HOME");
-        let original_codex_home = original_home
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".codex")
-            });
-        let controlled_home = root.join("codex-home");
-        fs::create_dir_all(&controlled_home).unwrap();
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(
-            original_codex_home.join("auth.json"),
-            controlled_home.join("auth.json"),
-        )
-        .unwrap();
-        fs::write(
-            controlled_home.join("config.toml"),
-            "web_search = \"disabled\"\n",
-        )
-        .unwrap();
-        struct RestoreHome(Option<std::ffi::OsString>);
-        impl Drop for RestoreHome {
-            fn drop(&mut self) {
-                if let Some(value) = &self.0 {
-                    std::env::set_var("CODEX_HOME", value);
-                } else {
-                    std::env::remove_var("CODEX_HOME");
-                }
-            }
-        }
-        let _restore_home = RestoreHome(original_home);
-        std::env::set_var("CODEX_HOME", &controlled_home);
-        let service = Arc::new(SourceService::new(root.join("data")).unwrap());
-        let connected = service.connect(None).await.unwrap();
-        assert!(matches!(
-            connected.capabilities.codex_summary.state,
-            CapabilityState::Available
-        ));
-        service.sessions.save_collection(&[thread()], &[]).unwrap();
-        service.sessions.save_history(&codexflow_domain::HistorySnapshot {
-            coverage: HistoryCoverage { thread_id: "thread-h".into(), source_updated_at: 200,
-                attempted_at_unix_ms: 1, path: HistoryReadPath::FullRead,
-                turns_complete: true, items_complete: true, turn_pages: 0, item_pages: 0,
-                loaded_turns: 1, loaded_items: 1, incompatible: false, error: None },
-            turns: vec![codexflow_domain::HistoryTurn { thread_id: "thread-h".into(), id: "turn-1".into(),
-                ordinal: 0, status: "completed".into(), started_at_unix_ms: None,
-                completed_at_unix_ms: None, duration_ms: None, time_error: None,
-                source_updated_at: 200, content_version: "turn-v1".into() }],
-            items: vec![codexflow_domain::HistoryItem { thread_id: "thread-h".into(), turn_id: "turn-1".into(),
-                id: "item-1".into(), ordinal: 0, source_type: "userMessage".into(), supported: true,
-                text: Some("目标：验证受控摘要。活动：阅读此句。结果：完成读取。决定：不使用工具。问题：未知。".into()),
-                command: None, cwd: None, output: None, exit_code: None, status: None, changes: vec![],
-                source_updated_at: 200, content_version: "item-v1".into() }],
-        }).unwrap();
-        let run = service
-            .start_thread_summary("thread-h".into())
-            .await
-            .unwrap();
-        let final_run = tokio::time::timeout(Duration::from_secs(120), async {
-            loop {
-                let current = service.summary_run(&run.id).unwrap().unwrap();
-                if matches!(
-                    current.state,
-                    SummaryRunState::Complete
-                        | SummaryRunState::Failed
-                        | SummaryRunState::Cancelled
-                ) {
-                    break current;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(
-            final_run.state,
-            SummaryRunState::Complete,
-            "{:?}",
-            final_run.error
-        );
-        let summary = service.sessions.summary("thread-h").unwrap().unwrap();
-        assert!(summary
-            .evidence_ids
-            .contains(&"item:turn-1:item-1".to_owned()));
-        service.shutdown().await;
-        let _ = fs::remove_dir_all(root);
     }
 }

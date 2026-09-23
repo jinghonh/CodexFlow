@@ -243,7 +243,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoa
       {!connected && <em>来源当前不可用；已保存的历史仍可浏览。</em>}
     </div>
     {error && <div className="page-error" role="alert">{error}</div>}
-    <ThreadSummaryView threadId={threadId} connected={connected} revision={revision} />
+    <ThreadSummaryView threadId={threadId} connected={connected} revision={revision} onLocate={showLocation} />
     <SourceFactsView threadId={threadId} updatedAt={updatedAt} coverage={coverage} revision={revision} onLocate={showLocation} />
     <div className="history-locator"><label>回合标识<input value={lookupTurn} onChange={(event) => setLookupTurn(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Turn ID" /></label><label>条目标识<input value={lookup} onChange={(event) => setLookup(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Item ID" /></label><button className="browse-button" onClick={() => void locate()}>定位</button></div>
     {lookupMessage && <p className="history-lookup-message" role="status">{lookupMessage}</p>}

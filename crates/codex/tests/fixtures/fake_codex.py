@@ -180,7 +180,22 @@ for line in sys.stdin:
                                    history_turn("turn-2", [history_item("item-1" if mode.endswith("duplicate-legacy") else "item-2")])]
             assert params["includeTurns"] is True
             response = {"id": request["id"], "result": {"thread": legacy}}
+    elif mode.startswith("fake-analysis-") and method == "config/read":
+        home = pathlib.Path(os.environ["CODEX_HOME"])
+        assert pathlib.Path.cwd() != home
+        assert not (home / "auth.json").exists()
+        keys = ("shell_tool", "apps", "hooks", "multi_agent", "remote_plugin", "plugins", "view_image",
+                "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
+                "in_app_browser", "in_app_local_automation", "image_generation", "shell_snapshot", "skill_search",
+                "skill_mcp_dependency_install", "tool_call_mcp_elicitation", "tool_suggest", "workspace_dependencies", "goals")
+        features = {key: False for key in keys}
+        if mode.endswith("unsafe-config"):
+            features["shell_tool"] = True
+        response = {"id":request["id"], "result":{"config":{"features":features,"web_search":"disabled",
+            "cli_auth_credentials_store":"keyring","mcp_servers":{}}}}
     elif mode.startswith("fake-analysis-") and method == "thread/start":
+        if mode.endswith("unsafe-config"):
+            (pathlib.Path(__file__).parent / "unexpected-thread-start").touch()
         assert request["params"]["ephemeral"] is True
         assert request["params"]["sandbox"] == "read-only"
         assert request["params"]["approvalPolicy"] == "never"

@@ -1,6 +1,9 @@
 mod analysis;
 mod history;
-pub use analysis::{analyze_summary, configured_summary_model, AnalysisEvent, AnalysisOutput};
+pub use analysis::{
+    analysis_isolation_issue, analyze_summary, configured_summary_model, AnalysisEvent,
+    AnalysisOutput,
+};
 
 use codexflow_domain::{
     AppError, Capability, ErrorCode, GitMetadata, ListScopeStatus, SourceCapabilities,
@@ -516,6 +519,7 @@ mod tests {
         let output = analyze_summary(
             Some(path.to_str().unwrap()),
             None,
+            path.parent(),
             "受控摘要".into(),
             CancellationToken::new(),
             |event| {
@@ -545,6 +549,7 @@ mod tests {
             let result = analyze_summary(
                 Some(path.to_str().unwrap()),
                 None,
+                path.parent(),
                 "受控摘要".into(),
                 token,
                 |event| {
@@ -572,6 +577,7 @@ mod tests {
         let result = analyze_summary(
             Some(path.to_str().unwrap()),
             None,
+            path.parent(),
             "受控摘要".into(),
             CancellationToken::new(),
             |_| Ok(()),
@@ -593,6 +599,7 @@ mod tests {
         analyze_summary(
             Some(path.to_str().unwrap()),
             None,
+            path.parent(),
             "受控摘要".into(),
             CancellationToken::new(),
             |_| Ok(()),
@@ -614,6 +621,7 @@ mod tests {
         let result = analyze_summary(
             Some(path.to_str().unwrap()),
             Some("unsupported"),
+            path.parent(),
             "受控摘要".into(),
             CancellationToken::new(),
             |_| Ok(()),
@@ -630,12 +638,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_backed_auth_and_unsafe_effective_config_fail_before_model_turn() {
+        let path = fake_binary("analysis-ok");
+        let auth_home = path.parent().unwrap().join("auth-home");
+        fs::create_dir(&auth_home).unwrap();
+        fs::write(auth_home.join("auth.json"), "synthetic credential").unwrap();
+        let blocked = analyze_summary(
+            Some(path.to_str().unwrap()),
+            None,
+            Some(&auth_home),
+            "受控摘要".into(),
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await;
+        assert!(matches!(
+            blocked,
+            Err(AppError {
+                code: ErrorCode::AnalysisUnavailable,
+                ..
+            })
+        ));
+        let unsafe_binary = fake_binary("analysis-unsafe-config");
+        let unsafe_result = analyze_summary(
+            Some(unsafe_binary.to_str().unwrap()),
+            None,
+            unsafe_binary.parent(),
+            "受控摘要".into(),
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await;
+        assert!(matches!(
+            unsafe_result,
+            Err(AppError {
+                code: ErrorCode::AnalysisUnavailable,
+                ..
+            })
+        ));
+        assert!(!unsafe_binary
+            .parent()
+            .unwrap()
+            .join("unexpected-thread-start")
+            .exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        let _ = fs::remove_dir_all(unsafe_binary.parent().unwrap());
+    }
+
+    #[tokio::test]
     #[ignore = "手动受控真实 Codex 冒烟，会调用模型"]
     async fn real_ephemeral_summary_does_not_enter_regular_history() {
+        if let Some(reason) = analysis_isolation_issue(None) {
+            eprintln!("跳过真实模型冒烟：{reason}");
+            return;
+        }
         let token = CancellationToken::new();
         let stop = token.clone();
         let mut temporary_id = None;
         let output = tokio::time::timeout(Duration::from_secs(180), analyze_summary(
+            None,
             None,
             None,
             "仅使用此合成材料填写五个总结字段，evidenceIds 填空数组：目标是检查摘要接口；活动是阅读本句；结果是完成检查；决定和问题均为未知。禁止使用工具。".into(),
@@ -675,10 +736,15 @@ mod tests {
     #[tokio::test]
     #[ignore = "手动受控真实 Codex 中断冒烟，会启动模型回合"]
     async fn real_ephemeral_interrupt_reaches_terminal_state() {
+        if let Some(reason) = analysis_isolation_issue(None) {
+            eprintln!("跳过真实中断冒烟：{reason}");
+            return;
+        }
         let cancel = CancellationToken::new();
         let trigger = cancel.clone();
         let mut terminal = None;
         let result = analyze_summary(
+            None,
             None,
             None,
             "这是一条合成的中断验证材料。请仅根据这句话填写总结字段。".into(),
@@ -1142,10 +1208,14 @@ pub struct Session {
 
 impl Session {
     async fn start(binary: &Path) -> Result<Self, AppError> {
-        Self::start_with_home(binary, None).await
+        Self::start_with_home(binary, None, None).await
     }
 
-    async fn start_with_home(binary: &Path, home: Option<&Path>) -> Result<Self, AppError> {
+    async fn start_with_home(
+        binary: &Path,
+        home: Option<&Path>,
+        cwd: Option<&Path>,
+    ) -> Result<Self, AppError> {
         let mut command = Command::new(binary);
         command
             .arg("app-server")
@@ -1154,7 +1224,13 @@ impl Session {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         if let Some(home) = home {
-            command.current_dir(home).env("CODEX_HOME", home);
+            command
+                .env_clear()
+                .env("CODEX_HOME", home)
+                .env("HOME", cwd.unwrap_or(home))
+                .env("PATH", env::var_os("PATH").unwrap_or_default())
+                .env("LANG", env::var_os("LANG").unwrap_or_default())
+                .current_dir(cwd.unwrap_or(home));
         }
         AuxiliaryGroup::configure(&mut command);
         let mut child = command.spawn().map_err(|_| {
