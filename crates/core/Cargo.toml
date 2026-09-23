@@ -8,4 +8,5 @@ codexflow-domain = { path = "../domain" }
 codexflow-codex = { path = "../codex" }
 codexflow-store = { path = "../store" }
 codexflow-jev = { path = "../jev" }
-tokio = { version = "1", features = ["sync", "macros", "rt"] }
+tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
