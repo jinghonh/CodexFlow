@@ -128,9 +128,10 @@ fn get_history_items(
 fn locate_history_item(
     state: tauri::State<'_, AppState>,
     thread_id: String,
+    turn_id: String,
     item_id: String,
 ) -> Result<Option<HistoryItemLocation>, AppError> {
-    service(&state)?.locate_history_item(&thread_id, &item_id)
+    service(&state)?.locate_history_item(&thread_id, &turn_id, &item_id)
 }
 
 #[tauri::command]

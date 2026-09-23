@@ -180,6 +180,7 @@ pub struct HistoryFileChange {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryItem {
+    /// 条目身份由 (thread_id, turn_id, id) 组成；不同回合可以复用来源条目标识。
     pub thread_id: String,
     pub turn_id: String,
     pub id: String,

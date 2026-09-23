@@ -52,6 +52,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected }: {
   const [itemOffset, setItemOffset] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [lookupTurn, setLookupTurn] = useState("");
   const [lookup, setLookup] = useState("");
   const [lookupMessage, setLookupMessage] = useState("");
   const [highlight, setHighlight] = useState<string | null>(null);
@@ -65,6 +66,10 @@ export function ThreadHistoryView({ threadId, updatedAt, connected }: {
     setTurnOffset(0);
     setItemOffset(0);
     setError("");
+    setLookupTurn("");
+    setLookup("");
+    setLookupMessage("");
+    setHighlight(null);
     async function openHistory() {
       try {
         let page = await invoke<TurnPage>("get_history_turns", { threadId, offset: 0, limit: TURN_LIMIT });
@@ -123,10 +128,14 @@ export function ThreadHistoryView({ threadId, updatedAt, connected }: {
 
   async function locate() {
     setLookupMessage("");
+    const turnId = lookupTurn.trim();
     const id = lookup.trim();
-    if (!id) return;
+    if (!turnId || !id) {
+      setLookupMessage("请输入回合标识和条目标识。");
+      return;
+    }
     try {
-      const location = await invoke<Location | null>("locate_history_item", { threadId, itemId: id });
+      const location = await invoke<Location | null>("locate_history_item", { threadId, turnId, itemId: id });
       if (!location) {
         setLookupMessage(turns?.coverage?.itemsComplete ? "本次完整历史中没有这个条目标识。" : "缓存中没有这个条目；当前历史可能不完整。");
         return;
@@ -153,7 +162,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected }: {
       {!connected && <em>来源当前不可用；已保存的历史仍可浏览。</em>}
     </div>
     {error && <div className="page-error" role="alert">{error}</div>}
-    <div className="history-locator"><label>定位条目标识<input value={lookup} onChange={(event) => setLookup(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Item ID" /></label><button className="browse-button" onClick={() => void locate()}>定位</button></div>
+    <div className="history-locator"><label>回合标识<input value={lookupTurn} onChange={(event) => setLookupTurn(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Turn ID" /></label><label>条目标识<input value={lookup} onChange={(event) => setLookup(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Item ID" /></label><button className="browse-button" onClick={() => void locate()}>定位</button></div>
     {lookupMessage && <p className="history-lookup-message" role="status">{lookupMessage}</p>}
     <div className="history-columns">
       <div className="history-turns"><h3>回合 <small>{turns?.total ?? 0}</small></h3>

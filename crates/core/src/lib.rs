@@ -330,9 +330,11 @@ impl SourceService {
     pub fn locate_history_item(
         &self,
         thread_id: &str,
+        turn_id: &str,
         item_id: &str,
     ) -> Result<Option<HistoryItemLocation>, AppError> {
-        self.sessions.locate_history_item(thread_id, item_id)
+        self.sessions
+            .locate_history_item(thread_id, turn_id, item_id)
     }
 
     fn reconcile_projects(&self) -> Result<(), AppError> {
@@ -1688,7 +1690,7 @@ mod tests {
         assert_eq!(service.cached_sessions().unwrap().threads.len(), 2);
         assert_eq!(
             service
-                .locate_history_item("thread-h", "item-1")
+                .locate_history_item("thread-h", "turn-1", "item-1")
                 .unwrap()
                 .unwrap()
                 .turn_id,
@@ -1696,6 +1698,103 @@ mod tests {
         );
         service.shutdown().await;
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn repeated_item_id_in_distinct_turns_survives_both_history_read_paths() {
+        for (mode, path) in [
+            (
+                "duplicate-paged",
+                codexflow_domain::HistoryReadPath::Paginated,
+            ),
+            (
+                "duplicate-legacy",
+                codexflow_domain::HistoryReadPath::FullRead,
+            ),
+        ] {
+            let root = temp_data_dir();
+            fs::create_dir_all(&root).unwrap();
+            let binary = root.join(format!("fake-history-{mode}.py"));
+            fs::write(
+                &binary,
+                include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
+            )
+            .unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let service = SourceService::with_credentials(
+                root.join("data"),
+                Arc::new(MemoryCredentials::default()),
+            )
+            .unwrap();
+            service
+                .connect(Some(binary.to_string_lossy().into_owned()))
+                .await
+                .unwrap();
+            service
+                .sessions
+                .save_collection(
+                    &[codexflow_domain::ThreadMetadata {
+                        id: "thread-h".into(),
+                        session_id: "session-thread-h".into(),
+                        title: Some("历史会话".into()),
+                        preview: "测试".into(),
+                        cwd: "/tmp/example-project".into(),
+                        project_id: None,
+                        source_kind: "cli".into(),
+                        source_detail: None,
+                        thread_source: None,
+                        parent_thread_id: None,
+                        forked_from_id: None,
+                        git: None,
+                        created_at: 100,
+                        updated_at: 200,
+                        archived: false,
+                        metadata_complete: true,
+                        turns_complete: false,
+                        items_complete: false,
+                        missing_from_source: false,
+                        content_complete: false,
+                        read_error: None,
+                        observed_at_unix_ms: 1,
+                    }],
+                    &[],
+                )
+                .unwrap();
+            let coverage = service.load_thread_history("thread-h").await.unwrap();
+            assert!(coverage.items_complete, "{mode}: {:?}", coverage.error);
+            assert_eq!(coverage.path, path);
+            assert_eq!(coverage.loaded_items, 2);
+            for (turn_id, turn_offset) in [("turn-1", 0), ("turn-2", 1)] {
+                let page = service.history_items("thread-h", turn_id, 0, 20).unwrap();
+                assert_eq!(page.total, 1, "{mode}: {turn_id}");
+                assert_eq!(page.items[0].id, "item-1");
+                assert_eq!(page.items[0].turn_id, turn_id);
+                let location = service
+                    .locate_history_item("thread-h", turn_id, "item-1")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(location.turn_id, turn_id);
+                assert_eq!(location.turn_offset, turn_offset);
+                assert_eq!(location.offset, 0);
+            }
+            service.shutdown().await;
+            let reopened = SessionStore::new(root.join("data")).unwrap();
+            assert_eq!(
+                reopened
+                    .history_items("thread-h", "turn-1", 0, 20)
+                    .unwrap()
+                    .total,
+                1
+            );
+            assert_eq!(
+                reopened
+                    .history_items("thread-h", "turn-2", 0, 20)
+                    .unwrap()
+                    .total,
+                1
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
 
     #[tokio::test]

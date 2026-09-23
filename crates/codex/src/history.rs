@@ -319,7 +319,7 @@ impl Session {
                     snapshot.items.len() as u64,
                     source_updated_at,
                 )?;
-                if !item_ids.insert(item.id.clone()) {
+                if !item_ids.insert((item.turn_id.clone(), item.id.clone())) {
                     return Err("条目分页出现重复标识。".into());
                 }
                 snapshot.items.push(item);
@@ -385,7 +385,10 @@ impl Session {
             }
             turns.push(turn);
         }
-        let unique_items: HashSet<&str> = items.iter().map(|item| item.id.as_str()).collect();
+        let unique_items: HashSet<(&str, &str)> = items
+            .iter()
+            .map(|item| (item.turn_id.as_str(), item.id.as_str()))
+            .collect();
         if unique_items.len() != items.len() {
             return Err("完整读取出现重复条目。".into());
         }

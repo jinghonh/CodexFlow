@@ -16,7 +16,7 @@ const item = (id: string, turnId: string) => ({ id, turnId, ordinal: 24, sourceT
   supported: true, text: "目标正文", command: null, cwd: null, output: null, exitCode: null,
   status: null, changes: [], sourceUpdatedAt: 200, contentVersion: "abcdef1234567890" });
 
-test("缓存分页并按条目标识定位到对应回合和条目页", async () => {
+test("相同条目标识按回合定位到对应条目页", async () => {
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "get_history_turns") {
       const offset = (args as { offset: number }).offset;
@@ -24,19 +24,23 @@ test("缓存分页并按条目标识定位到对应回合和条目页", async ()
     }
     if (command === "get_history_items") {
       const { turnId, offset } = args as { turnId: string; offset: number };
-      return { coverage, items: turnId === "turn-25" && offset === 20 ? [item("item-target", turnId)] : [],
-        total: turnId === "turn-25" ? 25 : 0, offset, limit: 20 };
+      return { coverage, items: turnId === "turn-25" && offset === 20 || turnId === "turn-1" ? [item("item-target", turnId)] : [],
+        total: turnId === "turn-25" ? 25 : 1, offset, limit: 20 };
     }
-    if (command === "locate_history_item") return { turnId: "turn-25", turnOffset: 24, offset: 24 };
+    if (command === "locate_history_item") {
+      expect(args).toEqual({ threadId: "thread-h", turnId: "turn-25", itemId: "item-target" });
+      return { turnId: "turn-25", turnOffset: 24, offset: 24 };
+    }
     throw new Error(`Unexpected command ${command}`);
   });
   render(<ThreadHistoryView threadId="thread-h" updatedAt={200} connected />);
   expect(await screen.findByText("部分完整")).toBeTruthy();
+  fireEvent.change(screen.getByPlaceholderText("输入完整 Turn ID"), { target: { value: "turn-25" } });
   fireEvent.change(screen.getByPlaceholderText("输入完整 Item ID"), { target: { value: "item-target" } });
   fireEvent.click(screen.getByRole("button", { name: "定位" }));
   expect(await screen.findByText("目标正文")).toBeTruthy();
   expect(screen.getByText("已定位到回合 turn-25。")).toBeTruthy();
-  expect(screen.getAllByText("21–25 / 25")).toHaveLength(2);
+  await waitFor(() => expect(screen.getAllByText("21–25 / 25")).toHaveLength(2));
   await waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith("get_history_items",
     { threadId: "thread-h", turnId: "turn-25", offset: 20, limit: 20 }));
   expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("load_thread_history", expect.anything());

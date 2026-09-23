@@ -155,7 +155,7 @@ for line in sys.stdin:
                 assert params["sortDirection"] == "asc"
                 assert params.get("cursor") in (None, "opaque-item-2")
                 if params.get("cursor"):
-                    data = [{"turnId": "turn-2", "item": {"id": "unknown-2", "type": "futureWidget", "payload": "opaque"}}]
+                    data = [{"turnId": "turn-2", "item": history_item("item-1") if mode.endswith("duplicate-paged") else {"id": "unknown-2", "type": "futureWidget", "payload": "opaque"}}]
                 else:
                     data = [{"turnId": "turn-1", "item": history_item("item-1")}]
                 response = {"id": request["id"], "result": {"data": data,
@@ -168,7 +168,7 @@ for line in sys.stdin:
                 legacy["turns"] = [history_turn("turn-1", [history_item("summary-only")], "summary")]
             else:
                 legacy["turns"] = [history_turn("turn-1", [history_item("item-1")]),
-                                   history_turn("turn-2", [history_item("item-2")])]
+                                   history_turn("turn-2", [history_item("item-1" if mode.endswith("duplicate-legacy") else "item-2")])]
             assert params["includeTurns"] is True
             response = {"id": request["id"], "result": {"thread": legacy}}
     elif method in ("thread/read", "thread/turns/list", "thread/items/list"):

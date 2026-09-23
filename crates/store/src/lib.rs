@@ -72,7 +72,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 5 {
+        if version > 6 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -213,6 +213,32 @@ impl SessionStore {
                 .commit()
                 .map_err(|_| AppError::migration("提交历史数据库迁移失败，原数据已保留。"))?;
         }
+        if version < 6 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始条目身份数据库迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE history_items_v6 (
+                        thread_id TEXT NOT NULL,
+                        turn_id TEXT NOT NULL,
+                        id TEXT NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        item_json TEXT NOT NULL,
+                        PRIMARY KEY (thread_id, turn_id, id)
+                    );
+                    INSERT INTO history_items_v6 (thread_id, turn_id, id, ordinal, item_json)
+                        SELECT thread_id, turn_id, id, ordinal, item_json FROM history_items;
+                    DROP TABLE history_items;
+                    ALTER TABLE history_items_v6 RENAME TO history_items;
+                    CREATE INDEX history_item_order ON history_items(thread_id, turn_id, ordinal, id);
+                    PRAGMA user_version = 6;",
+                )
+                .map_err(|_| AppError::migration("迁移条目身份数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交条目身份数据库迁移失败，原数据已保留。"))?;
+        }
         store.recover_interrupted_runs()?;
         Ok(store)
     }
@@ -292,9 +318,9 @@ impl SessionStore {
         for item in &snapshot.items {
             let json =
                 serde_json::to_string(item).map_err(|_| AppError::store("序列化条目失败。"))?;
-            tx.execute("INSERT INTO history_items (thread_id,id,turn_id,ordinal,item_json) VALUES (?1,?2,?3,?4,?5)
-                ON CONFLICT(thread_id,id) DO UPDATE SET turn_id=excluded.turn_id,ordinal=excluded.ordinal,item_json=excluded.item_json",
-                params![item.thread_id, item.id, item.turn_id, item.ordinal, json],
+            tx.execute("INSERT INTO history_items (thread_id,turn_id,id,ordinal,item_json) VALUES (?1,?2,?3,?4,?5)
+                ON CONFLICT(thread_id,turn_id,id) DO UPDATE SET ordinal=excluded.ordinal,item_json=excluded.item_json",
+                params![item.thread_id, item.turn_id, item.id, item.ordinal, json],
             ).map_err(|_| AppError::store("保存条目失败，旧缓存已保留。"))?;
         }
         let json = serde_json::to_string(&coverage)
@@ -433,14 +459,15 @@ impl SessionStore {
     pub fn locate_history_item(
         &self,
         thread_id: &str,
+        turn_id: &str,
         item_id: &str,
     ) -> Result<Option<HistoryItemLocation>, AppError> {
         let connection = self.connection()?;
         let mut location = connection.query_row(
             "SELECT i.turn_id, (SELECT COUNT(*) FROM history_items p WHERE p.thread_id=i.thread_id AND p.turn_id=i.turn_id
                 AND (p.ordinal<i.ordinal OR (p.ordinal=i.ordinal AND p.id<i.id)))
-             FROM history_items i WHERE i.thread_id=?1 AND i.id=?2",
-            params![thread_id, item_id], |row| Ok(HistoryItemLocation { turn_id: row.get(0)?, turn_offset: 0, offset: row.get(1)? }),
+             FROM history_items i WHERE i.thread_id=?1 AND i.turn_id=?2 AND i.id=?3",
+            params![thread_id, turn_id, item_id], |row| Ok(HistoryItemLocation { turn_id: row.get(0)?, turn_offset: 0, offset: row.get(1)? }),
         ).optional().map_err(|_| AppError::store("定位条目失败。"))?;
         if let Some(found) = &mut location {
             found.turn_offset = connection
@@ -1075,7 +1102,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 6;")
+            .execute_batch("PRAGMA user_version = 7;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -1086,7 +1113,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1119,7 +1146,7 @@ mod tests {
             ordinal,
             source_type: "agentMessage".into(),
             supported: true,
-            text: Some(format!("正文 {id}")),
+            text: Some(format!("正文 {turn_id}/{id}")),
             command: None,
             cwd: None,
             output: None,
@@ -1127,7 +1154,7 @@ mod tests {
             status: None,
             changes: vec![],
             source_updated_at,
-            content_version: format!("item-{id}"),
+            content_version: format!("item-{turn_id}-{id}"),
         };
         let coverage = HistoryCoverage {
             thread_id: "duplicate-thread".into(),
@@ -1149,7 +1176,7 @@ mod tests {
                 turns: vec![make_turn("turn-1", 0, 200), make_turn("turn-2", 1, 200)],
                 items: vec![
                     make_item("item-1", "turn-1", 0, 200),
-                    make_item("item-2", "turn-2", 1, 200),
+                    make_item("item-1", "turn-2", 1, 200),
                 ],
             })
             .unwrap();
@@ -1158,7 +1185,7 @@ mod tests {
             "turn-2"
         );
         let location = store
-            .locate_history_item("duplicate-thread", "item-2")
+            .locate_history_item("duplicate-thread", "turn-2", "item-1")
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -1169,6 +1196,18 @@ mod tests {
             ),
             ("turn-2", 1, 0)
         );
+        assert_eq!(
+            store
+                .locate_history_item("duplicate-thread", "turn-1", "item-1")
+                .unwrap()
+                .unwrap()
+                .turn_offset,
+            0
+        );
+        assert!(store
+            .locate_history_item("duplicate-thread", "turn-2", "missing")
+            .unwrap()
+            .is_none());
         assert!(
             store
                 .thread("duplicate-thread")
@@ -1217,7 +1256,7 @@ mod tests {
                 .unwrap()
                 .items[0]
                 .id,
-            "item-2"
+            "item-1"
         );
         assert_eq!(
             reopened
@@ -1226,6 +1265,24 @@ mod tests {
                 .items[0]
                 .source_updated_at,
             200
+        );
+        assert_eq!(
+            reopened
+                .history_items("duplicate-thread", "turn-1", 0, 20)
+                .unwrap()
+                .items[0]
+                .text
+                .as_deref(),
+            Some("正文 turn-1/item-1")
+        );
+        assert_eq!(
+            reopened
+                .history_items("duplicate-thread", "turn-2", 0, 20)
+                .unwrap()
+                .items[0]
+                .text
+                .as_deref(),
+            Some("正文 turn-2/item-1")
         );
         let _ = fs::remove_dir_all(dir);
     }
@@ -1271,7 +1328,82 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_five_item_cache_migrates_without_losing_content() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-item-identity-migration-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        drop(store);
+        let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE history_items;
+             CREATE TABLE history_items (
+                thread_id TEXT NOT NULL, id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL, item_json TEXT NOT NULL,
+                PRIMARY KEY (thread_id, id)
+             );
+             CREATE INDEX history_item_order ON history_items(thread_id, turn_id, ordinal, id);
+             PRAGMA user_version = 5;",
+            )
+            .unwrap();
+        let item = HistoryItem {
+            thread_id: "thread-legacy".into(),
+            turn_id: "turn-legacy".into(),
+            id: "item-legacy".into(),
+            ordinal: 3,
+            source_type: "agentMessage".into(),
+            supported: true,
+            text: Some("旧内容".into()),
+            command: None,
+            cwd: None,
+            output: None,
+            exit_code: None,
+            status: None,
+            changes: vec![],
+            source_updated_at: 200,
+            content_version: "old-hash".into(),
+        };
+        let json = serde_json::to_string(&item).unwrap();
+        connection.execute(
+            "INSERT INTO history_items (thread_id,id,turn_id,ordinal,item_json) VALUES (?1,?2,?3,?4,?5)",
+            params![item.thread_id, item.id, item.turn_id, item.ordinal, json],
+        ).unwrap();
+        drop(connection);
+
+        let upgraded = SessionStore::new(dir.clone()).unwrap();
+        let page = upgraded
+            .history_items("thread-legacy", "turn-legacy", 0, 20)
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].text.as_deref(), Some("旧内容"));
+        assert_eq!(page.items[0].content_version, "old-hash");
+        let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let mut second = item.clone();
+        second.turn_id = "turn-new".into();
+        connection.execute(
+            "INSERT INTO history_items (thread_id,turn_id,id,ordinal,item_json) VALUES (?1,?2,?3,?4,?5)",
+            params![second.thread_id, second.turn_id, second.id, second.ordinal,
+                serde_json::to_string(&second).unwrap()],
+        ).unwrap();
+        assert_eq!(
+            upgraded
+                .history_items("thread-legacy", "turn-new", 0, 20)
+                .unwrap()
+                .total,
+            1
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1418,7 +1550,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (5, 1));
+        assert_eq!((version, count), (6, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1451,7 +1583,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1554,7 +1686,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 5);
+            assert_eq!(version, 6);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

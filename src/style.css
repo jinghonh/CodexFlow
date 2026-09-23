@@ -154,9 +154,9 @@ button:disabled { cursor: wait; opacity: .6; }
 .history-status { display: grid; gap: 6px; border: 1px solid var(--line); background: var(--page); padding: 13px; margin: 15px 0; font-size: 11px; }
 .history-status span, .history-status small { color: var(--muted); }
 .history-status em { color: var(--red); font-style: normal; overflow-wrap: anywhere; }
-.history-locator { display: flex; gap: 8px; align-items: end; margin-bottom: 12px; }
-.history-locator label { flex: 1; font-size: 10px; font-weight: 700; }
-.history-locator input { display: block; width: 100%; margin-top: 7px; padding: 10px; border: 1px solid var(--line); background: var(--page); color: var(--ink); }
+.history-locator { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; margin-bottom: 12px; }
+.history-locator label { flex: 1 1 180px; min-width: 0; font-size: 10px; font-weight: 700; }
+.history-locator input { display: block; box-sizing: border-box; width: 100%; margin-top: 7px; padding: 10px; border: 1px solid var(--line); background: var(--page); color: var(--ink); }
 .history-lookup-message { color: var(--muted); font-size: 11px; }
 .history-columns { display: grid; grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.6fr); gap: 18px; }
 .history-columns h3 { margin: 0 0 10px; font-size: 12px; }
