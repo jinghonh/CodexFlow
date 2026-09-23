@@ -278,6 +278,7 @@ pub enum FactOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum EvidenceField {
+    Text,
     Command,
     Output,
     ChangePath,
@@ -498,7 +499,94 @@ pub struct ProjectGraph {
     pub project: LocalProject,
     pub nodes: Vec<GraphNode>,
     pub relations: Vec<ObservedRelation>,
+    #[serde(default)]
+    pub derived_relations: Vec<DerivedRelation>,
     pub diagnostics: Vec<GraphDiagnostic>,
+}
+
+/// 规则只记录来源事实的交集或引用，不表达语义因果关系。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum DerivedRelationKind {
+    SharedFile,
+    SharedArtifact,
+    ExplicitReference,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateEvidence {
+    pub id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub field: EvidenceField,
+    pub change_index: Option<u32>,
+    pub excerpt: String,
+    pub content_version: String,
+    pub fact_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidencePair {
+    pub id: String,
+    pub left: CandidateEvidence,
+    pub right: CandidateEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceSample {
+    pub left_available: u64,
+    pub right_available: u64,
+    pub combinations_available: u64,
+    pub combinations_shown: u32,
+    pub left_sampled: u32,
+    pub right_sampled: u32,
+    pub sampling_rule: String,
+    pub pairs: Vec<EvidencePair>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateReason {
+    pub signal: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationCandidate {
+    pub id: String,
+    pub left_thread_id: String,
+    pub right_thread_id: String,
+    pub score: i32,
+    pub reasons: Vec<CandidateReason>,
+    pub evidence: EvidenceSample,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidatePreview {
+    pub project_id: String,
+    pub thread_count: u64,
+    pub neighbor_limit: u32,
+    pub candidate_count: u64,
+    pub candidates: Vec<RelationCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DerivedRelation {
+    pub id: String,
+    pub project_id: String,
+    pub from_thread_id: String,
+    pub to_thread_id: String,
+    pub kind: DerivedRelationKind,
+    pub source: String,
+    pub basis: String,
+    pub evidence: Vec<CandidateEvidence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

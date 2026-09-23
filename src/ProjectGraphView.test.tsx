@@ -88,3 +88,25 @@ test("布局器失败时仍显示全部结构关系", async () => {
   expect(edge.dataset.target).toBe("first");
   expect(screen.getByText("自动布局未完成，已按固定顺序展示全部会话和关系。")).toBeTruthy();
 });
+
+test("规则关系显示灰色事实依据和来源定位", async () => {
+  vi.mocked(invoke).mockResolvedValue({
+    project: { id: "project", name: "示例项目" },
+    nodes: [{ id: "thread-a", title: "甲", referenceOnly: false }, { id: "thread-b", title: "乙", referenceOnly: false }],
+    relations: [],
+    derivedRelations: [{ id: "derived", projectId: "project", fromThreadId: "thread-a", toThreadId: "thread-b",
+      kind: "SHARED_FILE", source: "derived", basis: "双方来源条目记录同一文件：src/lib.rs",
+      evidence: [{ id: "proof", threadId: "thread-a", turnId: "turn-1", itemId: "item-1", excerpt: "src/lib.rs", contentVersion: "version-1" }] }],
+    diagnostics: [],
+  });
+  const onSelectEvidence = vi.fn();
+  render(<ProjectGraphView projectId="project" refreshVersion={0} onSelectEvidence={onSelectEvidence} />);
+  const edge = await screen.findByRole("button", { name: "规则 · 共同文件" });
+  expect(edge.dataset.dashed).toBe("true");
+  fireEvent.click(edge);
+  expect(screen.getByRole("heading", { name: "规则关系 · 共同文件" })).toBeTruthy();
+  expect(screen.getByText("双方来源条目记录同一文件：src/lib.rs")).toBeTruthy();
+  expect(screen.getByText(/不是模型判断或概率/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "定位来源条目" }));
+  expect(onSelectEvidence).toHaveBeenCalledWith(expect.objectContaining({ turnId: "turn-1", itemId: "item-1" }));
+});

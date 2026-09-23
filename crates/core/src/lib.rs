@@ -1,14 +1,15 @@
+mod candidates;
 mod facts;
 mod projects;
 mod relations;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
 use codexflow_domain::{
-    build_project_timeline, AppError, ConnectionState, DisplayTheme, ErrorCode, EvidenceCheck,
-    EvidenceField, EvidencePage, EvidenceState, FactPage, HistoryCoverage, HistoryItemLocation,
-    HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig, JevConnectionResult,
-    JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph, ProjectSessions,
-    ProjectTimeline, SessionList, SourceEvidence, SourceStatus,
+    build_project_timeline, AppError, CandidatePreview, ConnectionState, DisplayTheme, ErrorCode,
+    EvidenceCheck, EvidenceField, EvidencePage, EvidenceState, FactPage, HistoryCoverage,
+    HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig,
+    JevConnectionResult, JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph,
+    ProjectSessions, ProjectTimeline, SessionList, SourceEvidence, SourceStatus,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -456,6 +457,7 @@ impl SourceService {
             );
         }
         let source = match evidence.field {
+            EvidenceField::Text => item.text.as_deref(),
             EvidenceField::Command => item.command.as_deref(),
             EvidenceField::Output => item.output.as_deref(),
             EvidenceField::ChangePath => evidence
@@ -562,7 +564,29 @@ impl SourceService {
     pub fn project_graph(&self, project_id: &str) -> Result<ProjectGraph, AppError> {
         let sessions = self.sessions.project_sessions(project_id)?;
         let relations = self.sessions.observed_relations(project_id)?;
-        Ok(relations::project_graph(sessions, relations))
+        let (_, derived) = self.automatic_candidates(&sessions)?;
+        let mut graph = relations::project_graph(sessions, relations);
+        graph.derived_relations = derived;
+        Ok(graph)
+    }
+
+    fn automatic_candidates(
+        &self,
+        sessions: &ProjectSessions,
+    ) -> Result<(CandidatePreview, Vec<codexflow_domain::DerivedRelation>), AppError> {
+        for item in &sessions.threads {
+            self.ensure_facts(&item.thread.id)?;
+        }
+        let material = self.sessions.project_material(&sessions.project.id)?;
+        let result = candidates::build(sessions, material);
+        self.sessions
+            .replace_automatic_candidates(&result.0, &result.1)?;
+        Ok(result)
+    }
+
+    pub fn candidate_preview(&self, project_id: &str) -> Result<CandidatePreview, AppError> {
+        let sessions = self.project_sessions(project_id)?;
+        Ok(self.automatic_candidates(&sessions)?.0)
     }
 
     pub fn choose_project(&self, path: &str) -> Result<ProjectCatalog, AppError> {
