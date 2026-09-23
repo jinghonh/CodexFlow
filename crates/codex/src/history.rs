@@ -45,8 +45,17 @@ fn status(value: &Value) -> String {
         .to_owned()
 }
 
-fn seconds_to_ms(value: Option<i64>) -> Option<i64> {
-    value.and_then(|seconds| seconds.checked_mul(1000))
+fn seconds_to_ms(value: Option<&Value>, field: &str, errors: &mut Vec<String>) -> Option<i64> {
+    match value {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_i64().and_then(|seconds| seconds.checked_mul(1000)) {
+            Some(ms) => Some(ms),
+            None => {
+                errors.push(format!("{field} 不是有效的 Unix 秒"));
+                None
+            }
+        },
+    }
 }
 
 fn parse_turn(
@@ -61,12 +70,24 @@ fn parse_turn(
         .filter(|id| !id.is_empty())
         .ok_or("回合缺少稳定标识。")?;
     let state = status(value.get("status").unwrap_or(&Value::Null));
-    let started_at_unix_ms = seconds_to_ms(value.get("startedAt").and_then(Value::as_i64));
-    let completed_at_unix_ms = seconds_to_ms(value.get("completedAt").and_then(Value::as_i64));
-    let duration_ms = value.get("durationMs").and_then(Value::as_i64);
+    let mut time_errors = Vec::new();
+    let started_at_unix_ms = seconds_to_ms(value.get("startedAt"), "开始时间", &mut time_errors);
+    let completed_at_unix_ms =
+        seconds_to_ms(value.get("completedAt"), "结束时间", &mut time_errors);
+    let duration_ms = match value.get("durationMs") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_i64() {
+            Some(duration) => Some(duration),
+            None => {
+                time_errors.push("时长不是有效的毫秒数".into());
+                None
+            }
+        },
+    };
+    let time_error = (!time_errors.is_empty()).then(|| time_errors.join("；"));
     let content_version = version(
         &json!({"id":id,"status":state,"startedAt":started_at_unix_ms,
-        "completedAt":completed_at_unix_ms,"durationMs":duration_ms}),
+        "completedAt":completed_at_unix_ms,"durationMs":duration_ms,"timeError":time_error}),
     );
     Ok(HistoryTurn {
         thread_id: thread_id.into(),
@@ -76,6 +97,7 @@ fn parse_turn(
         started_at_unix_ms,
         completed_at_unix_ms,
         duration_ms,
+        time_error,
         source_updated_at,
         content_version,
     })
@@ -477,5 +499,45 @@ mod tests {
         .unwrap();
         assert!(plan.command.is_none());
         assert!(plan.changes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod timeline_time_tests {
+    use super::*;
+
+    #[test]
+    fn unix_seconds_and_millisecond_duration_remain_distinct() {
+        let turn = parse_turn(
+            &json!({"id":"turn","status":"completed","startedAt":1_700_000_000,
+            "completedAt":1_700_000_002,"durationMs":1_750}),
+            "thread",
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(turn.started_at_unix_ms, Some(1_700_000_000_000));
+        assert_eq!(turn.completed_at_unix_ms, Some(1_700_000_002_000));
+        assert_eq!(turn.duration_ms, Some(1_750));
+        assert!(turn.time_error.is_none());
+    }
+
+    #[test]
+    fn malformed_or_overflowing_source_time_is_visible_as_invalid() {
+        let turn = parse_turn(
+            &json!({"id":"turn","status":"completed","startedAt":"yesterday",
+            "completedAt":i64::MAX,"durationMs":2.5}),
+            "thread",
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(turn.started_at_unix_ms, None);
+        assert_eq!(turn.completed_at_unix_ms, None);
+        assert_eq!(turn.duration_ms, None);
+        let error = turn.time_error.unwrap();
+        assert!(error.contains("开始时间"));
+        assert!(error.contains("结束时间"));
+        assert!(error.contains("时长"));
     }
 }

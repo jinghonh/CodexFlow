@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+mod timeline;
+pub use timeline::{
+    build_project_timeline, LastActivityBasis, ProjectTimeline, TimelineQuality, TimelineThread,
+    TimelineTurn, TurnTimeState,
+};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppError {
@@ -165,6 +171,8 @@ pub struct HistoryTurn {
     pub started_at_unix_ms: Option<i64>,
     pub completed_at_unix_ms: Option<i64>,
     pub duration_ms: Option<i64>,
+    #[serde(default)]
+    pub time_error: Option<String>,
     pub source_updated_at: i64,
     pub content_version: String,
 }

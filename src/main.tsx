@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ProjectGraphView } from "./ProjectGraphView";
+import { ProjectTimelineView } from "./ProjectTimelineView";
 import { ThreadHistoryView } from "./ThreadHistoryView";
 import "./style.css";
 
@@ -76,6 +77,7 @@ function App() {
   const [projectCatalog, setProjectCatalog] = useState<ProjectCatalog | null>(null);
   const [projectSessions, setProjectSessions] = useState<ProjectSessions | null>(null);
   const [graphVersion, setGraphVersion] = useState(0);
+  const [timelineVersion, setTimelineVersion] = useState(0);
   const [projectPath, setProjectPath] = useState("");
   const [projectError, setProjectError] = useState("");
   const [showUnassigned, setShowUnassigned] = useState(false);
@@ -435,7 +437,8 @@ function App() {
           <label className="session-search">查找会话<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="标题、预览、Thread ID 或工作目录" /></label>
           <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{query ? "没有匹配的会话。" : refreshing ? "正在刷新；缓存中暂无会话。" : !connected && attempted ? "来源当前不可用；缓存中暂无会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : visibleThreads.map(({ thread, attribution }) => <article className="thread-row" key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><button className="browse-button history-open" onClick={() => setSelectedThreadId(thread.id)} aria-label={`查看会话 ${thread.id} 的历史`}>查看回合与条目</button><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.missingFromSource && <span className="thread-warning">完整列表中未再次出现</span>}{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>元数据 / 回合 / 条目</span><code>{thread.metadataComplete ? "完整" : "不完整"} / {thread.turnsComplete ? "完整" : "待采集"} / {thread.itemsComplete ? "完整" : "待采集"}</code></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
         </section>
-        {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} />}
+        {!showUnassigned && projectSessions && <ProjectTimelineView key={projectSessions.project.id} projectId={projectSessions.project.id} refreshVersion={`${graphVersion}-${timelineVersion}`} connected={connected} onSelectThread={setSelectedThreadId} />}
+        {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} onHistoryLoaded={() => setTimelineVersion((value) => value + 1)} />}
         {!showUnassigned && projectSessions && <ProjectGraphView projectId={projectSessions.project.id} refreshVersion={graphVersion} />}
         <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。Jev 连接检查不运行推理；只有点击“测试固定合成推理”才会发起该次模型调用。</p>
       </div>

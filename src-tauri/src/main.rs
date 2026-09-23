@@ -2,8 +2,8 @@ use codexflow_core::SourceService;
 use codexflow_domain::{
     AppError, DisplayTheme, EvidenceCheck, EvidencePage, FactPage, HistoryCoverage,
     HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, JevConnectionResult,
-    JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph, ProjectSessions, SessionList,
-    SourceStatus,
+    JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph, ProjectSessions, ProjectTimeline,
+    SessionList, SourceStatus,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -216,6 +216,14 @@ fn get_project_graph(
 }
 
 #[tauri::command]
+fn get_project_timeline(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectTimeline, AppError> {
+    service(&state)?.project_timeline(&project_id)
+}
+
+#[tauri::command]
 fn choose_project(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -268,6 +276,7 @@ fn main() {
             get_project_catalog,
             get_project_sessions,
             get_project_graph,
+            get_project_timeline,
             choose_project,
             choose_existing_project
         ])

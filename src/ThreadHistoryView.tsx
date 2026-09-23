@@ -115,8 +115,8 @@ function SourceFactsView({ threadId, updatedAt, coverage, revision, onLocate }: 
   </div>;
 }
 
-export function ThreadHistoryView({ threadId, updatedAt, connected }: {
-  threadId: string; updatedAt: number; connected: boolean;
+export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoaded }: {
+  threadId: string; updatedAt: number; connected: boolean; onHistoryLoaded?: () => void;
 }) {
   const [turns, setTurns] = useState<TurnPage | null>(null);
   const [items, setItems] = useState<ItemPage | null>(null);
@@ -157,6 +157,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected }: {
             setTurns(page);
             setSelectedTurnId(page.turns[0]?.id ?? null);
             setRevision((value) => value + 1);
+            onHistoryLoaded?.();
           }
         }
       } catch (caught) { if (active) setError(errorText(caught)); }
@@ -195,6 +196,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected }: {
       setTurns(page);
       setSelectedTurnId((previous) => page.turns.some((turn) => turn.id === previous) ? previous : page.turns[0]?.id ?? null);
       setRevision((value) => value + 1);
+      onHistoryLoaded?.();
     } catch (caught) { setError(errorText(caught)); }
     finally { setLoading(false); }
   }
