@@ -1,6 +1,7 @@
 use codexflow_domain::{
     AppError, AttributedThread, IndexRun, IndexRunState, ListScopeStatus, LocalProject,
-    Preferences, ProjectCatalog, ProjectSessions, SessionList, ThreadAttribution, ThreadMetadata,
+    ObservedRelation, Preferences, ProjectCatalog, ProjectSessions, SessionList, ThreadAttribution,
+    ThreadMetadata,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
@@ -67,7 +68,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 3 {
+        if version > 4 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -127,21 +128,52 @@ impl SessionStore {
         if version < 3 {
             let transaction = connection
                 .transaction()
-                .map_err(|_| AppError::migration("开始索引运行数据库迁移失败。"))?;
+                .map_err(|_| AppError::migration("开始索引运行与观察关系数据库迁移失败。"))?;
             transaction
                 .execute_batch(
-                    "CREATE TABLE index_runs (
+                    "CREATE TABLE IF NOT EXISTS index_runs (
                     id TEXT PRIMARY KEY NOT NULL,
                     run_json TEXT NOT NULL,
                     started_at INTEGER NOT NULL
                 );
-                CREATE INDEX index_runs_started ON index_runs(started_at DESC);
+                CREATE INDEX IF NOT EXISTS index_runs_started ON index_runs(started_at DESC);
+                CREATE TABLE IF NOT EXISTS observed_relations (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_id TEXT NOT NULL,
+                    relation_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS observed_relations_project ON observed_relations(project_id);
                 PRAGMA user_version = 3;",
                 )
-                .map_err(|_| AppError::migration("迁移索引运行数据库失败，原数据已保留。"))?;
+                .map_err(|_| AppError::migration("迁移索引运行与观察关系数据库失败，原数据已保留。"))?;
+            transaction.commit().map_err(|_| {
+                AppError::migration("提交索引运行与观察关系数据库迁移失败，原数据已保留。")
+            })?;
+        }
+        if version < 4 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始合并数据库结构迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS index_runs (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        run_json TEXT NOT NULL,
+                        started_at INTEGER NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS index_runs_started ON index_runs(started_at DESC);
+                    CREATE TABLE IF NOT EXISTS observed_relations (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        project_id TEXT NOT NULL,
+                        relation_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS observed_relations_project ON observed_relations(project_id);
+                    PRAGMA user_version = 4;",
+                )
+                .map_err(|_| AppError::migration("合并数据库结构迁移失败，原数据已保留。"))?;
             transaction
                 .commit()
-                .map_err(|_| AppError::migration("提交索引运行数据库迁移失败，原数据已保留。"))?;
+                .map_err(|_| AppError::migration("提交合并数据库结构迁移失败，原数据已保留。"))?;
         }
         store.recover_interrupted_runs()?;
         Ok(store)
@@ -453,6 +485,7 @@ impl SessionStore {
         &self,
         projects: &[LocalProject],
         attributions: &[ThreadAttribution],
+        relations: Option<&[ObservedRelation]>,
     ) -> Result<(), AppError> {
         let mut connection = self.connection()?;
         let transaction = connection
@@ -478,9 +511,39 @@ impl SessionStore {
                 params![attribution.thread_id, attribution.project_id, json],
             ).map_err(|_| AppError::store("保存归属依据失败。"))?;
         }
+        if let Some(relations) = relations {
+            transaction
+                .execute("DELETE FROM observed_relations", [])
+                .map_err(|_| AppError::store("更新观察关系失败，旧数据已保留。"))?;
+            for relation in relations {
+                let json = serde_json::to_string(relation)
+                    .map_err(|_| AppError::store("序列化观察关系失败。"))?;
+                transaction
+                    .execute(
+                        "INSERT INTO observed_relations (id, project_id, relation_json) VALUES (?1, ?2, ?3)",
+                        params![relation.id, relation.project_id, json],
+                    )
+                    .map_err(|_| AppError::store("保存观察关系失败，旧数据已保留。"))?;
+            }
+        }
         transaction
             .commit()
             .map_err(|_| AppError::store("提交项目归属失败，旧数据已保留。"))
+    }
+
+    pub fn observed_relations(&self, project_id: &str) -> Result<Vec<ObservedRelation>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT relation_json FROM observed_relations WHERE project_id=?1 ORDER BY id")
+            .map_err(|_| AppError::store("读取观察关系失败。"))?;
+        let rows = query
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询观察关系失败。"))?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| AppError::store("读取观察关系失败。"))?)
+                .map_err(|_| AppError::store("观察关系缓存内容损坏。"))
+        })
+        .collect()
     }
 
     pub fn selection(&self) -> Result<(Option<String>, Vec<String>), AppError> {
@@ -738,7 +801,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 4;")
+            .execute_batch("PRAGMA user_version = 5;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -749,7 +812,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -841,6 +904,7 @@ mod tests {
             .save_projects_and_attributions(
                 &[project.clone(), other_project.clone()],
                 &[attribution],
+                None,
             )
             .unwrap();
         store.select_project(&project.id).unwrap();
@@ -885,7 +949,7 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-        SessionStore::new(dir.clone()).unwrap();
+        let store = SessionStore::new(dir.clone()).unwrap();
         let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
         let (version, count): (i64, i64) = (
             connection
@@ -895,8 +959,153 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (3, 1));
+        assert_eq!((version, count), (4, 1));
+        assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_two_project_cache_gains_observed_relations_without_losing_projects() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-relations-migration-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+        connection.execute_batch(
+            r#"CREATE TABLE threads (id TEXT PRIMARY KEY NOT NULL, metadata_json TEXT NOT NULL, updated_at INTEGER NOT NULL);
+             CREATE TABLE list_scopes (archived INTEGER PRIMARY KEY NOT NULL, complete INTEGER NOT NULL,
+                attempted_at_unix_ms INTEGER, completed_at_unix_ms INTEGER, error TEXT);
+             CREATE TABLE projects (id TEXT PRIMARY KEY NOT NULL, project_json TEXT NOT NULL);
+             CREATE TABLE thread_attributions (thread_id TEXT PRIMARY KEY NOT NULL, project_id TEXT, attribution_json TEXT NOT NULL);
+             CREATE TABLE project_selection (id INTEGER PRIMARY KEY CHECK (id = 1), selected_project_id TEXT, recent_json TEXT NOT NULL);
+             INSERT INTO project_selection (id, selected_project_id, recent_json) VALUES (1, NULL, '[]');
+             INSERT INTO projects (id, project_json) VALUES ('existing', '{"id":"existing","name":"现有项目","root":"/tmp/existing","gitCommonDir":null}');
+             PRAGMA user_version = 2;"#,
+        ).unwrap();
+        drop(connection);
+        let store = SessionStore::new(dir.clone()).unwrap();
+        assert_eq!(store.projects().unwrap().len(), 1);
+        assert!(store.observed_relations("existing").unwrap().is_empty());
+        let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        assert!(store.latest_index_run().unwrap().is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn either_version_three_schema_migrates_without_losing_existing_data() {
+        use codexflow_domain::{ObservedRelationKind, ParentEndpoint};
+
+        for has_relations in [false, true] {
+            let dir = std::env::temp_dir().join(format!(
+                "codexflow-v3-schema-{}-{}-{has_relations}",
+                std::process::id(),
+                now_ms()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE threads (id TEXT PRIMARY KEY NOT NULL, metadata_json TEXT NOT NULL, updated_at INTEGER NOT NULL);
+                     CREATE TABLE list_scopes (archived INTEGER PRIMARY KEY NOT NULL, complete INTEGER NOT NULL,
+                         attempted_at_unix_ms INTEGER, completed_at_unix_ms INTEGER, error TEXT);
+                     CREATE TABLE projects (id TEXT PRIMARY KEY NOT NULL, project_json TEXT NOT NULL);
+                     CREATE TABLE thread_attributions (thread_id TEXT PRIMARY KEY NOT NULL, project_id TEXT, attribution_json TEXT NOT NULL);
+                     CREATE TABLE project_selection (id INTEGER PRIMARY KEY CHECK (id = 1), selected_project_id TEXT, recent_json TEXT NOT NULL);
+                     INSERT INTO project_selection (id, selected_project_id, recent_json) VALUES (1, NULL, '[]');",
+                )
+                .unwrap();
+            if has_relations {
+                let relation = ObservedRelation {
+                    id: "existing-relation".into(),
+                    project_id: "existing-project".into(),
+                    from_thread_id: "parent".into(),
+                    to_thread_id: "child".into(),
+                    kind: ObservedRelationKind::SubagentOf,
+                    source: "observed".into(),
+                    source_field: "parentThreadId".into(),
+                    confidence: 1.0,
+                    parent_endpoint: ParentEndpoint::InProject,
+                };
+                connection
+                    .execute_batch(
+                        "CREATE TABLE observed_relations (id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL, relation_json TEXT NOT NULL);
+                         CREATE INDEX observed_relations_project ON observed_relations(project_id);",
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO observed_relations (id, project_id, relation_json) VALUES (?1, ?2, ?3)",
+                        params![relation.id, relation.project_id, serde_json::to_string(&relation).unwrap()],
+                    )
+                    .unwrap();
+            } else {
+                let run = IndexRun {
+                    id: "existing-run".into(),
+                    project_id: Some("existing-project".into()),
+                    state: IndexRunState::Complete,
+                    started_at_unix_ms: 10,
+                    finished_at_unix_ms: Some(20),
+                    pages_saved: 1,
+                    threads_seen: 1,
+                    error: None,
+                    interrupted: false,
+                };
+                connection
+                    .execute_batch(
+                        "CREATE TABLE index_runs (id TEXT PRIMARY KEY NOT NULL, run_json TEXT NOT NULL, started_at INTEGER NOT NULL);
+                         CREATE INDEX index_runs_started ON index_runs(started_at DESC);",
+                    )
+                    .unwrap();
+                connection
+                    .execute(
+                        "INSERT INTO index_runs (id, run_json, started_at) VALUES (?1, ?2, ?3)",
+                        params![
+                            run.id,
+                            serde_json::to_string(&run).unwrap(),
+                            run.started_at_unix_ms
+                        ],
+                    )
+                    .unwrap();
+            }
+            connection
+                .execute_batch("PRAGMA user_version = 3;")
+                .unwrap();
+            drop(connection);
+
+            let store = SessionStore::new(dir.clone()).unwrap();
+            assert_eq!(
+                store.observed_relations("existing-project").unwrap().len(),
+                usize::from(has_relations)
+            );
+            assert_eq!(
+                store
+                    .latest_index_run()
+                    .unwrap()
+                    .as_ref()
+                    .map(|run| run.id.as_str()),
+                (!has_relations).then_some("existing-run")
+            );
+            let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 4);
+            let tables: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 2);
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
