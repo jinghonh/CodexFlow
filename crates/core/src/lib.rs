@@ -18,6 +18,9 @@ use tokio_util::sync::CancellationToken;
 pub struct SourceService {
     store: PreferenceStore,
     sessions: SessionStore,
+    // Source I/O may hold state for a full refresh; settings must remain
+    // available to Jev requests, cancellation and credential deletion.
+    preferences: Mutex<Preferences>,
     state: Mutex<State>,
     credentials: Arc<dyn CredentialStore>,
     jev_gate: RwLock<()>,
@@ -25,7 +28,6 @@ pub struct SourceService {
 }
 
 struct State {
-    preferences: Preferences,
     status: SourceStatus,
     session: Option<Session>,
 }
@@ -46,8 +48,8 @@ impl SourceService {
         Ok(Self {
             store,
             sessions,
+            preferences: Mutex::new(preferences),
             state: Mutex::new(State {
-                preferences,
                 status,
                 session: None,
             }),
@@ -58,7 +60,7 @@ impl SourceService {
     }
 
     pub async fn jev_status(&self) -> Result<JevStatus, AppError> {
-        let config = self.state.lock().await.preferences.jev.clone();
+        let config = self.preferences.lock().await.jev.clone();
         let (credential_configured, credential_error) = match self.credentials.load() {
             Ok(credential) => (
                 credential
@@ -101,8 +103,8 @@ impl SourceService {
             ));
         }
         let _gate = self.stop_jev().await;
-        let mut state = self.state.lock().await;
-        if state.preferences.jev.base_url != base_url && api_key.is_none() {
+        let mut preferences = self.preferences.lock().await;
+        if preferences.jev.base_url != base_url && api_key.is_none() {
             return Err(AppError::jev(
                 ErrorCode::JevNotConfigured,
                 "更换服务地址时请填写新 API Key；删除旧密钥需单独操作。",
@@ -115,14 +117,14 @@ impl SourceService {
                 key: key.trim().to_owned(),
             })?;
         }
-        let mut next = state.preferences.clone();
+        let mut next = preferences.clone();
         next.jev = JevConfig {
             base_url: base_url.clone(),
             model,
         };
         self.store.save(&next)?;
-        state.preferences = next;
-        drop(state);
+        *preferences = next;
+        drop(preferences);
         self.jev_status().await
     }
 
@@ -145,30 +147,32 @@ impl SourceService {
 
     pub async fn check_jev_connection(&self) -> Result<JevConnectionResult, AppError> {
         let _gate = self.jev_gate.read().await;
-        let (credential, model) = self.jev_request_settings().await?;
         let token = self.jev_cancel.lock().await.clone();
-        let client = JevClient::new()?;
         tokio::select! {
             biased;
             _ = token.cancelled() => Err(jev_cancelled()),
-            result = client.check_connection(&credential, &model) => result,
+            result = async {
+                let (credential, model) = self.jev_request_settings().await?;
+                JevClient::new()?.check_connection(&credential, &model).await
+            } => result,
         }
     }
 
     pub async fn test_jev_inference(&self) -> Result<JevInferenceResult, AppError> {
         let _gate = self.jev_gate.read().await;
-        let (credential, model) = self.jev_request_settings().await?;
         let token = self.jev_cancel.lock().await.clone();
-        let client = JevClient::new()?;
         tokio::select! {
             biased;
             _ = token.cancelled() => Err(jev_cancelled()),
-            result = client.test_inference(&credential, &model) => result,
+            result = async {
+                let (credential, model) = self.jev_request_settings().await?;
+                JevClient::new()?.test_inference(&credential, &model).await
+            } => result,
         }
     }
 
     async fn jev_request_settings(&self) -> Result<(Credential, String), AppError> {
-        let config = self.state.lock().await.preferences.jev.clone();
+        let config = self.preferences.lock().await.jev.clone();
         let credential = self
             .credentials
             .load()?
@@ -186,7 +190,10 @@ impl SourceService {
     pub async fn settings(&self) -> (DisplayTheme, SourceStatus) {
         let mut state = self.state.lock().await;
         check_process(&mut state);
-        (state.preferences.theme.clone(), state.status.clone())
+        (
+            self.preferences.lock().await.theme.clone(),
+            state.status.clone(),
+        )
     }
 
     pub async fn status(&self) -> SourceStatus {
@@ -196,15 +203,15 @@ impl SourceService {
     }
 
     pub async fn set_theme(&self, theme: DisplayTheme) -> Result<DisplayTheme, AppError> {
-        let mut state = self.state.lock().await;
+        let mut preferences = self.preferences.lock().await;
         let next = Preferences {
-            selected_binary: state.preferences.selected_binary.clone(),
+            selected_binary: preferences.selected_binary.clone(),
             theme,
-            jev: state.preferences.jev.clone(),
+            jev: preferences.jev.clone(),
         };
         self.store.save(&next)?;
-        state.preferences = next;
-        Ok(state.preferences.theme.clone())
+        *preferences = next;
+        Ok(preferences.theme.clone())
     }
 
     pub async fn connect(&self, selected_binary: Option<String>) -> Result<SourceStatus, AppError> {
@@ -212,13 +219,16 @@ impl SourceService {
         let choice = selected_binary
             .map(|path| path.trim().to_owned())
             .filter(|path| !path.is_empty());
-        let next = Preferences {
-            selected_binary: choice.clone(),
-            theme: state.preferences.theme.clone(),
-            jev: state.preferences.jev.clone(),
-        };
-        self.store.save(&next)?;
-        state.preferences = next;
+        {
+            let mut preferences = self.preferences.lock().await;
+            let next = Preferences {
+                selected_binary: choice.clone(),
+                theme: preferences.theme.clone(),
+                jev: preferences.jev.clone(),
+            };
+            self.store.save(&next)?;
+            *preferences = next;
+        }
         if let Some(mut previous) = state.session.take() {
             previous.close().await;
         }
@@ -494,6 +504,139 @@ mod tests {
             status.credential_error.unwrap().code,
             ErrorCode::JevCredentialFailed
         ));
+    }
+
+    async fn stop_jev_during_refresh(inference: bool, delete: bool) {
+        use std::{future::Future, net::TcpListener, task::Poll, time::Duration};
+        use tokio::time::{sleep, timeout};
+
+        let dir = temp_data_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("fake-gated-list-rich.py");
+        fs::write(
+            &binary,
+            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        // Keep HTTP pending without relying on an external service or response timing.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let service =
+            Arc::new(SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap());
+        service
+            .save_jev(
+                format!("http://{}", listener.local_addr().unwrap()),
+                "jev-latest".into(),
+                Some("synthetic-only-key".into()),
+            )
+            .await
+            .unwrap();
+        let source = service
+            .connect(Some(binary.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        assert!(matches!(source.connection, ConnectionState::Connected));
+        assert_eq!(service.refresh_sessions().await.unwrap().threads.len(), 4);
+        let pause = dir.join("pause-refresh");
+        fs::write(&pause, b"").unwrap();
+        let refresh = {
+            let service = service.clone();
+            tokio::spawn(async move { service.refresh_sessions().await })
+        };
+        timeout(Duration::from_secs(2), async {
+            while !dir.join("refresh-paused").exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("source must acknowledge the paused refresh");
+        assert_eq!(service.cached_sessions().unwrap().threads.len(), 4);
+
+        let stopped = {
+            let request = async {
+                if inference {
+                    service.test_jev_inference().await.map(|_| ())
+                } else {
+                    service.check_jev_connection().await.map(|_| ())
+                }
+            };
+            tokio::pin!(request);
+            // Poll the public entry point before stopping it: spawning alone would
+            // allow cancellation to win before the request had actually started.
+            std::future::poll_fn(|cx| {
+                assert!(request.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            timeout(Duration::from_secs(2), async {
+                tokio::join!(request, async {
+                    if delete {
+                        let status = service.delete_jev_credential().await.unwrap();
+                        assert!(!status.credential_configured);
+                    } else {
+                        service.cancel_jev().await;
+                    }
+                })
+            })
+            .await
+        };
+        let credential_remains = credentials.load().unwrap().is_some();
+        if stopped.is_ok() && delete {
+            let result = timeout(Duration::from_secs(2), async {
+                if inference {
+                    service.test_jev_inference().await.map(|_| ())
+                } else {
+                    service.check_jev_connection().await.map(|_| ())
+                }
+            })
+            .await
+            .expect("deleted credentials must reject new requests during refresh");
+            assert!(matches!(
+                result.unwrap_err().code,
+                ErrorCode::JevNotConfigured
+            ));
+        }
+        assert!(
+            !refresh.is_finished(),
+            "stop must finish before refresh resumes"
+        );
+
+        // Release and reap the source even when the regression assertion fails.
+        fs::remove_file(pause).unwrap();
+        let refreshed = timeout(Duration::from_secs(2), refresh)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(refreshed.threads.len(), 4);
+        assert!(refreshed.scopes.iter().all(|scope| scope.complete));
+        service.shutdown().await;
+        fs::remove_dir_all(dir).unwrap();
+
+        let (result, ()) = stopped.expect("Jev stop must finish while refresh is paused");
+        assert!(matches!(result.unwrap_err().code, ErrorCode::JevCancelled));
+        assert_eq!(credential_remains, !delete);
+    }
+
+    #[tokio::test]
+    async fn cancel_connection_during_paused_refresh() {
+        stop_jev_during_refresh(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn cancel_inference_during_paused_refresh() {
+        stop_jev_during_refresh(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn delete_credential_with_connection_during_paused_refresh() {
+        stop_jev_during_refresh(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn delete_credential_with_inference_during_paused_refresh() {
+        stop_jev_during_refresh(true, true).await;
     }
 
     #[tokio::test]
