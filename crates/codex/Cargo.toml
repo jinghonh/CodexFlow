@@ -7,5 +7,6 @@ edition.workspace = true
 codexflow-domain = { path = "../domain" }
 libc = "0.2"
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["process", "io-util", "time", "macros", "rt"] }
 tokio-util = { version = "0.7", features = ["rt"] }

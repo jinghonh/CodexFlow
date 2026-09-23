@@ -1,3 +1,5 @@
+mod history;
+
 use codexflow_domain::{
     AppError, Capability, ErrorCode, GitMetadata, ListScopeStatus, SourceCapabilities,
     ThreadMetadata,
@@ -484,6 +486,74 @@ mod tests {
             diagnosis.capabilities.codex_summary
         );
         let mut session = diagnosis.session;
+        session.close().await;
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn paginated_history_uses_item_entries_and_preserves_unknown_identity() {
+        let path = fake_binary("history-paged");
+        let mut session = Session::start(&path).await.unwrap();
+        session.initialize(true).await.unwrap();
+        let history = session.collect_history("thread-h", 200, 300_000).await;
+        assert!(history.coverage.turns_complete && history.coverage.items_complete);
+        assert_eq!(
+            history.coverage.path,
+            codexflow_domain::HistoryReadPath::Paginated
+        );
+        assert_eq!(
+            (history.coverage.turn_pages, history.coverage.item_pages),
+            (2, 2)
+        );
+        assert_eq!(history.turns.len(), 2);
+        assert_eq!(history.items.len(), 2);
+        assert_eq!(history.items[0].turn_id, "turn-1");
+        assert_eq!(history.items[0].text.as_deref(), Some("完整正文 item-1"));
+        assert_eq!(history.items[1].turn_id, "turn-2");
+        assert_eq!(history.items[1].id, "unknown-2");
+        assert!(!history.items[1].supported);
+        assert!(history.items.iter().all(|item| item.id != "summary-only"));
+        session.close().await;
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn legacy_full_read_and_summary_only_history_are_distinguished() {
+        for (mode, complete) in [("history-legacy", true), ("history-summary", false)] {
+            let path = fake_binary(mode);
+            let mut session = Session::start(&path).await.unwrap();
+            session.initialize(true).await.unwrap();
+            let history = session.collect_history("thread-h", 200, 300_000).await;
+            assert_eq!(history.coverage.items_complete, complete);
+            assert_eq!(history.items.len(), if complete { 2 } else { 0 });
+            if complete {
+                assert_eq!(
+                    history.coverage.path,
+                    codexflow_domain::HistoryReadPath::FullRead
+                );
+            } else {
+                assert!(history.coverage.error.is_some());
+            }
+            session.close().await;
+            let _ = fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_item_page_keeps_partial_content_and_next_thread_readable() {
+        let path = fake_binary("history-partial");
+        let mut session = Session::start(&path).await.unwrap();
+        session.initialize(true).await.unwrap();
+        let partial = session.collect_history("thread-h", 200, 300_000).await;
+        assert!(partial.coverage.turns_complete);
+        assert!(!partial.coverage.items_complete);
+        assert_eq!(partial.items.len(), 1);
+        assert_eq!(partial.coverage.loaded_items, 1);
+        let failed = session.collect_history("thread-bad", 200, 300_001).await;
+        assert!(failed.coverage.error.is_some());
+        assert!(failed.items.is_empty());
+        let again = session.collect_history("thread-h", 200, 300_002).await;
+        assert_eq!(again.items.len(), 1);
         session.close().await;
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

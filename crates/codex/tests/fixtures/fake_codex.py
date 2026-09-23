@@ -51,6 +51,13 @@ def thread(thread_id, source, archived=False):
         "turns": [],
     }
 
+def history_turn(turn_id, items=None, view="full"):
+    return {"id": turn_id, "status": "completed", "startedAt": 100, "completedAt": 102,
+            "durationMs": 2000, "itemsView": view, "items": items or []}
+
+def history_item(item_id, kind="agentMessage"):
+    return {"id": item_id, "type": kind, "text": "完整正文 " + item_id}
+
 for line in sys.stdin:
     request = json.loads(line)
     method = request["method"]
@@ -122,6 +129,48 @@ for line in sys.stdin:
             response = {"id": request["id"], "result": {"data": data, "nextCursor": next_cursor}}
         else:
             response = {"id": request["id"], "result": {"data": [], "nextCursor": None}}
+    elif mode.startswith("fake-history-") and method in ("thread/read", "thread/turns/list", "thread/items/list") and request["params"]["threadId"] != "00000000-0000-4000-8000-000000000000":
+        params = request["params"]
+        thread_id = params["threadId"]
+        if method == "thread/read" and params.get("includeTurns") is False:
+            response = {"id": request["id"], "result": {"thread": thread(thread_id, "cli")}}
+        elif thread_id == "thread-bad" or mode.endswith("both-fail"):
+            response = {"id": request["id"], "error": {"code": -32601, "message": "not supported yet"}}
+        elif method == "thread/turns/list":
+            if mode.endswith(("legacy", "summary")):
+                response = {"id": request["id"], "error": {"code": -32601, "message": "not supported yet"}}
+            else:
+                assert params["itemsView"] == "notLoaded"
+                assert params["sortDirection"] == "asc"
+                assert params.get("cursor") in (None, "opaque-turn-2")
+                turn_id = "turn-1" if not params.get("cursor") else "turn-2"
+                response = {"id": request["id"], "result": {"data": [history_turn(turn_id, [history_item("summary-only")], "summary")],
+                    "nextCursor": "opaque-turn-2" if turn_id == "turn-1" else None}}
+        elif method == "thread/items/list":
+            if mode.endswith("legacy"):
+                response = {"id": request["id"], "error": {"code": -32601, "message": "not supported yet"}}
+            elif mode.endswith("partial") and params.get("cursor") == "opaque-item-2":
+                response = {"id": request["id"], "error": {"code": -32000, "message": "page failed"}}
+            else:
+                assert params["sortDirection"] == "asc"
+                assert params.get("cursor") in (None, "opaque-item-2")
+                if params.get("cursor"):
+                    data = [{"turnId": "turn-2", "item": {"id": "unknown-2", "type": "futureWidget", "payload": "opaque"}}]
+                else:
+                    data = [{"turnId": "turn-1", "item": history_item("item-1")}]
+                response = {"id": request["id"], "result": {"data": data,
+                    "nextCursor": "opaque-item-2" if not params.get("cursor") else None}}
+        elif mode.endswith("partial"):
+            response = {"id": request["id"], "error": {"code": -32000, "message": "read failed"}}
+        else:
+            legacy = thread(thread_id, "cli")
+            if mode.endswith("summary"):
+                legacy["turns"] = [history_turn("turn-1", [history_item("summary-only")], "summary")]
+            else:
+                legacy["turns"] = [history_turn("turn-1", [history_item("item-1")]),
+                                   history_turn("turn-2", [history_item("item-2")])]
+            assert params["includeTurns"] is True
+            response = {"id": request["id"], "result": {"thread": legacy}}
     elif method in ("thread/read", "thread/turns/list", "thread/items/list"):
         thread_id = request["params"]["threadId"]
         if thread_id == "thread-b":

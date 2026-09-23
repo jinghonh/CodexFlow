@@ -1,5 +1,6 @@
 use codexflow_domain::{
-    AppError, AttributedThread, IndexRun, IndexRunState, ListScopeStatus, LocalProject,
+    AppError, AttributedThread, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
+    HistorySnapshot, HistoryTurnPage, IndexRun, IndexRunState, ListScopeStatus, LocalProject,
     ObservedRelation, Preferences, ProjectCatalog, ProjectSessions, SessionList, ThreadAttribution,
     ThreadMetadata,
 };
@@ -49,6 +50,9 @@ fn merge_thread_metadata(previous: ThreadMetadata, incoming: ThreadMetadata) -> 
     merged.turns_complete = previous.turns_complete;
     merged.items_complete = previous.items_complete;
     merged.content_complete = previous.content_complete;
+    if merged.read_error.is_none() {
+        merged.read_error = previous.read_error.clone();
+    }
     merged.observed_at_unix_ms = previous.observed_at_unix_ms.max(merged.observed_at_unix_ms);
     merged.missing_from_source = false;
     if same_refresh {
@@ -68,7 +72,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 4 {
+        if version > 5 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -175,6 +179,40 @@ impl SessionStore {
                 .commit()
                 .map_err(|_| AppError::migration("提交合并数据库结构迁移失败，原数据已保留。"))?;
         }
+        if version < 5 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始历史数据库迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE history_coverage (
+                    thread_id TEXT PRIMARY KEY NOT NULL,
+                    coverage_json TEXT NOT NULL
+                );
+                CREATE TABLE history_turns (
+                    thread_id TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    turn_json TEXT NOT NULL,
+                    PRIMARY KEY (thread_id, id)
+                );
+                CREATE INDEX history_turn_order ON history_turns(thread_id, ordinal, id);
+                CREATE TABLE history_items (
+                    thread_id TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    item_json TEXT NOT NULL,
+                    PRIMARY KEY (thread_id, id)
+                );
+                CREATE INDEX history_item_order ON history_items(thread_id, turn_id, ordinal, id);
+                PRAGMA user_version = 5;",
+                )
+                .map_err(|_| AppError::migration("迁移历史数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交历史数据库迁移失败，原数据已保留。"))?;
+        }
         store.recover_interrupted_runs()?;
         Ok(store)
     }
@@ -182,6 +220,242 @@ impl SessionStore {
     fn connection(&self) -> Result<Connection, AppError> {
         Connection::open(&self.path)
             .map_err(|_| AppError::store("打开会话数据库失败，请检查应用数据目录。"))
+    }
+
+    pub fn thread(&self, thread_id: &str) -> Result<Option<ThreadMetadata>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT metadata_json FROM threads WHERE id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取会话元数据失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("会话元数据损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn save_history(&self, snapshot: &HistorySnapshot) -> Result<HistoryCoverage, AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始保存会话历史失败。"))?;
+        let mut coverage = snapshot.coverage.clone();
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT coverage_json FROM history_coverage WHERE thread_id=?1",
+                [&coverage.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取已有历史覆盖范围失败。"))?;
+        if let Some(previous) = previous {
+            let previous: HistoryCoverage = serde_json::from_str(&previous)
+                .map_err(|_| AppError::store("已有历史覆盖范围损坏。"))?;
+            if previous.source_updated_at > coverage.source_updated_at {
+                return Ok(previous);
+            }
+            if !coverage.items_complete
+                && previous.source_updated_at == coverage.source_updated_at
+                && previous.items_complete
+            {
+                coverage.turns_complete = true;
+                coverage.items_complete = true;
+                coverage.loaded_turns = previous.loaded_turns;
+                coverage.loaded_items = previous.loaded_items;
+                coverage.path = previous.path;
+            }
+        }
+        if snapshot.coverage.items_complete {
+            tx.execute(
+                "DELETE FROM history_items WHERE thread_id=?1",
+                [&coverage.thread_id],
+            )
+            .map_err(|_| AppError::store("替换完整条目缓存失败。"))?;
+            tx.execute(
+                "DELETE FROM history_turns WHERE thread_id=?1",
+                [&coverage.thread_id],
+            )
+            .map_err(|_| AppError::store("替换完整回合缓存失败。"))?;
+        }
+        for turn in &snapshot.turns {
+            let json =
+                serde_json::to_string(turn).map_err(|_| AppError::store("序列化回合失败。"))?;
+            tx.execute("INSERT INTO history_turns (thread_id,id,ordinal,turn_json) VALUES (?1,?2,?3,?4)
+                ON CONFLICT(thread_id,id) DO UPDATE SET ordinal=excluded.ordinal,turn_json=excluded.turn_json",
+                params![turn.thread_id, turn.id, turn.ordinal, json],
+            ).map_err(|_| AppError::store("保存回合失败，旧缓存已保留。"))?;
+        }
+        for item in &snapshot.items {
+            let json =
+                serde_json::to_string(item).map_err(|_| AppError::store("序列化条目失败。"))?;
+            tx.execute("INSERT INTO history_items (thread_id,id,turn_id,ordinal,item_json) VALUES (?1,?2,?3,?4,?5)
+                ON CONFLICT(thread_id,id) DO UPDATE SET turn_id=excluded.turn_id,ordinal=excluded.ordinal,item_json=excluded.item_json",
+                params![item.thread_id, item.id, item.turn_id, item.ordinal, json],
+            ).map_err(|_| AppError::store("保存条目失败，旧缓存已保留。"))?;
+        }
+        let json = serde_json::to_string(&coverage)
+            .map_err(|_| AppError::store("序列化历史覆盖范围失败。"))?;
+        tx.execute(
+            "INSERT INTO history_coverage (thread_id,coverage_json) VALUES (?1,?2)
+            ON CONFLICT(thread_id) DO UPDATE SET coverage_json=excluded.coverage_json",
+            params![coverage.thread_id, json],
+        )
+        .map_err(|_| AppError::store("保存历史覆盖范围失败。"))?;
+        let existing: String = tx
+            .query_row(
+                "SELECT metadata_json FROM threads WHERE id=?1",
+                [&coverage.thread_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| AppError::store("读取会话元数据失败。"))?;
+        let mut metadata: ThreadMetadata =
+            serde_json::from_str(&existing).map_err(|_| AppError::store("会话元数据损坏。"))?;
+        metadata.turns_complete =
+            coverage.turns_complete && metadata.updated_at == coverage.source_updated_at;
+        metadata.items_complete =
+            coverage.items_complete && metadata.updated_at == coverage.source_updated_at;
+        metadata.content_complete = metadata.turns_complete && metadata.items_complete;
+        metadata.read_error = coverage.error.clone();
+        let metadata_json = serde_json::to_string(&metadata)
+            .map_err(|_| AppError::store("序列化会话元数据失败。"))?;
+        tx.execute(
+            "UPDATE threads SET metadata_json=?1 WHERE id=?2",
+            params![metadata_json, coverage.thread_id],
+        )
+        .map_err(|_| AppError::store("更新会话完整性失败。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交会话历史失败，旧缓存已保留。"))?;
+        Ok(coverage)
+    }
+
+    pub fn history_coverage(&self, thread_id: &str) -> Result<Option<HistoryCoverage>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT coverage_json FROM history_coverage WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取历史覆盖范围失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("历史覆盖范围损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn history_turns(
+        &self,
+        thread_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<HistoryTurnPage, AppError> {
+        let limit = limit.clamp(1, 100);
+        let connection = self.connection()?;
+        let total: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM history_turns WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| AppError::store("统计回合失败。"))?;
+        let mut query = connection.prepare("SELECT turn_json FROM history_turns WHERE thread_id=?1 ORDER BY ordinal,id LIMIT ?2 OFFSET ?3")
+            .map_err(|_| AppError::store("读取回合失败。"))?;
+        let rows = query
+            .query_map(
+                params![thread_id, limit, offset.min(i64::MAX as u64) as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| AppError::store("查询回合失败。"))?;
+        let turns = rows
+            .map(|row| {
+                serde_json::from_str(&row.map_err(|_| AppError::store("读取回合失败。"))?)
+                    .map_err(|_| AppError::store("回合缓存损坏。"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(HistoryTurnPage {
+            coverage: self.history_coverage(thread_id)?,
+            turns,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub fn history_items(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<HistoryItemPage, AppError> {
+        let limit = limit.clamp(1, 100);
+        let connection = self.connection()?;
+        let total: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM history_items WHERE thread_id=?1 AND turn_id=?2",
+                params![thread_id, turn_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| AppError::store("统计条目失败。"))?;
+        let mut query = connection.prepare("SELECT item_json FROM history_items WHERE thread_id=?1 AND turn_id=?2 ORDER BY ordinal,id LIMIT ?3 OFFSET ?4")
+            .map_err(|_| AppError::store("读取条目失败。"))?;
+        let rows = query
+            .query_map(
+                params![
+                    thread_id,
+                    turn_id,
+                    limit,
+                    offset.min(i64::MAX as u64) as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| AppError::store("查询条目失败。"))?;
+        let items = rows
+            .map(|row| {
+                serde_json::from_str(&row.map_err(|_| AppError::store("读取条目失败。"))?)
+                    .map_err(|_| AppError::store("条目缓存损坏。"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(HistoryItemPage {
+            coverage: self.history_coverage(thread_id)?,
+            items,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub fn locate_history_item(
+        &self,
+        thread_id: &str,
+        item_id: &str,
+    ) -> Result<Option<HistoryItemLocation>, AppError> {
+        let connection = self.connection()?;
+        let mut location = connection.query_row(
+            "SELECT i.turn_id, (SELECT COUNT(*) FROM history_items p WHERE p.thread_id=i.thread_id AND p.turn_id=i.turn_id
+                AND (p.ordinal<i.ordinal OR (p.ordinal=i.ordinal AND p.id<i.id)))
+             FROM history_items i WHERE i.thread_id=?1 AND i.id=?2",
+            params![thread_id, item_id], |row| Ok(HistoryItemLocation { turn_id: row.get(0)?, turn_offset: 0, offset: row.get(1)? }),
+        ).optional().map_err(|_| AppError::store("定位条目失败。"))?;
+        if let Some(found) = &mut location {
+            found.turn_offset = connection
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM history_turns p WHERE p.thread_id=t.thread_id
+                    AND (p.ordinal<t.ordinal OR (p.ordinal=t.ordinal AND p.id<t.id)))
+                 FROM history_turns t WHERE t.thread_id=?1 AND t.id=?2",
+                    params![thread_id, found.turn_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("定位回合失败。"))?
+                .unwrap_or(0);
+        }
+        Ok(location)
     }
 
     pub fn begin_refresh(&self, attempted_at_unix_ms: i64) -> Result<(), AppError> {
@@ -735,7 +1009,7 @@ impl PreferenceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codexflow_domain::{DisplayTheme, ErrorCode};
+    use codexflow_domain::{DisplayTheme, ErrorCode, HistoryItem, HistoryReadPath, HistoryTurn};
 
     fn thread(
         title: &str,
@@ -801,7 +1075,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 5;")
+            .execute_batch("PRAGMA user_version = 6;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -810,6 +1084,191 @@ mod tests {
         assert!(matches!(error.code, ErrorCode::MigrationFailed));
         let connection = Connection::open(&path).unwrap();
         let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_pages_and_locations_survive_partial_retry_and_reopen() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-history-store-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        store
+            .save_collection(&[thread("历史会话", 200, false, 1_000)], &[])
+            .unwrap();
+        let make_turn = |id: &str, ordinal, source_updated_at| HistoryTurn {
+            thread_id: "duplicate-thread".into(),
+            id: id.into(),
+            ordinal,
+            status: "completed".into(),
+            started_at_unix_ms: Some(100_000),
+            completed_at_unix_ms: Some(102_000),
+            duration_ms: Some(2_000),
+            source_updated_at,
+            content_version: format!("turn-{id}"),
+        };
+        let make_item = |id: &str, turn_id: &str, ordinal, source_updated_at| HistoryItem {
+            thread_id: "duplicate-thread".into(),
+            turn_id: turn_id.into(),
+            id: id.into(),
+            ordinal,
+            source_type: "agentMessage".into(),
+            supported: true,
+            text: Some(format!("正文 {id}")),
+            command: None,
+            cwd: None,
+            output: None,
+            exit_code: None,
+            status: None,
+            changes: vec![],
+            source_updated_at,
+            content_version: format!("item-{id}"),
+        };
+        let coverage = HistoryCoverage {
+            thread_id: "duplicate-thread".into(),
+            source_updated_at: 200,
+            attempted_at_unix_ms: 2_000,
+            path: HistoryReadPath::Paginated,
+            turns_complete: true,
+            items_complete: true,
+            turn_pages: 1,
+            item_pages: 1,
+            loaded_turns: 2,
+            loaded_items: 2,
+            incompatible: false,
+            error: None,
+        };
+        store
+            .save_history(&HistorySnapshot {
+                coverage: coverage.clone(),
+                turns: vec![make_turn("turn-1", 0, 200), make_turn("turn-2", 1, 200)],
+                items: vec![
+                    make_item("item-1", "turn-1", 0, 200),
+                    make_item("item-2", "turn-2", 1, 200),
+                ],
+            })
+            .unwrap();
+        assert_eq!(
+            store.history_turns("duplicate-thread", 1, 1).unwrap().turns[0].id,
+            "turn-2"
+        );
+        let location = store
+            .locate_history_item("duplicate-thread", "item-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                location.turn_id.as_str(),
+                location.turn_offset,
+                location.offset
+            ),
+            ("turn-2", 1, 0)
+        );
+        assert!(
+            store
+                .thread("duplicate-thread")
+                .unwrap()
+                .unwrap()
+                .content_complete
+        );
+
+        store
+            .save_collection(&[thread("历史更新", 201, false, 3_000)], &[])
+            .unwrap();
+        let mut partial = coverage;
+        partial.source_updated_at = 201;
+        partial.attempted_at_unix_ms = 4_000;
+        partial.turns_complete = false;
+        partial.items_complete = false;
+        partial.loaded_turns = 1;
+        partial.loaded_items = 1;
+        partial.error = Some("第二页失败".into());
+        store
+            .save_history(&HistorySnapshot {
+                coverage: partial,
+                turns: vec![make_turn("turn-1", 0, 201)],
+                items: vec![make_item("item-1", "turn-1", 0, 201)],
+            })
+            .unwrap();
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        assert!(
+            !reopened
+                .thread("duplicate-thread")
+                .unwrap()
+                .unwrap()
+                .content_complete
+        );
+        assert_eq!(
+            reopened
+                .history_coverage("duplicate-thread")
+                .unwrap()
+                .unwrap()
+                .loaded_items,
+            1
+        );
+        assert_eq!(
+            reopened
+                .history_items("duplicate-thread", "turn-2", 0, 20)
+                .unwrap()
+                .items[0]
+                .id,
+            "item-2"
+        );
+        assert_eq!(
+            reopened
+                .history_items("duplicate-thread", "turn-2", 0, 20)
+                .unwrap()
+                .items[0]
+                .source_updated_at,
+            200
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn version_four_cache_gains_history_tables_without_losing_threads() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-history-migration-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        store
+            .save_collection(&[thread("旧缓存", 200, false, 1_000)], &[])
+            .unwrap();
+        drop(store);
+        let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE history_coverage; DROP TABLE history_turns; DROP TABLE history_items;
+             PRAGMA user_version = 4;",
+            )
+            .unwrap();
+        drop(connection);
+        let upgraded = SessionStore::new(dir.clone()).unwrap();
+        assert_eq!(
+            upgraded
+                .thread("duplicate-thread")
+                .unwrap()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("旧缓存")
+        );
+        assert_eq!(
+            upgraded
+                .history_turns("duplicate-thread", 0, 20)
+                .unwrap()
+                .total,
+            0
+        );
+        let version: i64 = Connection::open(dir.join("sessions.sqlite3"))
+            .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 5);
@@ -959,7 +1418,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (4, 1));
+        assert_eq!((version, count), (5, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -992,7 +1451,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1095,7 +1554,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 4);
+            assert_eq!(version, 5);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

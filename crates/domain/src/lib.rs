@@ -128,6 +128,110 @@ pub struct ThreadMetadata {
     pub observed_at_unix_ms: i64,
 }
 
+/// Coverage describes the latest source read, independently of any older cached rows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryCoverage {
+    pub thread_id: String,
+    pub source_updated_at: i64,
+    pub attempted_at_unix_ms: i64,
+    pub path: HistoryReadPath,
+    pub turns_complete: bool,
+    pub items_complete: bool,
+    pub turn_pages: u32,
+    pub item_pages: u32,
+    pub loaded_turns: u64,
+    pub loaded_items: u64,
+    #[serde(default)]
+    pub incompatible: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum HistoryReadPath {
+    None,
+    Paginated,
+    FullRead,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryTurn {
+    pub thread_id: String,
+    pub id: String,
+    pub ordinal: u64,
+    pub status: String,
+    pub started_at_unix_ms: Option<i64>,
+    pub completed_at_unix_ms: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub source_updated_at: i64,
+    pub content_version: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryFileChange {
+    pub path: String,
+    pub kind: String,
+    pub diff: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryItem {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub id: String,
+    pub ordinal: u64,
+    pub source_type: String,
+    pub supported: bool,
+    pub text: Option<String>,
+    pub command: Option<String>,
+    pub cwd: Option<String>,
+    pub output: Option<String>,
+    pub exit_code: Option<i64>,
+    pub status: Option<String>,
+    pub changes: Vec<HistoryFileChange>,
+    pub source_updated_at: i64,
+    pub content_version: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HistorySnapshot {
+    pub coverage: HistoryCoverage,
+    pub turns: Vec<HistoryTurn>,
+    pub items: Vec<HistoryItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryTurnPage {
+    pub coverage: Option<HistoryCoverage>,
+    pub turns: Vec<HistoryTurn>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryItemPage {
+    pub coverage: Option<HistoryCoverage>,
+    pub items: Vec<HistoryItem>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryItemLocation {
+    pub turn_id: String,
+    pub turn_offset: u64,
+    pub offset: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListScopeStatus {

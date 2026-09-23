@@ -1,7 +1,8 @@
 use codexflow_core::SourceService;
 use codexflow_domain::{
-    AppError, DisplayTheme, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus,
-    ProjectCatalog, ProjectGraph, ProjectSessions, SessionList, SourceStatus,
+    AppError, DisplayTheme, HistoryCoverage, HistoryItemLocation, HistoryItemPage, HistoryTurnPage,
+    IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph,
+    ProjectSessions, SessionList, SourceStatus,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -95,6 +96,44 @@ fn get_session_list(state: tauri::State<'_, AppState>) -> Result<SessionList, Ap
 }
 
 #[tauri::command]
+async fn load_thread_history(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+) -> Result<HistoryCoverage, AppError> {
+    service(&state)?.load_thread_history(&thread_id).await
+}
+
+#[tauri::command]
+fn get_history_turns(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    offset: u64,
+    limit: u32,
+) -> Result<HistoryTurnPage, AppError> {
+    service(&state)?.history_turns(&thread_id, offset, limit)
+}
+
+#[tauri::command]
+fn get_history_items(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    turn_id: String,
+    offset: u64,
+    limit: u32,
+) -> Result<HistoryItemPage, AppError> {
+    service(&state)?.history_items(&thread_id, &turn_id, offset, limit)
+}
+
+#[tauri::command]
+fn locate_history_item(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    item_id: String,
+) -> Result<Option<HistoryItemLocation>, AppError> {
+    service(&state)?.locate_history_item(&thread_id, &item_id)
+}
+
+#[tauri::command]
 async fn refresh_session_list(state: tauri::State<'_, AppState>) -> Result<SessionList, AppError> {
     service(&state)?.refresh_sessions().await
 }
@@ -184,6 +223,10 @@ fn main() {
             test_jev_inference,
             cancel_jev_request,
             get_session_list,
+            load_thread_history,
+            get_history_turns,
+            get_history_items,
+            locate_history_item,
             refresh_session_list,
             start_index_run,
             get_latest_index_run,

@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ProjectGraphView } from "./ProjectGraphView";
+import { ThreadHistoryView } from "./ThreadHistoryView";
 import "./style.css";
 
 type Theme = "system" | "light" | "dark";
@@ -93,7 +94,12 @@ function App() {
   const [indexRun, setIndexRun] = useState<IndexRun | null>(null);
   const refreshing = indexRun?.state === "queued" || indexRun?.state === "running";
   const [query, setQuery] = useState("");
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const projectEpoch = useRef(0);
+
+  useEffect(() => {
+    if (selectedThreadId) document.getElementById("thread-history")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [selectedThreadId]);
 
   function recordRun(run: IndexRun | null) {
     setIndexRun((previous) => {
@@ -330,6 +336,8 @@ function App() {
   const visibleThreads = (showUnassigned ? projectCatalog?.unassigned ?? [] : projectSessions?.threads ?? []).filter(({ thread }) =>
     [thread.title, thread.preview, thread.id, thread.cwd].some((value) => value?.toLowerCase().includes(query.toLowerCase()))
   );
+  const selectedThread = (showUnassigned ? projectCatalog?.unassigned ?? [] : projectSessions?.threads ?? [])
+    .find(({ thread }) => thread.id === selectedThreadId)?.thread;
   const projects = [...(projectCatalog?.projects ?? [])].sort((a, b) => {
     const recent = projectCatalog?.recentProjectIds ?? [];
     const aIndex = recent.indexOf(a.id);
@@ -421,12 +429,13 @@ function App() {
           <div className="session-heading"><div><div className="panel-kicker">03 / 项目会话</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
           {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{indexRun.error.code}：{indexRun.error.message}</em>}</div>}
           {!showUnassigned && projectSessions && <div className="workspace-list"><strong>实际工作区</strong>{projectSessions.workspaces.length ? projectSessions.workspaces.map((workspace) => <code key={workspace}>{workspace}</code>) : <span>当前没有可验证的工作区</span>}</div>}
-          <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{refreshing ? "刷新中；缓存可浏览" : !attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>回合：待采集 · 条目：待采集</span></div>
+          <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{refreshing ? "刷新中；缓存可浏览" : !attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>选择会话后按需读取回合与条目</span></div>
           {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "已归档" : "未归档"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "上次列表完整" : "最近读取未完成"}</span><small>{scope.completedAtUnixMs ? `上次完整读取 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整读取记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}
           {listError && <div className="page-error" role="alert">{listError} 已保存的会话仍可浏览。</div>}
           <label className="session-search">查找会话<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="标题、预览、Thread ID 或工作目录" /></label>
-          <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{query ? "没有匹配的会话。" : refreshing ? "正在刷新；缓存中暂无会话。" : !connected && attempted ? "来源当前不可用；缓存中暂无会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : visibleThreads.map(({ thread, attribution }) => <article className="thread-row" key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.missingFromSource && <span className="thread-warning">完整列表中未再次出现</span>}{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>元数据 / 回合 / 条目</span><code>{thread.metadataComplete ? "完整" : "不完整"} / {thread.turnsComplete ? "完整" : "待采集"} / {thread.itemsComplete ? "完整" : "待采集"}</code></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
+          <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{query ? "没有匹配的会话。" : refreshing ? "正在刷新；缓存中暂无会话。" : !connected && attempted ? "来源当前不可用；缓存中暂无会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : visibleThreads.map(({ thread, attribution }) => <article className="thread-row" key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><button className="browse-button history-open" onClick={() => setSelectedThreadId(thread.id)} aria-label={`查看会话 ${thread.id} 的历史`}>查看回合与条目</button><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.missingFromSource && <span className="thread-warning">完整列表中未再次出现</span>}{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>元数据 / 回合 / 条目</span><code>{thread.metadataComplete ? "完整" : "不完整"} / {thread.turnsComplete ? "完整" : "待采集"} / {thread.itemsComplete ? "完整" : "待采集"}</code></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
         </section>
+        {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} />}
         {!showUnassigned && projectSessions && <ProjectGraphView projectId={projectSessions.project.id} refreshVersion={graphVersion} />}
         <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。Jev 连接检查不运行推理；只有点击“测试固定合成推理”才会发起该次模型调用。</p>
       </div>

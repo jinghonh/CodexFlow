@@ -3,9 +3,10 @@ mod relations;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
 use codexflow_domain::{
-    AppError, ConnectionState, DisplayTheme, ErrorCode, IndexRun, IndexRunState, JevConfig,
-    JevConnectionResult, JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph,
-    ProjectSessions, SessionList, SourceStatus,
+    AppError, ConnectionState, DisplayTheme, ErrorCode, HistoryCoverage, HistoryItemLocation,
+    HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig, JevConnectionResult,
+    JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph, ProjectSessions,
+    SessionList, SourceStatus,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -280,6 +281,58 @@ impl SourceService {
 
     pub fn cached_sessions(&self) -> Result<SessionList, AppError> {
         self.sessions.list()
+    }
+
+    pub async fn load_thread_history(&self, thread_id: &str) -> Result<HistoryCoverage, AppError> {
+        let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
+            AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "会话未在本地索引中。请先刷新列表。",
+                false,
+            )
+        })?;
+        let mut state = self.state.lock().await;
+        check_process(&mut state);
+        let session = state.session.as_mut().ok_or_else(|| {
+            AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "来源当前不可用；可继续查看已缓存的回合和条目。",
+                true,
+            )
+        })?;
+        let snapshot = session
+            .collect_history(thread_id, thread.updated_at, now_ms() as i64)
+            .await;
+        drop(state);
+        self.sessions.save_history(&snapshot)
+    }
+
+    pub fn history_turns(
+        &self,
+        thread_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<HistoryTurnPage, AppError> {
+        self.sessions.history_turns(thread_id, offset, limit)
+    }
+
+    pub fn history_items(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<HistoryItemPage, AppError> {
+        self.sessions
+            .history_items(thread_id, turn_id, offset, limit)
+    }
+
+    pub fn locate_history_item(
+        &self,
+        thread_id: &str,
+        item_id: &str,
+    ) -> Result<Option<HistoryItemLocation>, AppError> {
+        self.sessions.locate_history_item(thread_id, item_id)
     }
 
     fn reconcile_projects(&self) -> Result<(), AppError> {
@@ -1565,6 +1618,82 @@ mod tests {
             .iter()
             .all(|scope| scope.complete));
 
+        service.shutdown().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_thread_history_does_not_block_another_thread_or_erase_metadata() {
+        let root = temp_data_dir();
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("fake-history-partial.py");
+        fs::write(
+            &binary,
+            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let service = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(MemoryCredentials::default()),
+        )
+        .unwrap();
+        let connected = service
+            .connect(Some(binary.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        assert!(matches!(connected.connection, ConnectionState::Connected));
+        let metadata = |id: &str| codexflow_domain::ThreadMetadata {
+            id: id.into(),
+            session_id: format!("session-{id}"),
+            title: Some(id.into()),
+            preview: "测试".into(),
+            cwd: "/tmp/example-project".into(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: None,
+            forked_from_id: None,
+            git: None,
+            created_at: 100,
+            updated_at: 200,
+            archived: false,
+            metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
+            content_complete: false,
+            read_error: None,
+            observed_at_unix_ms: 1,
+        };
+        service
+            .sessions
+            .save_collection(&[metadata("thread-bad"), metadata("thread-h")], &[])
+            .unwrap();
+        let failed = service.load_thread_history("thread-bad").await.unwrap();
+        assert!(failed.incompatible);
+        assert!(!failed.items_complete);
+        let partial = service.load_thread_history("thread-h").await.unwrap();
+        assert!(partial.turns_complete);
+        assert!(!partial.items_complete);
+        assert_eq!(service.history_turns("thread-h", 0, 20).unwrap().total, 2);
+        assert_eq!(
+            service
+                .history_items("thread-h", "turn-1", 0, 20)
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(service.cached_sessions().unwrap().threads.len(), 2);
+        assert_eq!(
+            service
+                .locate_history_item("thread-h", "item-1")
+                .unwrap()
+                .unwrap()
+                .turn_id,
+            "turn-1"
+        );
         service.shutdown().await;
         let _ = fs::remove_dir_all(root);
     }
