@@ -178,13 +178,14 @@ pub fn build_project_timeline(
             } else {
                 TimelineQuality::Unknown
             };
+            // A valid source boundary remains evidence of time even when the
+            // other boundary or duration cannot form a complete interval.
             let last_end = turns
                 .iter()
-                .filter_map(|turn| turn.interval_end_unix_ms)
+                .filter_map(|turn| turn.completed_at_unix_ms)
                 .max();
             let last_start = turns
                 .iter()
-                .filter(|turn| turn.time_error.is_none())
                 .filter_map(|turn| turn.started_at_unix_ms)
                 .max();
             let (last_activity_at_unix_ms, last_activity_basis) = if let Some(end) = last_end {
@@ -350,7 +351,7 @@ mod tests {
 
     #[test]
     fn partial_missing_running_and_invalid_time_do_not_invent_positions_or_duration() {
-        let mut invalid = turn(
+        let invalid = turn(
             "invalid",
             5,
             Some(8_000),
@@ -358,7 +359,6 @@ mod tests {
             Some(400),
             "completed",
         );
-        invalid.time_error = Some("来源开始时间无效".into());
         let view = build_project_timeline(
             sessions(false),
             vec![
@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(thread.turns[6].duration_ms, None);
         assert_eq!(thread.turns[7].interval_start_unix_ms, Some(900));
         assert_eq!(thread.turns[7].duration_ms, None);
-        assert_eq!(thread.last_activity_at_unix_ms, Some(5_000));
+        assert_eq!(thread.last_activity_at_unix_ms, Some(8_000));
         assert_eq!(thread.last_activity_basis, LastActivityBasis::TurnStart);
     }
 
@@ -412,5 +412,53 @@ mod tests {
             view.threads[0].last_activity_basis,
             LastActivityBasis::MetadataUpdate
         );
+    }
+
+    #[test]
+    fn end_only_turn_is_last_activity_even_without_a_complete_interval() {
+        let mut end_only = turn("end-only", 1, None, Some(9_000), None, "completed");
+        end_only.time_error = Some("开始时间不是有效的 Unix 秒".into());
+        let view = build_project_timeline(
+            sessions(true),
+            vec![
+                turn(
+                    "earlier",
+                    0,
+                    Some(1_000),
+                    Some(3_000),
+                    Some(2_000),
+                    "completed",
+                ),
+                end_only,
+            ],
+        );
+        let thread = &view.threads[0];
+        assert_eq!(thread.turns[1].interval_end_unix_ms, None);
+        assert_eq!(thread.last_activity_at_unix_ms, Some(9_000));
+        assert_eq!(thread.last_activity_basis, LastActivityBasis::TurnEnd);
+    }
+
+    #[test]
+    fn valid_start_remains_last_activity_when_other_time_fields_are_invalid() {
+        let mut start_only = turn("start-only", 1, Some(9_000), None, None, "completed");
+        start_only.time_error = Some("结束时间不是有效的 Unix 秒；时长不是有效的毫秒数".into());
+        let view = build_project_timeline(
+            sessions(true),
+            vec![
+                turn(
+                    "earlier",
+                    0,
+                    Some(1_000),
+                    Some(3_000),
+                    Some(2_000),
+                    "completed",
+                ),
+                start_only,
+            ],
+        );
+        let thread = &view.threads[0];
+        assert_eq!(thread.turns[1].interval_start_unix_ms, None);
+        assert_eq!(thread.last_activity_at_unix_ms, Some(9_000));
+        assert_eq!(thread.last_activity_basis, LastActivityBasis::TurnStart);
     }
 }

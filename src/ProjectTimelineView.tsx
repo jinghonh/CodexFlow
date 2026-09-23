@@ -20,7 +20,7 @@ const dayMs = 86_400_000;
 const labelWidth = 238;
 const qualityText: Record<Quality, string> = { complete: "完整", partial: "部分已知", unknown: "未知" };
 const basisText: Record<Thread["lastActivityBasis"], string> = {
-  turnEnd: "来源回合结束", turnStart: "来源回合开始；结束未知", metadataUpdate: "仅元数据更新时间，不能证明活动结束", unknown: "来源未提供",
+  turnEnd: "来源回合结束", turnStart: "来源回合开始；不据此推断活动结束", metadataUpdate: "仅元数据更新时间，不能证明活动结束", unknown: "来源未提供",
 };
 const stateText: Record<TimeState, string> = {
   complete: "有来源起止时间", durationOnly: "仅有来源时长，无时间线位置", running: "执行中，尚无完整结束时间",
