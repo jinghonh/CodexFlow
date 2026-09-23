@@ -832,6 +832,10 @@ impl SourceService {
                 // The isolated analyzer ended before a model turn could be sent.
                 current.batch_calls = current.batch_calls.saturating_sub(1);
                 current.total_calls = current.total_calls.saturating_sub(1);
+                if control.pause.load(Ordering::SeqCst) || control.cancel.is_cancelled() {
+                    // A user-stopped queued call is not an automatic retry attempt.
+                    current.units[index].attempts = current.units[index].attempts.saturating_sub(1);
+                }
             }
             if completed.state == SummaryRunState::Complete {
                 current.units[index].state = AnalysisUnitState::Succeeded;
@@ -1340,6 +1344,7 @@ mod tests {
             ),
             (0, 0, 1)
         );
+        assert_eq!(cancelled.units[0].attempts, 0);
         assert!(service.sessions.summary("thread-0").unwrap().is_none());
         drop(held);
         let _ = fs::remove_dir_all(root);
@@ -1425,6 +1430,7 @@ mod tests {
             (paused.total_calls, paused.batch_calls, paused.pending),
             (0, 0, 1)
         );
+        assert_eq!(paused.units[0].attempts, 0);
         drop(held);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(service.sessions.summary("thread-0").unwrap().is_none());
@@ -1434,6 +1440,58 @@ mod tests {
             .unwrap();
         let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
         assert_eq!((complete.total_calls, complete.succeeded), (1, 1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn queued_pause_does_not_consume_retries_in_the_next_batch() {
+        let root = root("pause-retry");
+        let service = service(&root, "twice-flaky", 1).await;
+        let held = Arc::clone(&service.model_slots)
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let limits = AnalysisLimits {
+            call_limit: 3,
+            retry_limit: 2,
+            ..AnalysisLimits::default()
+        };
+        let started = service
+            .start_project_analysis("project-test".into(), limits, |_| {})
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let run = service.analysis_run(&started.id).unwrap().unwrap();
+                if run.units[0].active_summary_run_id.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        service.pause_analysis_run(&started.id).unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!((paused.total_calls, paused.units[0].attempts), (0, 0));
+        drop(held);
+        service
+            .continue_analysis_run(&started.id, 3, |_| {})
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(
+            (
+                complete.total_calls,
+                complete.units[0].attempts,
+                complete.succeeded
+            ),
+            (3, 3, 1)
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("failure-count")).unwrap(),
+            "2"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

@@ -221,7 +221,13 @@ for line in sys.stdin:
         assert request["params"]["outputSchema"]["required"] == ["goal", "activity", "outcome", "decisions", "issues", "evidenceIds"]
         response = {"id": request["id"], "result": {"turn": {"id": analysis_turn, "status": "inProgress", "items": []}}}
         print(json.dumps(response), flush=True)
-        if mode.endswith("flaky") and not (pathlib.Path(__file__).parent / "first-failure").exists():
+        if mode.endswith("twice-flaky"):
+            counter = pathlib.Path(__file__).parent / "failure-count"
+            failures = int(counter.read_text()) if counter.exists() else 0
+            if failures < 2:
+                counter.write_text(str(failures + 1))
+                raise SystemExit(0)
+        elif mode.endswith("flaky") and not (pathlib.Path(__file__).parent / "first-failure").exists():
             (pathlib.Path(__file__).parent / "first-failure").touch()
             raise SystemExit(0)
         if mode.endswith("internal-retry"):
