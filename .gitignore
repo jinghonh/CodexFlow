@@ -4,3 +4,5 @@ docs/*
 !docs/TICKETS.md
 !docs/ORCHESTRATOR_PROMPT.md
 !docs/adr/
+!docs/agents/
+.codexflow-orchestration/
