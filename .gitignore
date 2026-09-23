@@ -2,4 +2,5 @@
 docs/*
 !docs/SPEC.md
 !docs/TICKETS.md
+!docs/ORCHESTRATOR_PROMPT.md
 !docs/adr/
