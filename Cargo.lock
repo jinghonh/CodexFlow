@@ -345,6 +345,7 @@ dependencies = [
  "codexflow-domain",
  "codexflow-jev",
  "codexflow-store",
+ "rusqlite",
  "tokio",
 ]
 

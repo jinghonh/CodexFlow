@@ -64,6 +64,37 @@ impl SessionStore {
             .map_err(|_| AppError::store("打开会话数据库失败，请检查应用数据目录。"))
     }
 
+    pub fn begin_refresh(&self, attempted_at_unix_ms: i64) -> Result<(), AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始记录会话刷新状态失败。"))?;
+        for archived in [false, true] {
+            transaction.execute(
+                "INSERT INTO list_scopes (archived, complete, attempted_at_unix_ms, completed_at_unix_ms, error)
+                 VALUES (?1, 0, ?2, NULL, '刷新尚未完成；若应用已重启，上次刷新已中断。')
+                 ON CONFLICT(archived) DO UPDATE SET
+                   complete=0,
+                   attempted_at_unix_ms=excluded.attempted_at_unix_ms,
+                   error=excluded.error",
+                params![archived, attempted_at_unix_ms],
+            ).map_err(|_| AppError::store("记录会话刷新状态失败，旧缓存已保留。"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交会话刷新状态失败，旧缓存已保留。"))
+    }
+
+    pub fn fail_refresh(&self, attempted_at_unix_ms: i64, message: &str) -> Result<(), AppError> {
+        self.connection()?
+            .execute(
+                "UPDATE list_scopes SET complete=0, error=?1 WHERE attempted_at_unix_ms=?2",
+                params![message, attempted_at_unix_ms],
+            )
+            .map_err(|_| AppError::store("记录会话刷新失败状态失败，旧缓存已保留。"))?;
+        Ok(())
+    }
+
     pub fn save_collection(
         &self,
         threads: &[ThreadMetadata],
@@ -242,6 +273,36 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn interrupted_refresh_remains_incomplete_after_reopen() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-interrupted-test-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let complete = [false, true].map(|archived| ListScopeStatus {
+            archived,
+            complete: true,
+            attempted_at_unix_ms: Some(1000),
+            completed_at_unix_ms: Some(1000),
+            error: None,
+        });
+        store.save_collection(&[], &complete).unwrap();
+        store.begin_refresh(2000).unwrap();
+        let reopened = SessionStore::new(dir.clone()).unwrap().list().unwrap();
+        assert!(reopened.scopes.iter().all(|scope| {
+            !scope.complete
+                && scope.attempted_at_unix_ms == Some(2000)
+                && scope.completed_at_unix_ms == Some(1000)
+                && scope
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("中断"))
+        }));
         let _ = fs::remove_dir_all(dir);
     }
 }

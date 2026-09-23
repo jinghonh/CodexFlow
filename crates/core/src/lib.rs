@@ -107,17 +107,31 @@ impl SourceService {
 
     pub async fn refresh_sessions(&self) -> Result<SessionList, AppError> {
         let mut state = self.state.lock().await;
+        let attempted_at = now_ms() as i64;
+        self.sessions.begin_refresh(attempted_at)?;
         check_process(&mut state);
-        let session = state.session.as_mut().ok_or_else(|| {
-            AppError::codex(
-                ErrorCode::SourceReadFailed,
-                "Codex 来源当前不可用。请先连接，已有会话缓存仍可浏览。",
-                true,
-            )
-        })?;
-        let collection = session.collect_threads(now_ms() as i64).await;
-        self.sessions
-            .save_collection(&collection.threads, &collection.scopes)?;
+        let session = match state.session.as_mut() {
+            Some(session) => session,
+            None => {
+                self.sessions
+                    .fail_refresh(attempted_at, "来源当前不可用；旧缓存已保留。")?;
+                return Err(AppError::codex(
+                    ErrorCode::SourceReadFailed,
+                    "Codex 来源当前不可用。请先连接，已有会话缓存仍可浏览。",
+                    true,
+                ));
+            }
+        };
+        let collection = session.collect_threads(attempted_at).await;
+        if let Err(error) = self
+            .sessions
+            .save_collection(&collection.threads, &collection.scopes)
+        {
+            let _ = self
+                .sessions
+                .fail_refresh(attempted_at, "保存会话列表失败；旧缓存已保留。");
+            return Err(error);
+        }
         self.sessions.list()
     }
 }
@@ -306,7 +320,33 @@ mod tests {
                 .unwrap()
                 .archived
         );
+        let database = rusqlite::Connection::open(root.join("data/sessions.sqlite3")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TRIGGER reject_thread_update BEFORE UPDATE ON threads
+             BEGIN SELECT RAISE(FAIL, 'simulated write failure'); END;",
+            )
+            .unwrap();
+        drop(database);
+        assert!(reopened.refresh_sessions().await.is_err());
+        let failed = reopened.cached_sessions().unwrap();
+        assert_eq!(failed.threads.len(), 4);
+        assert!(failed.scopes.iter().all(|scope| !scope.complete
+            && scope
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("保存"))));
+        assert!(failed
+            .scopes
+            .iter()
+            .all(|scope| scope.completed_at_unix_ms.is_some()));
         reopened.shutdown().await;
+        let after_failure = SourceService::new(root.join("data"))
+            .unwrap()
+            .cached_sessions()
+            .unwrap();
+        assert_eq!(after_failure.threads.len(), 4);
+        assert!(after_failure.scopes.iter().all(|scope| !scope.complete));
         let _ = fs::remove_dir_all(root);
     }
 }

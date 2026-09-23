@@ -9,3 +9,6 @@ codexflow-codex = { path = "../codex" }
 codexflow-store = { path = "../store" }
 codexflow-jev = { path = "../jev" }
 tokio = { version = "1", features = ["sync", "macros", "rt"] }
+
+[dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
