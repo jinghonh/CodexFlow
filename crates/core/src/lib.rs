@@ -431,17 +431,21 @@ impl SourceService {
                 "证据所指条目不存在；历史可能只读取了部分内容。",
             ));
         };
-        if let Some(fact) = self.sessions.source_fact(&evidence.fact_id)? {
-            if fact.thread_id != evidence.thread_id
-                || fact.turn_id != evidence.turn_id
-                || fact.item_id != evidence.item_id
-                || fact.evidence_id != evidence.id
-            {
-                return Ok(result(
-                    EvidenceState::WrongHierarchy,
-                    "证据定位与所属事实的会话、回合或条目不匹配。",
-                ));
-            }
+        let Some(fact) = self.sessions.source_fact(&evidence.fact_id)? else {
+            return Ok(result(
+                EvidenceState::MissingFact,
+                "证据所属事实不存在或已被替换。",
+            ));
+        };
+        if fact.thread_id != evidence.thread_id
+            || fact.turn_id != evidence.turn_id
+            || fact.item_id != evidence.item_id
+            || fact.evidence_id != evidence.id
+        {
+            return Ok(result(
+                EvidenceState::WrongHierarchy,
+                "证据定位与所属事实的会话、回合或条目不匹配。",
+            ));
         }
         if item.content_version != evidence.content_version
             || item.source_updated_at != thread.updated_at
@@ -2081,6 +2085,11 @@ mod tests {
             EvidenceState::MissingItem
         );
         wrong = evidence[0].clone();
+        wrong.fact_id = "missing-fact".into();
+        let missing_fact = service.check_evidence(&wrong).unwrap();
+        assert_eq!(missing_fact.state, EvidenceState::MissingFact);
+        assert!(missing_fact.message.contains("事实不存在"));
+        wrong = evidence[0].clone();
         wrong.excerpt = "does not appear".into();
         assert_eq!(
             service.check_evidence(&wrong).unwrap().state,
@@ -2145,6 +2154,19 @@ mod tests {
             reopened.sessions.fact_index(&thread.id).unwrap().unwrap().1,
             facts::RULE_VERSION
         );
+        let current_evidence = reopened
+            .source_evidence(&thread.id, 0, 10)
+            .unwrap()
+            .evidence;
+        let orphan = &current_evidence[0];
+        let connection = rusqlite::Connection::open(root.join("sessions.sqlite3")).unwrap();
+        connection
+            .execute("DELETE FROM source_facts WHERE id=?1", [&orphan.fact_id])
+            .unwrap();
+        drop(connection);
+        let check = reopened.validate_source_evidence(&orphan.id).unwrap();
+        assert_eq!(check.state, EvidenceState::MissingFact);
+        assert!(check.message.contains("事实不存在"));
         let _ = fs::remove_dir_all(root);
     }
 

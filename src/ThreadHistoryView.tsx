@@ -28,7 +28,7 @@ type Fact = { id: string; turnId: string; itemId: string; kind: "file" | "comman
 type FactPage = { facts: Fact[]; total: number; offset: number; limit: number; coverage: Coverage | null };
 type Evidence = { id: string; excerpt: string; contentVersion: string; field: string };
 type EvidencePage = { evidence: Evidence[]; total: number; offset: number; limit: number };
-type EvidenceCheck = { state: "valid" | "missingThread" | "missingTurn" | "missingItem" | "wrongHierarchy" | "excerptMissing" | "staleVersion";
+type EvidenceCheck = { state: "valid" | "missingThread" | "missingTurn" | "missingItem" | "missingFact" | "wrongHierarchy" | "excerptMissing" | "staleVersion";
   message: string; location: Location | null };
 const TURN_LIMIT = 20;
 const ITEM_LIMIT = 20;

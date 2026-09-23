@@ -316,6 +316,7 @@ pub enum EvidenceState {
     MissingThread,
     MissingTurn,
     MissingItem,
+    MissingFact,
     WrongHierarchy,
     ExcerptMissing,
     StaleVersion,
