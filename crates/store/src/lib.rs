@@ -20,6 +20,45 @@ pub struct SessionStore {
     path: PathBuf,
 }
 
+/// One read transaction supplies every row used to validate one evidence pointer.
+pub struct EvidenceSourceSnapshot {
+    pub evidence: SourceEvidence,
+    pub thread: Option<ThreadMetadata>,
+    pub turn_exists: bool,
+    pub item: Option<HistoryItem>,
+    pub item_in_other_turn: bool,
+    pub fact: Option<SourceFact>,
+    pub location: Option<HistoryItemLocation>,
+}
+
+fn locate_history_item_in(
+    connection: &Connection,
+    thread_id: &str,
+    turn_id: &str,
+    item_id: &str,
+) -> Result<Option<HistoryItemLocation>, AppError> {
+    let mut location = connection.query_row(
+        "SELECT i.turn_id, (SELECT COUNT(*) FROM history_items p WHERE p.thread_id=i.thread_id AND p.turn_id=i.turn_id
+            AND (p.ordinal<i.ordinal OR (p.ordinal=i.ordinal AND p.id<i.id)))
+         FROM history_items i WHERE i.thread_id=?1 AND i.turn_id=?2 AND i.id=?3",
+        params![thread_id, turn_id, item_id], |row| Ok(HistoryItemLocation { turn_id: row.get(0)?, turn_offset: 0, offset: row.get(1)? }),
+    ).optional().map_err(|_| AppError::store("定位条目失败。"))?;
+    if let Some(found) = &mut location {
+        found.turn_offset = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM history_turns p WHERE p.thread_id=t.thread_id
+                AND (p.ordinal<t.ordinal OR (p.ordinal=t.ordinal AND p.id<t.id)))
+             FROM history_turns t WHERE t.thread_id=?1 AND t.id=?2",
+                params![thread_id, found.turn_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("定位回合失败。"))?
+            .unwrap_or(0);
+    }
+    Ok(location)
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -496,27 +535,7 @@ impl SessionStore {
         turn_id: &str,
         item_id: &str,
     ) -> Result<Option<HistoryItemLocation>, AppError> {
-        let connection = self.connection()?;
-        let mut location = connection.query_row(
-            "SELECT i.turn_id, (SELECT COUNT(*) FROM history_items p WHERE p.thread_id=i.thread_id AND p.turn_id=i.turn_id
-                AND (p.ordinal<i.ordinal OR (p.ordinal=i.ordinal AND p.id<i.id)))
-             FROM history_items i WHERE i.thread_id=?1 AND i.turn_id=?2 AND i.id=?3",
-            params![thread_id, turn_id, item_id], |row| Ok(HistoryItemLocation { turn_id: row.get(0)?, turn_offset: 0, offset: row.get(1)? }),
-        ).optional().map_err(|_| AppError::store("定位条目失败。"))?;
-        if let Some(found) = &mut location {
-            found.turn_offset = connection
-                .query_row(
-                    "SELECT (SELECT COUNT(*) FROM history_turns p WHERE p.thread_id=t.thread_id
-                    AND (p.ordinal<t.ordinal OR (p.ordinal=t.ordinal AND p.id<t.id)))
-                 FROM history_turns t WHERE t.thread_id=?1 AND t.id=?2",
-                    params![thread_id, found.turn_id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(|_| AppError::store("定位回合失败。"))?
-                .unwrap_or(0);
-        }
-        Ok(location)
+        locate_history_item_in(&self.connection()?, thread_id, turn_id, item_id)
     }
 
     pub fn all_history_items(&self, thread_id: &str) -> Result<Vec<HistoryItem>, AppError> {
@@ -689,86 +708,124 @@ impl SessionStore {
         })
     }
 
-    pub fn evidence(&self, evidence_id: &str) -> Result<Option<SourceEvidence>, AppError> {
-        let json: Option<String> = self
-            .connection()?
+    pub fn evidence_snapshot(
+        &self,
+        evidence: SourceEvidence,
+    ) -> Result<EvidenceSourceSnapshot, AppError> {
+        self.read_evidence_snapshot(Some(evidence), None, || {})?
+            .ok_or_else(|| AppError::store("证据快照缺失。"))
+    }
+
+    pub fn stored_evidence_snapshot(
+        &self,
+        evidence_id: &str,
+    ) -> Result<Option<EvidenceSourceSnapshot>, AppError> {
+        self.read_evidence_snapshot(None, Some(evidence_id), || {})
+    }
+
+    fn read_evidence_snapshot(
+        &self,
+        supplied: Option<SourceEvidence>,
+        evidence_id: Option<&str>,
+        after_item: impl FnOnce(),
+    ) -> Result<Option<EvidenceSourceSnapshot>, AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始证据一致性检查失败。"))?;
+        let evidence = match supplied {
+            Some(evidence) => evidence,
+            None => {
+                let id = evidence_id.ok_or_else(|| AppError::store("证据标识缺失。"))?;
+                let json: Option<String> = tx
+                    .query_row(
+                        "SELECT evidence_json FROM source_evidence WHERE id=?1",
+                        [id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| AppError::store("读取证据失败。"))?;
+                let Some(json) = json else {
+                    return Ok(None);
+                };
+                serde_json::from_str(&json).map_err(|_| AppError::store("证据缓存损坏。"))?
+            }
+        };
+        let thread_json: Option<String> = tx
             .query_row(
-                "SELECT evidence_json FROM source_evidence WHERE id=?1",
-                [evidence_id],
+                "SELECT metadata_json FROM threads WHERE id=?1",
+                [&evidence.thread_id],
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|_| AppError::store("读取证据失败。"))?;
-        json.map(|value| {
-            serde_json::from_str(&value).map_err(|_| AppError::store("证据缓存损坏。"))
-        })
-        .transpose()
-    }
-
-    pub fn source_fact(&self, fact_id: &str) -> Result<Option<SourceFact>, AppError> {
-        let json: Option<String> = self
-            .connection()?
-            .query_row(
-                "SELECT fact_json FROM source_facts WHERE id=?1",
-                [fact_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| AppError::store("读取证据所属事实失败。"))?;
-        json.map(|value| {
-            serde_json::from_str(&value).map_err(|_| AppError::store("事实缓存损坏。"))
-        })
-        .transpose()
-    }
-
-    pub fn history_turn_exists(&self, thread_id: &str, turn_id: &str) -> Result<bool, AppError> {
-        self.connection()?
+            .map_err(|_| AppError::store("检查证据会话失败。"))?;
+        let thread = thread_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| AppError::store("会话元数据损坏。"))
+            })
+            .transpose()?;
+        let turn_exists = tx
             .query_row(
                 "SELECT 1 FROM history_turns WHERE thread_id=?1 AND id=?2",
-                params![thread_id, turn_id],
+                params![evidence.thread_id, evidence.turn_id],
                 |_| Ok(()),
             )
             .optional()
-            .map(|row| row.is_some())
-            .map_err(|_| AppError::store("检查证据回合失败。"))
-    }
-
-    pub fn history_item(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        item_id: &str,
-    ) -> Result<Option<HistoryItem>, AppError> {
-        let json: Option<String> = self
-            .connection()?
+            .map_err(|_| AppError::store("检查证据回合失败。"))?
+            .is_some();
+        let item_json: Option<String> = tx
             .query_row(
                 "SELECT item_json FROM history_items WHERE thread_id=?1 AND turn_id=?2 AND id=?3",
-                params![thread_id, turn_id, item_id],
+                params![evidence.thread_id, evidence.turn_id, evidence.item_id],
                 |row| row.get(0),
             )
             .optional()
             .map_err(|_| AppError::store("检查证据条目失败。"))?;
-        json.map(|value| {
-            serde_json::from_str(&value).map_err(|_| AppError::store("证据条目损坏。"))
-        })
-        .transpose()
-    }
-
-    pub fn item_id_in_other_turn(
-        &self,
-        thread_id: &str,
-        turn_id: &str,
-        item_id: &str,
-    ) -> Result<bool, AppError> {
-        self.connection()?
-            .query_row(
+        let item = item_json
+            .map(|json| serde_json::from_str(&json).map_err(|_| AppError::store("证据条目损坏。")))
+            .transpose()?;
+        after_item();
+        let item_in_other_turn =
+            if item.is_none() {
+                tx.query_row(
                 "SELECT 1 FROM history_items WHERE thread_id=?1 AND turn_id<>?2 AND id=?3 LIMIT 1",
-                params![thread_id, turn_id, item_id],
-                |_| Ok(()),
+                params![evidence.thread_id, evidence.turn_id, evidence.item_id], |_| Ok(()),
+            ).optional().map_err(|_| AppError::store("检查证据层级失败。"))?.is_some()
+            } else {
+                false
+            };
+        let fact_json: Option<String> = tx
+            .query_row(
+                "SELECT fact_json FROM source_facts WHERE id=?1",
+                [&evidence.fact_id],
+                |row| row.get(0),
             )
             .optional()
-            .map(|row| row.is_some())
-            .map_err(|_| AppError::store("检查证据层级失败。"))
+            .map_err(|_| AppError::store("读取证据所属事实失败。"))?;
+        let fact = fact_json
+            .map(|json| serde_json::from_str(&json).map_err(|_| AppError::store("事实缓存损坏。")))
+            .transpose()?;
+        let location = if item.is_some() && turn_exists {
+            locate_history_item_in(
+                &tx,
+                &evidence.thread_id,
+                &evidence.turn_id,
+                &evidence.item_id,
+            )?
+        } else {
+            None
+        };
+        tx.commit()
+            .map_err(|_| AppError::store("完成证据一致性检查失败。"))?;
+        Ok(Some(EvidenceSourceSnapshot {
+            evidence,
+            thread,
+            turn_exists,
+            item,
+            item_in_other_turn,
+            fact,
+            location,
+        }))
     }
 
     pub fn begin_refresh(&self, attempted_at_unix_ms: i64) -> Result<(), AppError> {
@@ -1322,7 +1379,10 @@ impl PreferenceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codexflow_domain::{DisplayTheme, ErrorCode, HistoryItem, HistoryReadPath, HistoryTurn};
+    use codexflow_domain::{
+        DisplayTheme, ErrorCode, EvidenceField, FactKind, FactOutcome, HistoryItem,
+        HistoryReadPath, HistoryTurn,
+    };
 
     fn thread(
         title: &str,
@@ -2139,5 +2199,159 @@ mod tests {
             assert_eq!(cached.observed_at_unix_ms, 200);
             let _ = fs::remove_dir_all(dir);
         }
+    }
+
+    #[test]
+    fn evidence_snapshot_keeps_old_item_fact_and_pointer_together_during_refresh() {
+        use std::sync::mpsc;
+        use std::thread as os_thread;
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-evidence-snapshot-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let path = dir.join("sessions.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        let mode: String = connection
+            .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        drop(connection);
+        store
+            .save_collection(&[thread("证据并发", 100, false, 1)], &[])
+            .unwrap();
+        let old_item = HistoryItem {
+            thread_id: "duplicate-thread".into(),
+            turn_id: "turn".into(),
+            id: "item".into(),
+            ordinal: 0,
+            source_type: "commandExecution".into(),
+            supported: true,
+            text: None,
+            command: Some("cargo test".into()),
+            cwd: None,
+            output: None,
+            exit_code: Some(0),
+            status: Some("completed".into()),
+            changes: vec![],
+            source_updated_at: 100,
+            content_version: "v1".into(),
+        };
+        store
+            .save_history(&HistorySnapshot {
+                coverage: HistoryCoverage {
+                    thread_id: "duplicate-thread".into(),
+                    source_updated_at: 100,
+                    attempted_at_unix_ms: 1,
+                    path: HistoryReadPath::FullRead,
+                    turns_complete: true,
+                    items_complete: true,
+                    turn_pages: 0,
+                    item_pages: 0,
+                    loaded_turns: 1,
+                    loaded_items: 1,
+                    incompatible: false,
+                    error: None,
+                },
+                turns: vec![HistoryTurn {
+                    thread_id: "duplicate-thread".into(),
+                    id: "turn".into(),
+                    ordinal: 0,
+                    status: "completed".into(),
+                    started_at_unix_ms: None,
+                    completed_at_unix_ms: None,
+                    duration_ms: None,
+                    source_updated_at: 100,
+                    content_version: "turn-v1".into(),
+                }],
+                items: vec![old_item.clone()],
+            })
+            .unwrap();
+        let old_fact = SourceFact {
+            id: "fact".into(),
+            thread_id: "duplicate-thread".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            kind: FactKind::Command,
+            subject: "cargo test".into(),
+            operation: "executed".into(),
+            outcome: FactOutcome::Succeeded,
+            evidence_id: "evidence".into(),
+            content_version: "v1".into(),
+            rule_version: "test".into(),
+        };
+        let old_evidence = SourceEvidence {
+            id: "evidence".into(),
+            fact_id: "fact".into(),
+            thread_id: "duplicate-thread".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            field: EvidenceField::Command,
+            change_index: None,
+            excerpt: "cargo test".into(),
+            content_version: "v1".into(),
+        };
+        store
+            .replace_automatic_facts(
+                "duplicate-thread",
+                "v1",
+                "test",
+                store.history_generation("duplicate-thread").unwrap(),
+                &[old_fact.clone()],
+                &[old_evidence.clone()],
+            )
+            .unwrap();
+
+        let (start_tx, start_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = os_thread::spawn(move || {
+            start_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            let mut connection = Connection::open(path).unwrap();
+            connection.busy_timeout(Duration::from_secs(3)).unwrap();
+            let tx = connection.transaction().unwrap();
+            let mut new_item = old_item;
+            new_item.command = Some("cargo build".into());
+            new_item.content_version = "v2".into();
+            let mut new_fact = old_fact;
+            new_fact.subject = "cargo build".into();
+            new_fact.content_version = "v2".into();
+            let mut new_evidence = old_evidence;
+            new_evidence.excerpt = "cargo build".into();
+            new_evidence.content_version = "v2".into();
+            tx.execute("UPDATE history_items SET item_json=?1 WHERE thread_id='duplicate-thread' AND turn_id='turn' AND id='item'",
+                [serde_json::to_string(&new_item).unwrap()]).unwrap();
+            tx.execute(
+                "UPDATE source_facts SET fact_json=?1 WHERE id='fact'",
+                [serde_json::to_string(&new_fact).unwrap()],
+            )
+            .unwrap();
+            tx.execute(
+                "UPDATE source_evidence SET evidence_json=?1 WHERE id='evidence'",
+                [serde_json::to_string(&new_evidence).unwrap()],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        let during = store
+            .read_evidence_snapshot(None, Some("evidence"), || {
+                start_tx.send(()).unwrap();
+                done_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            })
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert_eq!(during.evidence.content_version, "v1");
+        assert_eq!(during.item.unwrap().content_version, "v1");
+        assert_eq!(during.fact.unwrap().content_version, "v1");
+        assert_eq!(during.location.unwrap().offset, 0);
+        let after = store.stored_evidence_snapshot("evidence").unwrap().unwrap();
+        assert_eq!(after.evidence.content_version, "v2");
+        assert_eq!(after.item.unwrap().content_version, "v2");
+        assert_eq!(after.fact.unwrap().content_version, "v2");
+        let _ = fs::remove_dir_all(dir);
     }
 }

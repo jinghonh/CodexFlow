@@ -13,7 +13,7 @@ use codexflow_domain::{
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
 };
-use codexflow_store::{PreferenceStore, SessionStore};
+use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore};
 use std::{
     path::PathBuf,
     sync::{
@@ -396,64 +396,64 @@ impl SourceService {
     }
 
     pub fn check_evidence(&self, evidence: &SourceEvidence) -> Result<EvidenceCheck, AppError> {
+        let snapshot = self.sessions.evidence_snapshot(evidence.clone())?;
+        Ok(Self::check_evidence_snapshot(snapshot))
+    }
+
+    fn check_evidence_snapshot(snapshot: EvidenceSourceSnapshot) -> EvidenceCheck {
+        let EvidenceSourceSnapshot {
+            evidence,
+            thread,
+            turn_exists,
+            item,
+            item_in_other_turn,
+            fact,
+            location,
+        } = snapshot;
         let result = |state, message: &str| EvidenceCheck {
             state,
             message: message.into(),
             location: None,
         };
-        let Some(thread) = self.sessions.thread(&evidence.thread_id)? else {
-            return Ok(result(EvidenceState::MissingThread, "证据所指会话不存在。"));
+        let Some(thread) = thread else {
+            return result(EvidenceState::MissingThread, "证据所指会话不存在。");
         };
-        if !self
-            .sessions
-            .history_turn_exists(&evidence.thread_id, &evidence.turn_id)?
-        {
-            return Ok(result(EvidenceState::MissingTurn, "证据所指回合不存在。"));
+        if !turn_exists {
+            return result(EvidenceState::MissingTurn, "证据所指回合不存在。");
         }
-        let Some(item) = self.sessions.history_item(
-            &evidence.thread_id,
-            &evidence.turn_id,
-            &evidence.item_id,
-        )?
-        else {
-            if self.sessions.item_id_in_other_turn(
-                &evidence.thread_id,
-                &evidence.turn_id,
-                &evidence.item_id,
-            )? {
-                return Ok(result(
+        let Some(item) = item else {
+            if item_in_other_turn {
+                return result(
                     EvidenceState::WrongHierarchy,
                     "条目标识存在，但不属于证据指定的回合。",
-                ));
+                );
             }
-            return Ok(result(
+            return result(
                 EvidenceState::MissingItem,
                 "证据所指条目不存在；历史可能只读取了部分内容。",
-            ));
+            );
         };
-        let Some(fact) = self.sessions.source_fact(&evidence.fact_id)? else {
-            return Ok(result(
-                EvidenceState::MissingFact,
-                "证据所属事实不存在或已被替换。",
-            ));
+        let Some(fact) = fact else {
+            return result(EvidenceState::MissingFact, "证据所属事实不存在或已被替换。");
         };
         if fact.thread_id != evidence.thread_id
             || fact.turn_id != evidence.turn_id
             || fact.item_id != evidence.item_id
             || fact.evidence_id != evidence.id
         {
-            return Ok(result(
+            return result(
                 EvidenceState::WrongHierarchy,
                 "证据定位与所属事实的会话、回合或条目不匹配。",
-            ));
+            );
         }
         if item.content_version != evidence.content_version
+            || fact.content_version != evidence.content_version
             || item.source_updated_at != thread.updated_at
         {
-            return Ok(result(
+            return result(
                 EvidenceState::StaleVersion,
                 "证据内容版本已失效；请重新读取来源历史。",
-            ));
+            );
         }
         let source = match evidence.field {
             EvidenceField::Command => item.command.as_deref(),
@@ -470,32 +470,33 @@ impl SourceService {
         if evidence.excerpt.is_empty()
             || !source.is_some_and(|text| text.contains(&evidence.excerpt))
         {
-            return Ok(result(
+            return result(
                 EvidenceState::ExcerptMissing,
                 "证据摘录无法在指定的来源字段中定位。",
-            ));
+            );
         }
-        let location = self.sessions.locate_history_item(
-            &evidence.thread_id,
-            &evidence.turn_id,
-            &evidence.item_id,
-        )?;
-        Ok(EvidenceCheck {
+        if location.is_none() {
+            return result(EvidenceState::MissingItem, "证据所指条目无法定位。");
+        }
+        EvidenceCheck {
             state: EvidenceState::Valid,
             message: "证据有效。".into(),
             location,
-        })
+        }
     }
 
     pub fn validate_source_evidence(&self, evidence_id: &str) -> Result<EvidenceCheck, AppError> {
-        let evidence = self.sessions.evidence(evidence_id)?.ok_or_else(|| {
-            AppError::codex(
-                ErrorCode::SourceReadFailed,
-                "证据不存在或已被新的自动事实替换。",
-                false,
-            )
-        })?;
-        self.check_evidence(&evidence)
+        let snapshot = self
+            .sessions
+            .stored_evidence_snapshot(evidence_id)?
+            .ok_or_else(|| {
+                AppError::codex(
+                    ErrorCode::SourceReadFailed,
+                    "证据不存在或已被新的自动事实替换。",
+                    false,
+                )
+            })?;
+        Ok(Self::check_evidence_snapshot(snapshot))
     }
 
     fn reconcile_projects(&self) -> Result<(), AppError> {
@@ -2159,6 +2160,24 @@ mod tests {
             .unwrap()
             .evidence;
         let orphan = &current_evidence[0];
+        let mut mismatched_fact = rebuilt.facts[0].clone();
+        mismatched_fact.content_version = "wrong-fact-version".into();
+        let (digest, rule, generation) = reopened.sessions.fact_index(&thread.id).unwrap().unwrap();
+        reopened
+            .sessions
+            .replace_automatic_facts(
+                &thread.id,
+                &digest,
+                &rule,
+                generation,
+                &[mismatched_fact],
+                &[orphan.clone()],
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.validate_source_evidence(&orphan.id).unwrap().state,
+            EvidenceState::StaleVersion
+        );
         let connection = rusqlite::Connection::open(root.join("sessions.sqlite3")).unwrap();
         connection
             .execute("DELETE FROM source_facts WHERE id=?1", [&orphan.fact_id])
