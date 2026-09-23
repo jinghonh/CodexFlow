@@ -1,8 +1,8 @@
 use codexflow_domain::{
-    AppError, AttributedThread, ListScopeStatus, LocalProject, Preferences, ProjectCatalog,
-    ProjectSessions, SessionList, ThreadAttribution, ThreadMetadata,
+    AppError, AttributedThread, IndexRun, IndexRunState, ListScopeStatus, LocalProject,
+    Preferences, ProjectCatalog, ProjectSessions, SessionList, ThreadAttribution, ThreadMetadata,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::{
     fs,
     io::Write,
@@ -18,6 +18,13 @@ pub struct SessionStore {
     path: PathBuf,
 }
 
+fn now_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 impl SessionStore {
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
         fs::create_dir_all(&app_data_dir)
@@ -29,7 +36,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 2 {
+        if version > 3 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -86,6 +93,26 @@ impl SessionStore {
                 .commit()
                 .map_err(|_| AppError::migration("提交项目数据库迁移失败，原数据已保留。"))?;
         }
+        if version < 3 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始索引运行数据库迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE index_runs (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    run_json TEXT NOT NULL,
+                    started_at INTEGER NOT NULL
+                );
+                CREATE INDEX index_runs_started ON index_runs(started_at DESC);
+                PRAGMA user_version = 3;",
+                )
+                .map_err(|_| AppError::migration("迁移索引运行数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交索引运行数据库迁移失败，原数据已保留。"))?;
+        }
+        store.recover_interrupted_runs()?;
         Ok(store)
     }
 
@@ -135,7 +162,25 @@ impl SessionStore {
             .transaction()
             .map_err(|_| AppError::store("开始保存会话列表失败。"))?;
         for thread in threads {
-            let json = serde_json::to_string(thread)
+            let mut thread = thread.clone();
+            let previous: Option<String> = transaction
+                .query_row(
+                    "SELECT metadata_json FROM threads WHERE id=?1",
+                    params![thread.id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("读取已有会话完整性失败。"))?;
+            if let Some(previous) = previous {
+                let previous: ThreadMetadata = serde_json::from_str(&previous)
+                    .map_err(|_| AppError::store("已有会话元数据损坏，旧缓存已保留。"))?;
+                if previous.updated_at == thread.updated_at {
+                    thread.turns_complete = previous.turns_complete;
+                    thread.items_complete = previous.items_complete;
+                    thread.content_complete = previous.content_complete;
+                }
+            }
+            let json = serde_json::to_string(&thread)
                 .map_err(|_| AppError::store("序列化会话元数据失败。"))?;
             transaction.execute(
                 "INSERT INTO threads (id, metadata_json, updated_at) VALUES (?1, ?2, ?3)
@@ -154,10 +199,142 @@ impl SessionStore {
                    error=excluded.error",
                 params![scope.archived, scope.complete, scope.attempted_at_unix_ms, scope.completed_at_unix_ms, scope.error],
             ).map_err(|_| AppError::store("保存列表完整性失败，旧缓存已保留。"))?;
+            if scope.complete {
+                let mut query = transaction
+                    .prepare("SELECT id, metadata_json FROM threads")
+                    .map_err(|_| AppError::store("检查来源完整列表失败。"))?;
+                let rows = query
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(|_| AppError::store("检查来源完整列表失败。"))?;
+                let mut stale = Vec::new();
+                for row in rows {
+                    let (id, json) = row.map_err(|_| AppError::store("读取来源完整列表失败。"))?;
+                    let mut thread: ThreadMetadata = serde_json::from_str(&json)
+                        .map_err(|_| AppError::store("会话缓存内容损坏，无法确认来源完整性。"))?;
+                    if thread.archived == scope.archived
+                        && thread.observed_at_unix_ms
+                            < scope.attempted_at_unix_ms.unwrap_or_default()
+                        && !thread.missing_from_source
+                    {
+                        thread.missing_from_source = true;
+                        stale.push((
+                            id,
+                            serde_json::to_string(&thread)
+                                .map_err(|_| AppError::store("序列化来源完整性失败。"))?,
+                        ));
+                    }
+                }
+                drop(query);
+                for (id, json) in stale {
+                    transaction
+                        .execute(
+                            "UPDATE threads SET metadata_json=?1 WHERE id=?2",
+                            params![json, id],
+                        )
+                        .map_err(|_| AppError::store("保存来源完整性失败，旧缓存已保留。"))?;
+                }
+            }
         }
         transaction
             .commit()
             .map_err(|_| AppError::store("提交会话列表失败，旧缓存已保留。"))
+    }
+
+    pub fn save_index_run(&self, run: &IndexRun) -> Result<(), AppError> {
+        let json =
+            serde_json::to_string(run).map_err(|_| AppError::store("序列化索引运行失败。"))?;
+        self.connection()?
+            .execute(
+                "INSERT INTO index_runs (id, run_json, started_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET run_json=excluded.run_json",
+                params![run.id, json, run.started_at_unix_ms],
+            )
+            .map_err(|_| AppError::store("保存索引运行失败，旧缓存已保留。"))?;
+        Ok(())
+    }
+
+    pub fn index_run(&self, id: &str) -> Result<Option<IndexRun>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT run_json FROM index_runs WHERE id=?1")
+            .map_err(|_| AppError::store("读取索引运行失败。"))?;
+        let mut rows = query
+            .query(params![id])
+            .map_err(|_| AppError::store("查询索引运行失败。"))?;
+        match rows
+            .next()
+            .map_err(|_| AppError::store("读取索引运行失败。"))?
+        {
+            Some(row) => {
+                let json: String = row
+                    .get(0)
+                    .map_err(|_| AppError::store("读取索引运行失败。"))?;
+                Ok(Some(
+                    serde_json::from_str(&json)
+                        .map_err(|_| AppError::store("索引运行数据损坏。"))?,
+                ))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn latest_index_run(&self) -> Result<Option<IndexRun>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT run_json FROM index_runs ORDER BY started_at DESC, id DESC LIMIT 1")
+            .map_err(|_| AppError::store("读取最近索引运行失败。"))?;
+        let mut rows = query
+            .query([])
+            .map_err(|_| AppError::store("查询最近索引运行失败。"))?;
+        match rows
+            .next()
+            .map_err(|_| AppError::store("读取最近索引运行失败。"))?
+        {
+            Some(row) => {
+                let json: String = row
+                    .get(0)
+                    .map_err(|_| AppError::store("读取最近索引运行失败。"))?;
+                Ok(Some(
+                    serde_json::from_str(&json)
+                        .map_err(|_| AppError::store("索引运行数据损坏。"))?,
+                ))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn recover_interrupted_runs(&self) -> Result<(), AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT run_json FROM index_runs")
+            .map_err(|_| AppError::store("读取待恢复索引运行失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询待恢复索引运行失败。"))?;
+        let mut interrupted = Vec::new();
+        for row in rows {
+            let json = row.map_err(|_| AppError::store("读取待恢复索引运行失败。"))?;
+            let mut run: IndexRun =
+                serde_json::from_str(&json).map_err(|_| AppError::store("索引运行数据损坏。"))?;
+            if !run.state.terminal() {
+                run.state = IndexRunState::Partial;
+                run.interrupted = true;
+                run.finished_at_unix_ms = Some(now_ms() as i64);
+                run.error = Some(AppError::codex(
+                    codexflow_domain::ErrorCode::SourceReadFailed,
+                    "上次索引运行因应用退出而中断；已提交缓存保留，可重新刷新。",
+                    true,
+                ));
+                interrupted.push(run);
+            }
+        }
+        drop(query);
+        for run in interrupted {
+            self.save_index_run(&run)?;
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> Result<SessionList, AppError> {
@@ -502,7 +679,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 3;")
+            .execute_batch("PRAGMA user_version = 4;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -513,7 +690,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -584,6 +761,9 @@ mod tests {
             updated_at: 2,
             archived: false,
             metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
             content_complete: false,
             read_error: None,
             observed_at_unix_ms: 3,
@@ -656,7 +836,101 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (2, 1));
+        assert_eq!((version, count), (3, 1));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reopening_marks_unfinished_run_interrupted_without_erasing_cache() {
+        let nonce = now_ms();
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-index-reopen-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let run = IndexRun {
+            id: "run-one".into(),
+            project_id: Some("project-one".into()),
+            state: IndexRunState::Running,
+            started_at_unix_ms: 123,
+            finished_at_unix_ms: None,
+            pages_saved: 2,
+            threads_seen: 12,
+            error: None,
+            interrupted: false,
+        };
+        store.save_index_run(&run).unwrap();
+        drop(store);
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        let recovered = reopened.index_run("run-one").unwrap().unwrap();
+        assert_eq!(recovered.state, IndexRunState::Partial);
+        assert!(recovered.interrupted);
+        assert_eq!(recovered.pages_saved, 2);
+        assert_eq!(recovered.project_id.as_deref(), Some("project-one"));
+        assert!(recovered.error.unwrap().cache_preserved);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_complete_scope_marks_old_threads_absent_and_metadata_keeps_content_quality() {
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-presence-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let mut thread = ThreadMetadata {
+            id: "thread-a".into(),
+            session_id: "session-a".into(),
+            title: None,
+            preview: String::new(),
+            cwd: "/tmp/example".into(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: None,
+            forked_from_id: None,
+            git: None,
+            created_at: 1,
+            updated_at: 2,
+            archived: false,
+            metadata_complete: true,
+            turns_complete: true,
+            items_complete: true,
+            missing_from_source: false,
+            content_complete: true,
+            read_error: None,
+            observed_at_unix_ms: 100,
+        };
+        store.save_collection(&[thread.clone()], &[]).unwrap();
+        thread.turns_complete = false;
+        thread.items_complete = false;
+        thread.content_complete = false;
+        thread.observed_at_unix_ms = 200;
+        store.save_collection(&[thread], &[]).unwrap();
+        let cached = &store.list().unwrap().threads[0];
+        assert!(cached.turns_complete && cached.items_complete && cached.content_complete);
+
+        let partial = ListScopeStatus {
+            archived: false,
+            complete: false,
+            attempted_at_unix_ms: Some(300),
+            completed_at_unix_ms: None,
+            error: Some("中断".into()),
+        };
+        store.save_collection(&[], &[partial]).unwrap();
+        assert!(!store.list().unwrap().threads[0].missing_from_source);
+        let complete = ListScopeStatus {
+            archived: false,
+            complete: true,
+            attempted_at_unix_ms: Some(301),
+            completed_at_unix_ms: Some(301),
+            error: None,
+        };
+        store.save_collection(&[], &[complete]).unwrap();
+        assert!(store.list().unwrap().threads[0].missing_from_source);
+        assert_eq!(store.list().unwrap().threads.len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 }

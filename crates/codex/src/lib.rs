@@ -18,6 +18,7 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
     time::timeout,
 };
+use tokio_util::sync::CancellationToken;
 
 const PROBE_THREAD_ID: &str = "00000000-0000-4000-8000-000000000000";
 const SOURCES: [&str; 10] = [
@@ -44,25 +45,56 @@ pub struct Diagnosis {
 pub struct Collection {
     pub threads: Vec<ThreadMetadata>,
     pub scopes: Vec<ListScopeStatus>,
+    pub cancelled: bool,
+}
+
+pub enum CollectionUpdate<'a> {
+    Page(&'a [ThreadMetadata]),
+    Scope(&'a ListScopeStatus),
 }
 
 impl Session {
     pub async fn collect_threads(&mut self, observed_at_unix_ms: i64) -> Collection {
+        self.collect_threads_with(observed_at_unix_ms, &CancellationToken::new(), |_| Ok(()))
+            .await
+            .expect("no-op collection callbacks cannot fail")
+    }
+
+    pub async fn collect_threads_with(
+        &mut self,
+        observed_at_unix_ms: i64,
+        cancel: &CancellationToken,
+        mut on_update: impl FnMut(CollectionUpdate<'_>) -> Result<(), AppError>,
+    ) -> Result<Collection, AppError> {
         let mut threads = BTreeMap::<String, ThreadMetadata>::new();
         let mut scopes = Vec::with_capacity(2);
+        let mut cancelled = false;
         for archived in [false, true] {
             let mut cursor: Option<String> = None;
             let mut seen_cursors = HashSet::new();
             let mut errors = Vec::new();
             loop {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                    errors.push("用户已取消列表刷新。".to_owned());
+                    break;
+                }
                 let mut params =
                     json!({"limit": 100, "sourceKinds": SOURCES, "archived": archived});
                 if let Some(ref cursor) = cursor {
                     params["cursor"] = json!(cursor);
                 }
-                let page = match self.request("thread/list", params).await {
-                    Ok(page) => page,
-                    Err(error) => {
+                let page = match tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => { cancelled = true; None },
+                    result = self.request("thread/list", params) => Some(result),
+                } {
+                    None => {
+                        errors.push("用户已取消列表刷新。".to_owned());
+                        break;
+                    }
+                    Some(Ok(page)) => page,
+                    Some(Err(error)) => {
                         errors.push(format!("列表分页读取失败：{}", error.description()));
                         break;
                     }
@@ -71,7 +103,12 @@ impl Session {
                     errors.push("列表响应缺少 data 数组。".to_owned());
                     break;
                 };
+                let mut page_threads = Vec::new();
                 for value in data {
+                    if cancel.is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
                     if value.get("ephemeral").and_then(Value::as_bool) == Some(true) {
                         continue;
                     }
@@ -80,15 +117,19 @@ impl Session {
                         errors.push("某条会话的元数据无效，已跳过。".to_owned());
                         continue;
                     };
-                    match self
+                    match tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => { cancelled = true; None },
+                        result = self
                         .request(
                             "thread/read",
                             json!({"threadId": thread.id, "includeTurns": false}),
                         )
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(error) => {
+                        => Some(result),
+                    } {
+                        None => break,
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
                             thread.read_error =
                                 Some(format!("会话读取失败：{}", error.description()))
                         }
@@ -98,9 +139,15 @@ impl Session {
                             || (thread.updated_at == old.updated_at && thread.archived)
                     });
                     if replace {
-                        threads.insert(thread.id.clone(), thread);
+                        threads.insert(thread.id.clone(), thread.clone());
                     }
+                    page_threads.push(thread);
                 }
+                if cancelled {
+                    errors.push("用户已取消列表刷新。".to_owned());
+                    break;
+                }
+                on_update(CollectionUpdate::Page(&page_threads))?;
                 let next = match page.get("nextCursor") {
                     Some(Value::String(value)) => Some(value.clone()),
                     None | Some(Value::Null) => None,
@@ -118,18 +165,24 @@ impl Session {
                     None => break,
                 }
             }
-            scopes.push(ListScopeStatus {
+            let scope = ListScopeStatus {
                 archived,
                 complete: errors.is_empty(),
                 attempted_at_unix_ms: Some(observed_at_unix_ms),
                 completed_at_unix_ms: errors.is_empty().then_some(observed_at_unix_ms),
                 error: (!errors.is_empty()).then(|| errors.join(" ")),
-            });
+            };
+            on_update(CollectionUpdate::Scope(&scope))?;
+            scopes.push(scope);
+            if cancelled {
+                break;
+            }
         }
-        Collection {
+        Ok(Collection {
             threads: threads.into_values().collect(),
             scopes,
-        }
+            cancelled,
+        })
     }
 }
 
@@ -178,6 +231,9 @@ fn parse_thread(value: &Value, archived: bool, observed_at_unix_ms: i64) -> Opti
         updated_at: value.get("updatedAt")?.as_i64()?,
         archived,
         metadata_complete: true,
+        turns_complete: false,
+        items_complete: false,
+        missing_from_source: false,
         content_complete: false,
         read_error: None,
         observed_at_unix_ms,

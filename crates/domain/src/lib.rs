@@ -86,6 +86,8 @@ pub enum ErrorCode {
     JevCredentialFailed,
     MigrationFailed,
     ProjectResolutionFailed,
+    RefreshAlreadyRunning,
+    RefreshNotFound,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,6 +117,12 @@ pub struct ThreadMetadata {
     pub updated_at: i64,
     pub archived: bool,
     pub metadata_complete: bool,
+    #[serde(default)]
+    pub turns_complete: bool,
+    #[serde(default)]
+    pub items_complete: bool,
+    #[serde(default)]
+    pub missing_from_source: bool,
     pub content_complete: bool,
     pub read_error: Option<String>,
     pub observed_at_unix_ms: i64,
@@ -135,6 +143,40 @@ pub struct ListScopeStatus {
 pub struct SessionList {
     pub threads: Vec<ThreadMetadata>,
     pub scopes: Vec<ListScopeStatus>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IndexRunState {
+    Queued,
+    Running,
+    Complete,
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+impl IndexRunState {
+    pub fn terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Complete | Self::Partial | Self::Failed | Self::Cancelled
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexRun {
+    pub id: String,
+    pub project_id: Option<String>,
+    pub state: IndexRunState,
+    pub started_at_unix_ms: i64,
+    pub finished_at_unix_ms: Option<i64>,
+    pub pages_saved: u64,
+    pub threads_seen: u64,
+    pub error: Option<AppError>,
+    pub interrupted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

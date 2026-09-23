@@ -1,10 +1,10 @@
 mod projects;
 
-use codexflow_codex::{diagnose, Session};
+use codexflow_codex::{diagnose, CollectionUpdate, Session};
 use codexflow_domain::{
-    AppError, ConnectionState, DisplayTheme, ErrorCode, JevConfig, JevConnectionResult,
-    JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectSessions, SessionList,
-    SourceStatus,
+    AppError, ConnectionState, DisplayTheme, ErrorCode, IndexRun, IndexRunState, JevConfig,
+    JevConnectionResult, JevInferenceResult, JevStatus, Preferences, ProjectCatalog,
+    ProjectSessions, SessionList, SourceStatus,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -34,6 +34,7 @@ pub struct SourceService {
     reconciliation_revision: AtomicU64,
     jev_gate: RwLock<()>,
     jev_cancel: Mutex<CancellationToken>,
+    refresh_active: std::sync::Mutex<Option<(String, CancellationToken)>>,
 }
 
 struct State {
@@ -67,6 +68,7 @@ impl SourceService {
             reconciliation_revision: AtomicU64::new(0),
             jev_gate: RwLock::new(()),
             jev_cancel: Mutex::new(CancellationToken::new()),
+            refresh_active: std::sync::Mutex::new(None),
         };
         service.reconcile_projects()?;
         Ok(service)
@@ -266,6 +268,9 @@ impl SourceService {
 
     pub async fn shutdown(&self) {
         self.cancel_jev().await;
+        if let Some((_, token)) = self.refresh_active.lock().unwrap().as_ref() {
+            token.cancel();
+        }
         let mut state = self.state.lock().await;
         if let Some(mut session) = state.session.take() {
             session.close().await;
@@ -345,44 +350,203 @@ impl SourceService {
     }
 
     pub async fn refresh_sessions(&self) -> Result<SessionList, AppError> {
-        let mut state = self.state.lock().await;
-        let attempted_at = now_ms() as i64;
-        self.sessions.begin_refresh(attempted_at)?;
-        check_process(&mut state);
-        let session = match state.session.as_mut() {
-            Some(session) => session,
-            None => {
-                self.sessions
-                    .fail_refresh(attempted_at, "来源当前不可用；旧缓存已保留。")?;
-                return Err(AppError::codex(
-                    ErrorCode::SourceReadFailed,
-                    "Codex 来源当前不可用。请先连接，已有会话缓存仍可浏览。",
-                    true,
-                ));
+        let (mut run, token) = self.reserve_refresh(None)?;
+        let result = self.run_refresh(&mut run, &token, &|_| {}).await;
+        self.clear_refresh(&run.id);
+        result
+    }
+
+    pub fn latest_refresh(&self) -> Result<Option<IndexRun>, AppError> {
+        self.sessions.latest_index_run()
+    }
+
+    pub fn refresh_status(&self, id: &str) -> Result<IndexRun, AppError> {
+        self.sessions.index_run(id)?.ok_or_else(|| {
+            AppError::codex(ErrorCode::RefreshNotFound, "找不到指定的索引运行。", false)
+        })
+    }
+
+    pub fn cancel_refresh(&self, id: &str) -> Result<IndexRun, AppError> {
+        let active = self.refresh_active.lock().unwrap();
+        if let Some((active_id, token)) = active.as_ref() {
+            if active_id == id {
+                token.cancel();
+                return self.refresh_status(id);
             }
+        }
+        drop(active);
+        self.refresh_status(id)
+    }
+
+    pub fn start_refresh(
+        self: &Arc<Self>,
+        project_id: Option<String>,
+        notify: impl Fn(IndexRun) + Send + Sync + 'static,
+    ) -> Result<IndexRun, AppError> {
+        let (run, token) = self.reserve_refresh(project_id)?;
+        let queued = run.clone();
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut run = run;
+            let _ = service.run_refresh(&mut run, &token, &notify).await;
+            service.clear_refresh(&run.id);
+        });
+        Ok(queued)
+    }
+
+    fn reserve_refresh(
+        &self,
+        project_id: Option<String>,
+    ) -> Result<(IndexRun, CancellationToken), AppError> {
+        static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+        let mut active = self.refresh_active.lock().unwrap();
+        if active.is_some() {
+            return Err(AppError::codex(
+                ErrorCode::RefreshAlreadyRunning,
+                "已有索引运行正在执行，请等待或取消后再刷新。",
+                true,
+            ));
+        }
+        let started_at_unix_ms = (now_ms() as i64).max(
+            self.sessions
+                .latest_index_run()?
+                .map_or(0, |previous| previous.started_at_unix_ms + 1),
+        );
+        let run = IndexRun {
+            id: format!(
+                "index-{started_at_unix_ms}-{}-{}",
+                std::process::id(),
+                NEXT_RUN.fetch_add(1, Ordering::Relaxed)
+            ),
+            project_id,
+            state: IndexRunState::Queued,
+            started_at_unix_ms,
+            finished_at_unix_ms: None,
+            pages_saved: 0,
+            threads_seen: 0,
+            error: None,
+            interrupted: false,
         };
-        let collection = session.collect_threads(attempted_at).await;
-        let save_result = {
-            let _updates = self.lock_project_updates();
-            match self
-                .sessions
-                .save_collection(&collection.threads, &collection.scopes)
-            {
-                Ok(()) => {
-                    self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
-                    Ok(())
-                }
-                Err(error) => Err(error),
-            }
-        };
-        if let Err(error) = save_result {
-            let _ = self
-                .sessions
-                .fail_refresh(attempted_at, "保存会话列表失败；旧缓存已保留。");
+        self.sessions.save_index_run(&run)?;
+        let token = CancellationToken::new();
+        *active = Some((run.id.clone(), token.clone()));
+        Ok((run, token))
+    }
+
+    fn clear_refresh(&self, id: &str) {
+        let mut active = self.refresh_active.lock().unwrap();
+        if active
+            .as_ref()
+            .is_some_and(|(active_id, _)| active_id == id)
+        {
+            *active = None;
+        }
+    }
+
+    async fn run_refresh(
+        &self,
+        run: &mut IndexRun,
+        token: &CancellationToken,
+        notify: &(dyn Fn(IndexRun) + Send + Sync),
+    ) -> Result<SessionList, AppError> {
+        let attempted_at = run.started_at_unix_ms;
+        run.state = IndexRunState::Running;
+        if let Err(error) = self.sessions.save_index_run(run) {
+            run.state = IndexRunState::Failed;
+            run.error = Some(error.clone());
+            run.finished_at_unix_ms = Some(now_ms() as i64);
+            let _ = self.sessions.save_index_run(run);
+            notify(run.clone());
             return Err(error);
         }
-        self.reconcile_projects()?;
-        self.sessions.list()
+        notify(run.clone());
+        let result = self.collect_refresh(run, token, notify, attempted_at).await;
+        run.finished_at_unix_ms = Some(now_ms() as i64);
+        match &result {
+            Ok((_, cancelled, complete, any_success)) => {
+                run.state = if *cancelled {
+                    IndexRunState::Cancelled
+                } else if *complete {
+                    IndexRunState::Complete
+                } else if *any_success {
+                    IndexRunState::Partial
+                } else {
+                    IndexRunState::Failed
+                };
+                if !complete && !cancelled {
+                    run.error = Some(AppError::codex(
+                        ErrorCode::SourceReadFailed,
+                        "来源列表未全部读取成功；已提交的缓存仍可浏览，请重试刷新。",
+                        true,
+                    ));
+                }
+            }
+            Err(error) => {
+                run.state = if token.is_cancelled() {
+                    IndexRunState::Cancelled
+                } else {
+                    IndexRunState::Failed
+                };
+                run.error = Some(error.clone());
+                let _ = self.sessions.fail_refresh(attempted_at, &error.message);
+            }
+        }
+        self.sessions.save_index_run(run)?;
+        notify(run.clone());
+        result.map(|(list, _, _, _)| list)
+    }
+
+    async fn collect_refresh(
+        &self,
+        run: &mut IndexRun,
+        token: &CancellationToken,
+        notify: &(dyn Fn(IndexRun) + Send + Sync),
+        attempted_at: i64,
+    ) -> Result<(SessionList, bool, bool, bool), AppError> {
+        self.sessions.begin_refresh(attempted_at)?;
+        let mut state = self.state.lock().await;
+        check_process(&mut state);
+        let session = state.session.as_mut().ok_or_else(|| {
+            AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "Codex 来源当前不可用。请先连接，已有会话缓存仍可浏览。",
+                true,
+            )
+        })?;
+        let collection = session
+            .collect_threads_with(attempted_at, token, |update| {
+                match update {
+                    CollectionUpdate::Page(threads) => {
+                        {
+                            let _updates = self.lock_project_updates();
+                            self.sessions.save_collection(threads, &[])?;
+                            self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
+                        }
+                        run.pages_saved += 1;
+                        run.threads_seen += threads.len() as u64;
+                        self.reconcile_projects()?;
+                    }
+                    CollectionUpdate::Scope(scope) => {
+                        self.sessions
+                            .save_collection(&[], std::slice::from_ref(scope))?;
+                    }
+                }
+                self.sessions.save_index_run(run)?;
+                notify(run.clone());
+                Ok(())
+            })
+            .await?;
+        check_process(&mut state);
+        let complete =
+            collection.scopes.len() == 2 && collection.scopes.iter().all(|scope| scope.complete);
+        let any_success =
+            run.pages_saved > 0 || collection.scopes.iter().any(|scope| scope.complete);
+        Ok((
+            self.sessions.list()?,
+            collection.cancelled,
+            complete,
+            any_success,
+        ))
     }
 }
 
@@ -1142,6 +1306,9 @@ mod tests {
                     updated_at: 1,
                     archived: false,
                     metadata_complete: true,
+                    turns_complete: false,
+                    items_complete: false,
+                    missing_from_source: false,
                     content_complete: false,
                     read_error: None,
                     observed_at_unix_ms: 1,
@@ -1234,6 +1401,9 @@ mod tests {
             updated_at: 1,
             archived: false,
             metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
             content_complete: false,
             read_error: None,
             observed_at_unix_ms: 1,
@@ -1305,6 +1475,200 @@ mod tests {
         assert_eq!(sessions.threads.len(), 1);
         assert_eq!(sessions.threads[0].thread.id, "inside");
         assert_eq!(reopened.project_catalog().unwrap().unassigned.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn paged_refresh_can_be_cancelled_and_resumed_without_losing_cache_or_project() {
+        use tokio::time::{sleep, timeout, Duration};
+        let root = temp_data_dir();
+        fs::create_dir_all(&root).unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        for mode in [
+            "list-rich",
+            "list-rich-second-gate",
+            "list-partial",
+            "list-rich-exit-second",
+        ] {
+            let binary = root.join(format!("fake-{mode}.py"));
+            fs::write(
+                &binary,
+                include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
+            )
+            .unwrap();
+            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let service = Arc::new(SourceService::new(root.join("data")).unwrap());
+        let project_id = service
+            .choose_project(project.to_str().unwrap())
+            .unwrap()
+            .selected_project_id
+            .unwrap();
+        service
+            .connect(Some(
+                root.join("fake-list-rich.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let first = service
+            .start_refresh(Some(project_id.clone()), |_| {})
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if service.refresh_status(&first.id).unwrap().state.terminal() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.refresh_status(&first.id).unwrap().state,
+            IndexRunState::Complete
+        );
+        assert_eq!(service.cached_sessions().unwrap().threads.len(), 4);
+
+        service
+            .connect(Some(
+                root.join("fake-list-rich-second-gate.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        fs::write(root.join("pause-refresh"), "").unwrap();
+        let second = service
+            .start_refresh(Some(project_id.clone()), |_| {})
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if root.join("refresh-paused").exists()
+                    && service.refresh_status(&second.id).unwrap().pages_saved > 0
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.refresh_status(&second.id).unwrap().state,
+            IndexRunState::Running
+        );
+        assert!(service
+            .cached_sessions()
+            .unwrap()
+            .threads
+            .iter()
+            .all(|thread| !thread.missing_from_source));
+        service.cancel_refresh(&second.id).unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if service.refresh_status(&second.id).unwrap().state.terminal() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.refresh_status(&second.id).unwrap().state,
+            IndexRunState::Cancelled
+        );
+        assert_eq!(service.cached_sessions().unwrap().threads.len(), 4);
+        fs::remove_file(root.join("pause-refresh")).unwrap();
+        service.shutdown().await;
+        drop(service);
+
+        let reopened = Arc::new(SourceService::new(root.join("data")).unwrap());
+        assert_eq!(
+            reopened
+                .project_catalog()
+                .unwrap()
+                .selected_project_id
+                .as_deref(),
+            Some(project_id.as_str())
+        );
+        assert_eq!(
+            reopened.refresh_status(&second.id).unwrap().state,
+            IndexRunState::Cancelled
+        );
+        assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
+        reopened
+            .connect(Some(
+                root.join("fake-list-partial.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let partial = reopened
+            .start_refresh(Some(project_id.clone()), |_| {})
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if reopened
+                    .refresh_status(&partial.id)
+                    .unwrap()
+                    .state
+                    .terminal()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.refresh_status(&partial.id).unwrap().state,
+            IndexRunState::Partial
+        );
+        assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
+        assert!(reopened
+            .cached_sessions()
+            .unwrap()
+            .threads
+            .iter()
+            .all(|thread| !thread.missing_from_source));
+        reopened
+            .connect(Some(
+                root.join("fake-list-rich-exit-second.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let exited = reopened
+            .start_refresh(Some(project_id.clone()), |_| {})
+            .unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if reopened
+                    .refresh_status(&exited.id)
+                    .unwrap()
+                    .state
+                    .terminal()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            reopened.refresh_status(&exited.id).unwrap().state,
+            IndexRunState::Partial
+        );
+        assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
+        reopened.shutdown().await;
         let _ = fs::remove_dir_all(root);
     }
 }

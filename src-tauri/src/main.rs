@@ -1,13 +1,14 @@
 use codexflow_core::SourceService;
 use codexflow_domain::{
-    AppError, DisplayTheme, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
-    ProjectSessions, SessionList, SourceStatus,
+    AppError, DisplayTheme, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus,
+    ProjectCatalog, ProjectSessions, SessionList, SourceStatus,
 };
 use serde::Serialize;
-use tauri::Manager;
+use std::sync::Arc;
+use tauri::{Emitter, Manager};
 
 struct AppState {
-    service: Result<SourceService, AppError>,
+    service: Result<Arc<SourceService>, AppError>,
 }
 
 #[derive(Serialize)]
@@ -17,7 +18,7 @@ struct SettingsView {
     source: SourceStatus,
 }
 
-fn service<'a>(state: &'a tauri::State<'_, AppState>) -> Result<&'a SourceService, AppError> {
+fn service<'a>(state: &'a tauri::State<'_, AppState>) -> Result<&'a Arc<SourceService>, AppError> {
     state.service.as_ref().map_err(Clone::clone)
 }
 
@@ -99,6 +100,32 @@ async fn refresh_session_list(state: tauri::State<'_, AppState>) -> Result<Sessi
 }
 
 #[tauri::command]
+fn start_index_run(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    project_id: Option<String>,
+) -> Result<IndexRun, AppError> {
+    service(&state)?.start_refresh(project_id, move |run| {
+        let _ = app.emit("index-run", run);
+    })
+}
+
+#[tauri::command]
+fn get_latest_index_run(state: tauri::State<'_, AppState>) -> Result<Option<IndexRun>, AppError> {
+    service(&state)?.latest_refresh()
+}
+
+#[tauri::command]
+fn get_index_run(state: tauri::State<'_, AppState>, id: String) -> Result<IndexRun, AppError> {
+    service(&state)?.refresh_status(&id)
+}
+
+#[tauri::command]
+fn cancel_index_run(state: tauri::State<'_, AppState>, id: String) -> Result<IndexRun, AppError> {
+    service(&state)?.cancel_refresh(&id)
+}
+
+#[tauri::command]
 fn get_project_catalog(state: tauri::State<'_, AppState>) -> Result<ProjectCatalog, AppError> {
     service(&state)?.project_catalog()
 }
@@ -133,7 +160,7 @@ fn main() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             app.manage(AppState {
-                service: SourceService::new(data_dir),
+                service: SourceService::new(data_dir).map(Arc::new),
             });
             Ok(())
         })
@@ -150,6 +177,10 @@ fn main() {
             cancel_jev_request,
             get_session_list,
             refresh_session_list,
+            start_index_run,
+            get_latest_index_run,
+            get_index_run,
+            cancel_index_run,
             get_project_catalog,
             get_project_sessions,
             choose_project,

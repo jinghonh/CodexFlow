@@ -67,17 +67,24 @@ for line in sys.stdin:
     elif method == "thread/list" and mode.endswith("unknown-method"):
         response = {"id": request["id"], "error": {"code": -32600, "message": "Invalid request: unknown variant `thread/list`"}}
     elif method == "thread/list":
+        if mode.endswith("list-rich-exit-second") and request["params"].get("cursor") == "next-live":
+            raise SystemExit(0)
         if mode.startswith("fake-gated-"):
             pause = pathlib.Path(__file__).parent / "pause-refresh"
             if pause.exists():
                 pause.with_name("refresh-paused").touch()
                 while pause.exists():
                     time.sleep(0.01)
+        if mode.endswith("list-rich-second-gate") and request["params"].get("cursor") == "next-live":
+            pause = pathlib.Path(__file__).parent / "pause-refresh"
+            pause.with_name("refresh-paused").touch()
+            while pause.exists():
+                time.sleep(0.01)
         assert request["params"]["sourceKinds"] == ["cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"]
         params = request["params"]
         if mode.endswith("list-partial") and params.get("cursor") == "next-live":
             response = {"id": request["id"], "error": {"code": -32000, "message": "page failed"}}
-        elif mode.endswith(("list-rich", "list-partial", "list-moved")):
+        elif mode.endswith(("list-rich", "list-partial", "list-moved", "list-rich-second-gate", "list-rich-exit-second")):
             if mode.endswith("list-moved") and params["archived"]:
                 data = [thread("thread-a", "cli", True), thread("thread-b", {"subAgent": "review"}, True), thread("thread-d", "exec", True)]
                 next_cursor = None

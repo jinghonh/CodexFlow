@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./style.css";
 
@@ -38,6 +39,7 @@ type Thread = {
   threadSource: string | null; parentThreadId: string | null; forkedFromId: string | null;
   git: { branch: string | null; sha: string | null; originUrl: string | null } | null;
   createdAt: number; updatedAt: number; archived: boolean; metadataComplete: boolean;
+  turnsComplete: boolean; itemsComplete: boolean; missingFromSource: boolean;
   contentComplete: boolean; readError: string | null; observedAtUnixMs: number;
 };
 type Scope = { archived: boolean; complete: boolean; attemptedAtUnixMs: number | null; completedAtUnixMs: number | null; error: string | null };
@@ -47,6 +49,8 @@ type Attribution = { threadId: string; projectId: string | null; workspaceRoot: 
 type AttributedThread = { thread: Thread; attribution: Attribution };
 type ProjectCatalog = { projects: Project[]; selectedProjectId: string | null; recentProjectIds: string[]; unassigned: AttributedThread[]; scopes: Scope[] };
 type ProjectSessions = { project: Project; workspaces: string[]; threads: AttributedThread[]; scopes: Scope[] };
+type IndexRun = { id: string; projectId: string | null; state: "queued" | "running" | "complete" | "partial" | "failed" | "cancelled"; startedAtUnixMs: number; finishedAtUnixMs: number | null; pagesSaved: number; threadsSeen: number; error: AppError | null; interrupted: boolean };
+const runLabels: Record<IndexRun["state"], string> = { queued: "待执行", running: "执行中", complete: "完成", partial: "部分完成", failed: "失败", cancelled: "已取消" };
 
 const labels: { key: keyof SourceStatus["capabilities"]; title: string; number: string }[] = [
   { key: "metadata", title: "会话元数据", number: "01" },
@@ -84,56 +88,68 @@ function App() {
   const [jevInference, setJevInference] = useState<JevInferenceResult | null>(null);
   const jevEpoch = useRef(0);
   const [listError, setListError] = useState("");
-  const [refreshing, setRefreshing] = useState(false);
+  const [indexRun, setIndexRun] = useState<IndexRun | null>(null);
+  const refreshing = indexRun?.state === "queued" || indexRun?.state === "running";
   const [query, setQuery] = useState("");
+  const projectEpoch = useRef(0);
+
+  function recordRun(run: IndexRun | null) {
+    setIndexRun((previous) => {
+      if (!run) return previous;
+      if (previous && run.startedAtUnixMs < previous.startedAtUnixMs) return previous;
+      if (previous?.id === run.id && previous.finishedAtUnixMs !== null && run.finishedAtUnixMs === null) return previous;
+      return run;
+    });
+  }
 
   async function loadProjects() {
+    const epoch = projectEpoch.current;
     const catalog = await invoke<ProjectCatalog>("get_project_catalog");
-    setProjectCatalog(catalog);
-    setProjectSessions(catalog.selectedProjectId
+    const sessions = catalog.selectedProjectId
       ? await invoke<ProjectSessions>("get_project_sessions", { projectId: catalog.selectedProjectId })
-      : null);
+      : null;
+    if (epoch !== projectEpoch.current) return;
+    setProjectCatalog(catalog);
+    setProjectSessions(sessions);
   }
 
   useEffect(() => {
     let active = true;
+    let unlisten: (() => void) | undefined;
+    listen<IndexRun>("index-run", (event) => {
+      if (!active) return;
+      recordRun(event.payload);
+      void loadProjects().catch((error) => setListError(errorText(error)));
+    }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});
     invoke<Settings>("get_settings")
       .then(async (settings) => {
         if (!active) return;
+        let selectedProjectId: string | null = null;
         try {
           const catalog = await invoke<ProjectCatalog>("get_project_catalog");
           if (active) {
             setProjectCatalog(catalog);
+            selectedProjectId = catalog.selectedProjectId;
             if (catalog.selectedProjectId) setProjectSessions(await invoke<ProjectSessions>("get_project_sessions", { projectId: catalog.selectedProjectId }));
           }
         } catch (error) { if (active) setListError(errorText(error)); }
         if (!active) return;
+        recordRun(await invoke<IndexRun | null>("get_latest_index_run"));
         setTheme(settings.theme);
         setPath(settings.source.selectedBinary ?? "");
         setSource(settings.source);
+        setBusy(false);
         const next = await invoke<SourceStatus>("connect_source", { selectedBinary: settings.source.selectedBinary });
         if (active) setSource(next);
-        if (active && next.connection === "connected") {
-          setRefreshing(true);
-          try {
-            await invoke<SessionList>("refresh_session_list");
-            if (active) { await loadProjects(); setListError(""); }
-          } catch (error) {
-            if (active) {
-              setListError(errorText(error));
-              try { if (active) await loadProjects(); }
-              catch (cacheError) { if (active) setListError(errorText(cacheError)); }
-            }
-          }
-          finally { if (active) setRefreshing(false); }
-        }
+        if (active && next.connection === "connected" && selectedProjectId) await startRefresh(selectedProjectId);
       })
       .catch((error) => { if (active) setPageError(errorText(error)); })
       .finally(() => { if (active) setBusy(false); });
     const timer = window.setInterval(() => {
       invoke<SourceStatus>("get_source_status").then((next) => { if (active) setSource(next); }).catch(() => {});
+      invoke<IndexRun | null>("get_latest_index_run").then((run) => { if (active) recordRun(run); }).catch(() => {});
     }, 4000);
-    return () => { active = false; window.clearInterval(timer); };
+    return () => { active = false; unlisten?.(); window.clearInterval(timer); };
   }, []);
 
   useEffect(() => {
@@ -155,21 +171,28 @@ function App() {
       const next = await invoke<SourceStatus>("connect_source", { selectedBinary: value.trim() || null });
       setSource(next);
       setPath(value);
-      if (next.connection === "connected") await refreshSessions();
+      if (next.connection === "connected" && projectCatalog?.selectedProjectId) await startRefresh(projectCatalog.selectedProjectId);
     } catch (error) { setPageError(errorText(error)); }
     finally { setBusy(false); }
   }
 
-  async function refreshSessions() {
-    setRefreshing(true);
+  async function startRefresh(projectId: string | null) {
     setListError("");
-    try { await invoke<SessionList>("refresh_session_list"); await loadProjects(); }
-    catch (error) {
-      setListError(errorText(error));
-      try { await loadProjects(); }
-      catch (cacheError) { setListError(errorText(cacheError)); }
+    try {
+      const queued = await invoke<IndexRun>("start_index_run", { projectId });
+      recordRun(await invoke<IndexRun>("get_index_run", { id: queued.id }));
     }
-    finally { setRefreshing(false); }
+    catch (error) {
+      const latest = await invoke<IndexRun | null>("get_latest_index_run").catch(() => null);
+      if (latest?.state === "queued" || latest?.state === "running") recordRun(latest);
+      else setListError(errorText(error));
+    }
+  }
+
+  async function cancelRefresh() {
+    if (!indexRun || !refreshing) return;
+    try { await invoke<IndexRun>("cancel_index_run", { id: indexRun.id }); }
+    catch (error) { setListError(errorText(error)); }
   }
 
   async function browse() {
@@ -195,24 +218,32 @@ function App() {
 
   async function chooseProject() {
     if (!projectPath.trim()) return;
+    projectEpoch.current += 1;
     try {
       const catalog = await invoke<ProjectCatalog>("choose_project", { path: projectPath.trim() });
-      setProjectCatalog(catalog);
-      setProjectSessions(catalog.selectedProjectId
+      const sessions = catalog.selectedProjectId
         ? await invoke<ProjectSessions>("get_project_sessions", { projectId: catalog.selectedProjectId })
-        : null);
+        : null;
+      projectEpoch.current += 1;
+      setProjectCatalog(catalog);
+      setProjectSessions(sessions);
       setShowUnassigned(false);
       setProjectError("");
+      await startRefresh(catalog.selectedProjectId);
     } catch (error) { setProjectError(errorText(error)); }
   }
 
   async function chooseExistingProject(projectId: string) {
+    projectEpoch.current += 1;
     try {
       const catalog = await invoke<ProjectCatalog>("choose_existing_project", { projectId });
+      const sessions = await invoke<ProjectSessions>("get_project_sessions", { projectId });
+      projectEpoch.current += 1;
       setProjectCatalog(catalog);
-      setProjectSessions(await invoke<ProjectSessions>("get_project_sessions", { projectId }));
+      setProjectSessions(sessions);
       setShowUnassigned(false);
       setProjectError("");
+      await startRefresh(projectId);
     } catch (error) { setProjectError(errorText(error)); }
   }
 
@@ -381,13 +412,14 @@ function App() {
           <button className={`unassigned-choice ${showUnassigned ? "selected" : ""}`} onClick={() => setShowUnassigned(true)}>未归属会话：{projectCatalog?.unassigned.length ?? 0} 条</button>
         </section>
         <section id="sessions" className="panel session-panel">
-          <div className="session-heading"><div><div className="panel-kicker">03 / 项目会话</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><button className="primary-button" disabled={!connected || refreshing} onClick={() => void refreshSessions()}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button></div>
+          <div className="session-heading"><div><div className="panel-kicker">03 / 项目会话</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
+          {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{indexRun.error.code}：{indexRun.error.message}</em>}</div>}
           {!showUnassigned && projectSessions && <div className="workspace-list"><strong>实际工作区</strong>{projectSessions.workspaces.length ? projectSessions.workspaces.map((workspace) => <code key={workspace}>{workspace}</code>) : <span>当前没有可验证的工作区</span>}</div>}
-          <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{!attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>历史内容：待采集</span></div>
+          <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{refreshing ? "刷新中；缓存可浏览" : !attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>回合：待采集 · 条目：待采集</span></div>
           {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "已归档" : "未归档"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "上次列表完整" : "最近读取未完成"}</span><small>{scope.completedAtUnixMs ? `上次完整读取 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整读取记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}
           {listError && <div className="page-error" role="alert">{listError} 已保存的会话仍可浏览。</div>}
           <label className="session-search">查找会话<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="标题、预览、Thread ID 或工作目录" /></label>
-          <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{query ? "没有匹配的会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : visibleThreads.map(({ thread, attribution }) => <article className="thread-row" key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
+          <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{query ? "没有匹配的会话。" : refreshing ? "正在刷新；缓存中暂无会话。" : !connected && attempted ? "来源当前不可用；缓存中暂无会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : visibleThreads.map(({ thread, attribution }) => <article className="thread-row" key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.missingFromSource && <span className="thread-warning">完整列表中未再次出现</span>}{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>元数据 / 回合 / 条目</span><code>{thread.metadataComplete ? "完整" : "不完整"} / {thread.turnsComplete ? "完整" : "待采集"} / {thread.itemsComplete ? "完整" : "待采集"}</code></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
         </section>
         <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。Jev 连接检查不运行推理；只有点击“测试固定合成推理”才会发起该次模型调用。</p>
       </div>
