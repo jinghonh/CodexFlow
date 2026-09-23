@@ -25,6 +25,37 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn merge_thread_metadata(previous: ThreadMetadata, incoming: ThreadMetadata) -> ThreadMetadata {
+    // The two list scopes can return the same ID at different source versions.
+    if previous.updated_at > incoming.updated_at {
+        let mut latest = previous;
+        latest.observed_at_unix_ms = latest.observed_at_unix_ms.max(incoming.observed_at_unix_ms);
+        latest.missing_from_source = false;
+        return latest;
+    }
+    if previous.updated_at < incoming.updated_at {
+        return incoming;
+    }
+
+    // Within one refresh, the archived scope wins an equal-version duplicate.
+    let same_refresh = previous.observed_at_unix_ms == incoming.observed_at_unix_ms;
+    let prefer_previous = same_refresh && previous.archived && !incoming.archived;
+    let mut merged = if prefer_previous {
+        previous.clone()
+    } else {
+        incoming
+    };
+    merged.turns_complete = previous.turns_complete;
+    merged.items_complete = previous.items_complete;
+    merged.content_complete = previous.content_complete;
+    merged.observed_at_unix_ms = previous.observed_at_unix_ms.max(merged.observed_at_unix_ms);
+    merged.missing_from_source = false;
+    if same_refresh {
+        merged.archived |= previous.archived;
+    }
+    merged
+}
+
 impl SessionStore {
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
         fs::create_dir_all(&app_data_dir)
@@ -174,11 +205,7 @@ impl SessionStore {
             if let Some(previous) = previous {
                 let previous: ThreadMetadata = serde_json::from_str(&previous)
                     .map_err(|_| AppError::store("已有会话元数据损坏，旧缓存已保留。"))?;
-                if previous.updated_at == thread.updated_at {
-                    thread.turns_complete = previous.turns_complete;
-                    thread.items_complete = previous.items_complete;
-                    thread.content_complete = previous.content_complete;
-                }
+                thread = merge_thread_metadata(previous, thread);
             }
             let json = serde_json::to_string(&thread)
                 .map_err(|_| AppError::store("序列化会话元数据失败。"))?;
@@ -647,6 +674,38 @@ mod tests {
     use super::*;
     use codexflow_domain::{DisplayTheme, ErrorCode};
 
+    fn thread(
+        title: &str,
+        updated_at: i64,
+        archived: bool,
+        observed_at_unix_ms: i64,
+    ) -> ThreadMetadata {
+        ThreadMetadata {
+            id: "duplicate-thread".into(),
+            session_id: "session-duplicate-thread".into(),
+            title: Some(title.into()),
+            preview: title.into(),
+            cwd: "/tmp/example".into(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: None,
+            forked_from_id: None,
+            git: None,
+            created_at: 1,
+            updated_at,
+            archived,
+            metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
+            content_complete: false,
+            read_error: None,
+            observed_at_unix_ms,
+        }
+    }
+
     #[test]
     fn selection_and_theme_survive_reopen() {
         let nonce = SystemTime::now()
@@ -932,5 +991,67 @@ mod tests {
         assert!(store.list().unwrap().threads[0].missing_from_source);
         assert_eq!(store.list().unwrap().threads.len(), 1);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn older_duplicate_does_not_replace_newer_metadata_or_content_integrity() {
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-newest-duplicate-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let mut newest = thread("newest metadata", 20, false, 100);
+        newest.turns_complete = true;
+        newest.items_complete = true;
+        newest.content_complete = true;
+        newest.missing_from_source = true;
+        store.save_collection(&[newest], &[]).unwrap();
+
+        let stale = thread("stale archived copy", 10, true, 200);
+        store.save_collection(&[stale], &[]).unwrap();
+
+        let cached = store.list().unwrap().threads.remove(0);
+        assert_eq!(cached.updated_at, 20);
+        assert_eq!(cached.title.as_deref(), Some("newest metadata"));
+        assert!(!cached.archived);
+        assert!(cached.turns_complete && cached.items_complete && cached.content_complete);
+        assert!(!cached.missing_from_source);
+        assert_eq!(cached.observed_at_unix_ms, 200);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_version_archive_duplicate_has_order_independent_metadata_and_integrity() {
+        for (index, archive_first) in [false, true].into_iter().enumerate() {
+            let dir = std::env::temp_dir().join(format!(
+                "codexflow-archive-duplicate-{}-{}-{index}",
+                std::process::id(),
+                now_ms()
+            ));
+            let store = SessionStore::new(dir.clone()).unwrap();
+            let mut cached = thread("cached metadata", 20, false, 100);
+            cached.turns_complete = true;
+            cached.items_complete = true;
+            cached.content_complete = true;
+            store.save_collection(&[cached], &[]).unwrap();
+
+            let live = thread("live scope copy", 20, false, 200);
+            let archived = thread("archived scope copy", 20, true, 200);
+            if archive_first {
+                store.save_collection(&[archived], &[]).unwrap();
+                store.save_collection(&[live], &[]).unwrap();
+            } else {
+                store.save_collection(&[live], &[]).unwrap();
+                store.save_collection(&[archived], &[]).unwrap();
+            }
+
+            let cached = store.list().unwrap().threads.remove(0);
+            assert_eq!(cached.title.as_deref(), Some("archived scope copy"));
+            assert!(cached.archived);
+            assert!(cached.turns_complete && cached.items_complete && cached.content_complete);
+            assert_eq!(cached.observed_at_unix_ms, 200);
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 }

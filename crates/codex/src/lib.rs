@@ -489,6 +489,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_a_partial_response_keeps_the_session_readable() {
+        use tokio::time::{sleep, timeout};
+
+        let path = fake_binary("cancel-partial");
+        let marker_dir = path.parent().unwrap();
+        let started = marker_dir.join("partial-response-started");
+        let resume = marker_dir.join("resume-partial-response");
+        let mut session = Session::start(&path).await.unwrap();
+        session.initialize(true).await.unwrap();
+        for request_number in [1, 2] {
+            let result = session
+                .request("thread/list", json!({"limit": 1}))
+                .await
+                .unwrap();
+            assert_eq!(result["marker"], format!("request-{request_number}"));
+        }
+
+        let cancel = CancellationToken::new();
+        let mut request = Box::pin(session.request("thread/list", json!({"limit": 1})));
+        tokio::select! {
+            biased;
+            result = &mut request => panic!("partial response unexpectedly completed: {result:?}"),
+            _ = async {
+                timeout(Duration::from_secs(2), async {
+                    while !started.exists() {
+                        sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                cancel.cancel();
+                cancel.cancelled().await;
+            } => {}
+        }
+        drop(request);
+        assert!(!session.pending_line.is_empty());
+        assert!(!session.pending_line.ends_with(b"\n"));
+
+        fs::write(&resume, "").unwrap();
+        let result = timeout(
+            Duration::from_secs(2),
+            session.request("thread/list", json!({"limit": 1})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["marker"], "request-4");
+        assert!(session.pending_line.is_empty());
+
+        session.close().await;
+        let _ = fs::remove_dir_all(marker_dir);
+    }
+
+    #[tokio::test]
     async fn missing_list_is_incompatible() {
         let path = fake_binary("missing-list");
         let error = diagnose(Some(path.to_str().unwrap()))
@@ -796,6 +850,8 @@ pub struct Session {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    // Keep read_until's partial bytes when its request future is cancelled.
+    pending_line: Vec<u8>,
     next_id: u64,
 }
 
@@ -821,6 +877,7 @@ impl Session {
             child,
             stdin,
             stdout,
+            pending_line: Vec::new(),
             next_id: 1,
         })
     }
@@ -855,10 +912,9 @@ impl Session {
             .await?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
         loop {
-            let mut line = String::new();
             let count = timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
-                self.stdout.read_line(&mut line),
+                self.stdout.read_until(b'\n', &mut self.pending_line),
             )
             .await
             .map_err(|_| ProbeError::Timeout)?
@@ -866,8 +922,10 @@ impl Session {
             if count == 0 {
                 return Err(ProbeError::Exited);
             }
+            let line = std::mem::take(&mut self.pending_line);
+            let line = std::str::from_utf8(&line).map_err(|_| ProbeError::InvalidResponse)?;
             let response: Value =
-                serde_json::from_str(&line).map_err(|_| ProbeError::InvalidResponse)?;
+                serde_json::from_str(line).map_err(|_| ProbeError::InvalidResponse)?;
             if response.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }

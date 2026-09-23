@@ -27,6 +27,7 @@ if sys.argv[1:] != ["app-server"]:
     raise SystemExit(2)
 
 initialized = False
+list_requests = 0
 
 def thread(thread_id, source, archived=False):
     return {
@@ -67,6 +68,24 @@ for line in sys.stdin:
     elif method == "thread/list" and mode.endswith("unknown-method"):
         response = {"id": request["id"], "error": {"code": -32600, "message": "Invalid request: unknown variant `thread/list`"}}
     elif method == "thread/list":
+        list_requests += 1
+        if mode.endswith("cancel-partial") and list_requests == 3:
+            encoded = json.dumps({"id": request["id"], "result": {"marker": "cancelled-response"}})
+            split = len(encoded) // 2
+            sys.stdout.write(encoded[:split])
+            sys.stdout.flush()
+            marker_dir = pathlib.Path(__file__).parent
+            time.sleep(0.05)
+            (marker_dir / "partial-response-started").touch()
+            while not (marker_dir / "resume-partial-response").exists():
+                time.sleep(0.01)
+            sys.stdout.write(encoded[split:] + "\n")
+            sys.stdout.flush()
+            continue
+        if mode.endswith("cancel-partial"):
+            response = {"id": request["id"], "result": {"marker": f"request-{list_requests}", "data": [], "nextCursor": None}}
+            print(json.dumps(response), flush=True)
+            continue
         if mode.endswith("list-rich-exit-second") and request["params"].get("cursor") == "next-live":
             raise SystemExit(0)
         if mode.startswith("fake-gated-"):

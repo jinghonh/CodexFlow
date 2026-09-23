@@ -1479,6 +1479,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_can_resume_after_cancelling_mid_response_line() {
+        use tokio::time::{sleep, timeout, Duration};
+
+        let root = temp_data_dir();
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("fake-cancel-partial.py");
+        fs::write(
+            &binary,
+            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let service = Arc::new(SourceService::new(root.join("data")).unwrap());
+        let connected = service
+            .connect(Some(binary.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        assert!(matches!(connected.connection, ConnectionState::Connected));
+
+        let cancelled = service.start_refresh(None, |_| {}).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !root.join("partial-response-started").exists() {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        service.cancel_refresh(&cancelled.id).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !service
+                .refresh_status(&cancelled.id)
+                .unwrap()
+                .state
+                .terminal()
+            {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.refresh_status(&cancelled.id).unwrap().state,
+            IndexRunState::Cancelled
+        );
+
+        fs::write(root.join("resume-partial-response"), "").unwrap();
+        let resumed = service.start_refresh(None, |_| {}).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while !service
+                .refresh_status(&resumed.id)
+                .unwrap()
+                .state
+                .terminal()
+            {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            service.refresh_status(&resumed.id).unwrap().state,
+            IndexRunState::Complete
+        );
+        assert!(matches!(
+            service.status().await.connection,
+            ConnectionState::Connected
+        ));
+        assert!(service
+            .cached_sessions()
+            .unwrap()
+            .scopes
+            .iter()
+            .all(|scope| scope.complete));
+
+        service.shutdown().await;
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn paged_refresh_can_be_cancelled_and_resumed_without_losing_cache_or_project() {
         use tokio::time::{sleep, timeout, Duration};
         let root = temp_data_dir();
