@@ -1,8 +1,8 @@
 use codexflow_domain::{
     AppError, AttributedThread, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
-    HistorySnapshot, HistoryTurnPage, IndexRun, IndexRunState, ListScopeStatus, LocalProject,
-    ObservedRelation, Preferences, ProjectCatalog, ProjectSessions, SessionList, ThreadAttribution,
-    ThreadMetadata,
+    HistorySnapshot, HistoryTurn, HistoryTurnPage, IndexRun, IndexRunState, ListScopeStatus,
+    LocalProject, ObservedRelation, Preferences, ProjectCatalog, ProjectSessions, SessionList,
+    ThreadAttribution, ThreadMetadata,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
@@ -410,6 +410,25 @@ impl SessionStore {
             offset,
             limit,
         })
+    }
+
+    pub fn project_turns(&self, project_id: &str) -> Result<Vec<HistoryTurn>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare(
+                "SELECT h.turn_json FROM history_turns h
+             JOIN thread_attributions a ON a.thread_id=h.thread_id
+             WHERE a.project_id=?1 ORDER BY h.thread_id,h.ordinal,h.id",
+            )
+            .map_err(|_| AppError::store("读取项目回合失败。"))?;
+        let rows = query
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询项目回合失败。"))?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| AppError::store("读取项目回合失败。"))?)
+                .map_err(|_| AppError::store("回合缓存损坏。"))
+        })
+        .collect()
     }
 
     pub fn history_items(
@@ -1136,6 +1155,7 @@ mod tests {
             started_at_unix_ms: Some(100_000),
             completed_at_unix_ms: Some(102_000),
             duration_ms: Some(2_000),
+            time_error: None,
             source_updated_at,
             content_version: format!("turn-{id}"),
         };
@@ -1180,6 +1200,28 @@ mod tests {
                 ],
             })
             .unwrap();
+        store
+            .save_projects_and_attributions(
+                &[LocalProject {
+                    id: "project".into(),
+                    name: "项目".into(),
+                    root: "/tmp/example".into(),
+                    git_common_dir: None,
+                }],
+                &[ThreadAttribution {
+                    thread_id: "duplicate-thread".into(),
+                    project_id: Some("project".into()),
+                    workspace_root: None,
+                    basis: "test".into(),
+                    detail: "test".into(),
+                    diagnostic: None,
+                    source_project_id: None,
+                }],
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.project_turns("project").unwrap().len(), 2);
+        assert!(store.project_turns("other-project").unwrap().is_empty());
         assert_eq!(
             store.history_turns("duplicate-thread", 1, 1).unwrap().turns[0].id,
             "turn-2"

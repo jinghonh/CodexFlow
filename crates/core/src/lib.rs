@@ -3,10 +3,10 @@ mod relations;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
 use codexflow_domain::{
-    AppError, ConnectionState, DisplayTheme, ErrorCode, HistoryCoverage, HistoryItemLocation,
-    HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig, JevConnectionResult,
-    JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph, ProjectSessions,
-    SessionList, SourceStatus,
+    build_project_timeline, AppError, ConnectionState, DisplayTheme, ErrorCode, HistoryCoverage,
+    HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig,
+    JevConnectionResult, JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph,
+    ProjectSessions, ProjectTimeline, SessionList, SourceStatus,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -389,6 +389,12 @@ impl SourceService {
 
     pub fn project_sessions(&self, project_id: &str) -> Result<ProjectSessions, AppError> {
         self.sessions.project_sessions(project_id)
+    }
+
+    pub fn project_timeline(&self, project_id: &str) -> Result<ProjectTimeline, AppError> {
+        let sessions = self.sessions.project_sessions(project_id)?;
+        let turns = self.sessions.project_turns(project_id)?;
+        Ok(build_project_timeline(sessions, turns))
     }
 
     pub fn project_graph(&self, project_id: &str) -> Result<ProjectGraph, AppError> {
