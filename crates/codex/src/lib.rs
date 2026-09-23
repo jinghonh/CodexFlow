@@ -686,6 +686,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effective_unified_exec_must_be_confirmed_disabled_before_thread_start() {
+        let path = fake_binary("analysis-unified-exec-on");
+        let result = analyze_summary(
+            Some(path.to_str().unwrap()),
+            None,
+            path.parent(),
+            "受控摘要".into(),
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError {
+                code: ErrorCode::AnalysisUnavailable,
+                ..
+            })
+        ));
+        assert!(!path
+            .parent()
+            .unwrap()
+            .join("unexpected-thread-start")
+            .exists());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn network_access_requires_explicit_false_before_model_turn() {
+        for mode in [
+            "network-missing",
+            "network-null",
+            "network-string",
+            "network-true",
+        ] {
+            let path = fake_binary(&format!("analysis-{mode}"));
+            let result = analyze_summary(
+                Some(path.to_str().unwrap()),
+                None,
+                path.parent(),
+                "受控摘要".into(),
+                CancellationToken::new(),
+                |_| Ok(()),
+            )
+            .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(AppError {
+                        code: ErrorCode::AnalysisUnavailable,
+                        ..
+                    })
+                ),
+                "{mode}"
+            );
+            assert!(
+                !path
+                    .parent()
+                    .unwrap()
+                    .join("unexpected-turn-start")
+                    .exists(),
+                "{mode}"
+            );
+            let _ = fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "手动受控真实 Codex 冒烟，会调用模型"]
     async fn real_ephemeral_summary_does_not_enter_regular_history() {
         if let Some(reason) = analysis_isolation_issue(None) {

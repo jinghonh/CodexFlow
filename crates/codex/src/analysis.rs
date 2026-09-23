@@ -186,6 +186,7 @@ async fn verify_isolated_config(session: &mut Session) -> Result<(), AppError> {
     })?;
     let disabled = [
         "shell_tool",
+        "unified_exec",
         "apps",
         "hooks",
         "multi_agent",
@@ -470,9 +471,9 @@ async fn analyze_in_home(
         exclude_analysis_thread(&thread_id);
         if thread.get("ephemeral").and_then(Value::as_bool) != Some(true)
             || started.pointer("/sandbox/type").and_then(Value::as_str) != Some("readOnly")
-            || started.pointer("/sandbox/networkAccess").and_then(Value::as_bool) == Some(true)
+            || started.pointer("/sandbox/networkAccess").and_then(Value::as_bool) != Some(false)
             || started.get("approvalPolicy").and_then(Value::as_str) != Some("never") {
-            return Err(failure(ErrorCode::AnalysisUnavailable, "Codex 未确认临时只读且无需批准的隔离配置，已停止分析。", false));
+            return Err(failure(ErrorCode::AnalysisUnavailable, "Codex 未确认临时只读、禁网络且无需批准的隔离配置，已停止分析。", false));
         }
         on_event(AnalysisEvent::Thread(thread_id.clone()))?;
         if cancel.is_cancelled() { return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)); }
