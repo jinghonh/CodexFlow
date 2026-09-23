@@ -216,6 +216,24 @@ button:disabled { cursor: wait; opacity: .6; }
 .graph-diagnostics { border-left: 3px solid var(--red); padding: 11px 14px; margin-top: 13px; background: var(--red-soft); color: var(--ink); font-size: 11px; overflow-wrap: anywhere; }
 .graph-diagnostics strong { color: var(--red); }
 .graph-diagnostics p { margin: 9px 0 0; }
+.graph-proof { display: grid; gap: 7px; margin-top: 10px; padding: 10px; border: 1px solid var(--line); }
+.graph-proof blockquote, .candidate-pair blockquote { margin: 0; padding: 8px; background: var(--paper); white-space: pre-wrap; overflow-wrap: anywhere; }
+.graph-proof small, .candidate-pair small { color: var(--muted); overflow-wrap: anywhere; }
+.graph-proof button, .candidate-pair button { justify-self: start; }
+.candidate-panel { margin-top: 20px; }
+.candidate-panel .panel-intro { min-height: 0; }
+.candidate-summary { display: flex; flex-wrap: wrap; gap: 8px 20px; border-top: 1px solid var(--line); padding: 12px 0; font-size: 11px; color: var(--muted); }
+.candidate-summary strong { color: var(--ink); }
+.candidate-list { display: grid; gap: 6px; max-height: 330px; overflow: auto; }
+.candidate-row { display: grid; grid-template-columns: 1fr auto; gap: 5px 15px; padding: 10px; border: 1px solid var(--line); background: var(--page); color: var(--ink); text-align: left; font-size: 11px; }
+.candidate-row.selected, .candidate-row:hover { border-color: var(--green); background: var(--green-soft); }
+.candidate-row strong, .candidate-row small { overflow-wrap: anywhere; }
+.candidate-row small { grid-column: 1 / -1; color: var(--muted); }
+.candidate-detail { margin-top: 14px; padding: 12px; border: 1px solid var(--line); background: var(--page); font-size: 11px; }
+.candidate-detail h3 { margin: 10px 0; font-size: 12px; }
+.candidate-detail p { line-height: 1.6; }
+.candidate-pair { display: grid; gap: 8px; margin-top: 9px; padding: 10px; border: 1px solid var(--line); }
+.candidate-pair > div { display: grid; gap: 6px; }
 .timeline-panel { margin-top: 20px; scroll-margin-top: 24px; }
 .timeline-heading { display: flex; justify-content: space-between; gap: 20px; align-items: start; }
 .timeline-heading .panel-intro { min-height: 0; margin-bottom: 13px; }

@@ -1,9 +1,9 @@
 use codexflow_domain::{
-    AppError, AttributedThread, EvidencePage, FactPage, HistoryCoverage, HistoryItem,
-    HistoryItemLocation, HistoryItemPage, HistorySnapshot, HistoryTurn, HistoryTurnPage, IndexRun,
-    IndexRunState, ListScopeStatus, LocalProject, ObservedRelation, Preferences, ProjectCatalog,
-    ProjectSessions, SessionList, SourceEvidence, SourceFact, SummaryRun, SummaryRunState,
-    ThreadAttribution, ThreadMetadata, ThreadSummary,
+    AppError, AttributedThread, CandidatePreview, DerivedRelation, EvidencePage, FactPage,
+    HistoryCoverage, HistoryItem, HistoryItemLocation, HistoryItemPage, HistorySnapshot,
+    HistoryTurn, HistoryTurnPage, IndexRun, IndexRunState, ListScopeStatus, LocalProject,
+    ObservedRelation, Preferences, ProjectCatalog, ProjectSessions, SessionList, SourceEvidence,
+    SourceFact, SummaryRun, SummaryRunState, ThreadAttribution, ThreadMetadata, ThreadSummary,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
@@ -19,6 +19,12 @@ pub struct PreferenceStore {
 
 pub struct SessionStore {
     path: PathBuf,
+}
+
+pub struct ProjectMaterial {
+    pub facts: Vec<SourceFact>,
+    pub evidence: Vec<SourceEvidence>,
+    pub items: Vec<HistoryItem>,
 }
 
 /// One read transaction supplies every row used to validate one evidence pointer.
@@ -112,7 +118,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 8 {
+        if version > 9 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -310,10 +316,35 @@ impl SessionStore {
         if version < 8 {
             let transaction = connection
                 .transaction()
-                .map_err(|_| AppError::migration("开始总结数据库迁移失败。"))?;
+                .map_err(|_| AppError::migration("开始规则关系数据库迁移失败。"))?;
             transaction
                 .execute_batch(
-                    "CREATE TABLE IF NOT EXISTS thread_summaries (
+                    "CREATE TABLE IF NOT EXISTS automatic_candidate_views (
+                    project_id TEXT PRIMARY KEY NOT NULL,
+                    preview_json TEXT NOT NULL,
+                    relations_json TEXT NOT NULL
+                );
+                PRAGMA user_version = 8;",
+                )
+                .map_err(|_| AppError::migration("迁移规则关系数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交规则关系数据库迁移失败，原数据已保留。"))?;
+        }
+        // The issue branches independently used schema version 8. Version 9 fills
+        // in either missing layout so databases from both branches upgrade safely.
+        if version < 9 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始总结与规则关系数据库迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS automatic_candidate_views (
+                    project_id TEXT PRIMARY KEY NOT NULL,
+                    preview_json TEXT NOT NULL,
+                    relations_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS thread_summaries (
                     thread_id TEXT PRIMARY KEY NOT NULL, summary_json TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS summary_runs (
@@ -321,12 +352,12 @@ impl SessionStore {
                     started_at INTEGER NOT NULL, run_json TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS summary_runs_thread ON summary_runs(thread_id, started_at DESC);
-                PRAGMA user_version = 8;",
+                PRAGMA user_version = 9;",
                 )
-                .map_err(|_| AppError::migration("迁移总结数据库失败，原数据已保留。"))?;
-            transaction
-                .commit()
-                .map_err(|_| AppError::migration("提交总结数据库迁移失败，原数据已保留。"))?;
+                .map_err(|_| AppError::migration("迁移总结与规则关系数据库失败，原数据已保留。"))?;
+            transaction.commit().map_err(|_| {
+                AppError::migration("提交总结与规则关系数据库迁移失败，原数据已保留。")
+            })?;
         }
         store.recover_interrupted_runs()?;
         store.recover_interrupted_summary_runs()?;
@@ -1388,6 +1419,52 @@ impl SessionStore {
         .collect()
     }
 
+    pub fn project_material(&self, project_id: &str) -> Result<ProjectMaterial, AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始读取项目来源材料失败。"))?;
+        fn read<T: serde::de::DeserializeOwned>(
+            connection: &Connection,
+            sql: &str,
+            project_id: &str,
+        ) -> Result<Vec<T>, AppError> {
+            let mut query = connection
+                .prepare(sql)
+                .map_err(|_| AppError::store("读取项目来源材料失败。"))?;
+            let rows = query
+                .query_map([project_id], |row| row.get::<_, String>(0))
+                .map_err(|_| AppError::store("查询项目来源材料失败。"))?;
+            rows.map(|row| {
+                serde_json::from_str(&row.map_err(|_| AppError::store("读取项目来源材料失败。"))?)
+                    .map_err(|_| AppError::store("项目来源材料损坏。"))
+            })
+            .collect()
+        }
+        Ok(ProjectMaterial {
+            facts: read(&transaction, "SELECT f.fact_json FROM source_facts f JOIN thread_attributions a ON a.thread_id=f.thread_id WHERE a.project_id=?1 ORDER BY f.thread_id,f.ordinal,f.id", project_id)?,
+            evidence: read(&transaction, "SELECT e.evidence_json FROM source_evidence e JOIN thread_attributions a ON a.thread_id=e.thread_id WHERE a.project_id=?1 ORDER BY e.thread_id,e.ordinal,e.id", project_id)?,
+            items: read(&transaction, "SELECT i.item_json FROM history_items i JOIN history_turns t ON t.thread_id=i.thread_id AND t.id=i.turn_id JOIN thread_attributions a ON a.thread_id=i.thread_id WHERE a.project_id=?1 ORDER BY i.thread_id,t.ordinal,i.ordinal,i.id", project_id)?,
+        })
+    }
+
+    pub fn replace_automatic_candidates(
+        &self,
+        preview: &CandidatePreview,
+        relations: &[DerivedRelation],
+    ) -> Result<(), AppError> {
+        let preview_json =
+            serde_json::to_string(preview).map_err(|_| AppError::store("序列化候选清单失败。"))?;
+        let relations_json = serde_json::to_string(relations)
+            .map_err(|_| AppError::store("序列化规则关系失败。"))?;
+        self.connection()?.execute(
+            "INSERT INTO automatic_candidate_views (project_id,preview_json,relations_json) VALUES (?1,?2,?3)
+             ON CONFLICT(project_id) DO UPDATE SET preview_json=excluded.preview_json, relations_json=excluded.relations_json",
+            params![preview.project_id, preview_json, relations_json],
+        ).map_err(|_| AppError::store("保存规则关系和候选清单失败。"))?;
+        Ok(())
+    }
+
     pub fn selection(&self) -> Result<(Option<String>, Vec<String>), AppError> {
         let connection = self.connection()?;
         let (selected, recent_json): (Option<String>, String) = connection
@@ -1646,7 +1723,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 9;")
+            .execute_batch("PRAGMA user_version = 10;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -1657,8 +1734,91 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn either_issue_v8_database_upgrades_to_the_complete_v9_schema() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        for name in ["summary-v8", "candidates-v8"] {
+            let dir = std::env::temp_dir().join(format!("codexflow-{name}-{nonce}"));
+            let initialized = SessionStore::new(dir.clone()).unwrap();
+            drop(initialized);
+            let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+            if name == "summary-v8" {
+                connection
+                    .execute(
+                        "INSERT INTO thread_summaries VALUES ('preserved-summary', '{}')",
+                        [],
+                    )
+                    .unwrap();
+                connection
+                    .execute_batch("DROP TABLE automatic_candidate_views;")
+                    .unwrap();
+            } else {
+                connection
+                    .execute(
+                        "INSERT INTO automatic_candidate_views VALUES ('preserved-project', '{}', '[]')",
+                        [],
+                    )
+                    .unwrap();
+                connection
+                    .execute_batch("DROP TABLE summary_runs; DROP TABLE thread_summaries;")
+                    .unwrap();
+            }
+            connection
+                .execute_batch("PRAGMA user_version = 8;")
+                .unwrap();
+            drop(connection);
+
+            let store = SessionStore::new(dir.clone()).unwrap();
+            let connection = store.connection().unwrap();
+            let version: i64 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 9);
+            for table in [
+                "automatic_candidate_views",
+                "thread_summaries",
+                "summary_runs",
+            ] {
+                let exists: bool = connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                        [table],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(exists, "missing table {table} after upgrading {name}");
+            }
+            if name == "summary-v8" {
+                let preserved: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM thread_summaries WHERE thread_id='preserved-summary'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(preserved, 1);
+            } else {
+                let preserved: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM automatic_candidate_views WHERE project_id='preserved-project'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(preserved, 1);
+            }
+            drop(connection);
+            drop(store);
+            let _ = fs::remove_dir_all(dir);
+        }
     }
 
     #[test]
@@ -1688,6 +1848,53 @@ mod tests {
         assert_eq!(recovered.state, SummaryRunState::Failed);
         assert!(recovered.finished_at_unix_ms.is_some());
         assert!(recovered.error.is_some());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn automatic_candidates_replace_one_project_snapshot_without_duplicates() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-candidates-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let preview = CandidatePreview {
+            project_id: "project".into(),
+            thread_count: 2,
+            neighbor_limit: 10,
+            candidate_count: 0,
+            candidates: Vec::new(),
+        };
+        let relation = DerivedRelation {
+            id: "derived-one".into(),
+            project_id: "project".into(),
+            from_thread_id: "a".into(),
+            to_thread_id: "b".into(),
+            kind: codexflow_domain::DerivedRelationKind::SharedFile,
+            source: "derived".into(),
+            basis: "同一文件".into(),
+            evidence: Vec::new(),
+        };
+        store
+            .replace_automatic_candidates(&preview, &[relation.clone()])
+            .unwrap();
+        store
+            .replace_automatic_candidates(&preview, &[relation])
+            .unwrap();
+        let connection = store.connection().unwrap();
+        let (count, json): (i64, String) = connection.query_row(
+            "SELECT (SELECT COUNT(*) FROM automatic_candidate_views), relations_json FROM automatic_candidate_views WHERE project_id='project'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(
+            serde_json::from_str::<Vec<DerivedRelation>>(&json)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(connection);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1925,7 +2132,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1986,7 +2193,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -2147,7 +2354,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (8, 1));
+        assert_eq!((version, count), (9, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2180,7 +2387,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2283,7 +2490,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 8);
+            assert_eq!(version, 9);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",
