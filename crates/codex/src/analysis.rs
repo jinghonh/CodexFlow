@@ -53,6 +53,74 @@ fn protocol(error: ProbeError) -> AppError {
     }
 }
 
+fn turn_failure(error: Option<&Value>) -> AppError {
+    let nested = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .and_then(|message| serde_json::from_str::<Value>(message).ok());
+    let info = error
+        .and_then(|error| error.get("codexErrorInfo"))
+        .or_else(|| {
+            nested
+                .as_ref()
+                .and_then(|value| value.pointer("/error/codexErrorInfo"))
+        });
+    let status = info
+        .and_then(|info| info.as_object())
+        .and_then(|object| object.values().next())
+        .and_then(|value| value.get("httpStatusCode"))
+        .and_then(Value::as_u64);
+    match info.and_then(Value::as_str) {
+        Some("unauthorized") => failure(
+            ErrorCode::AnalysisAuthenticationFailed,
+            "Codex 认证失败，请检查登录状态。",
+            false,
+        ),
+        Some("usageLimitExceeded" | "sessionBudgetExceeded") => failure(
+            ErrorCode::AnalysisQuotaExceeded,
+            "Codex 使用额度不足，已暂停分析。",
+            false,
+        ),
+        Some("serverOverloaded") => failure(
+            ErrorCode::AnalysisOverloaded,
+            "Codex 服务暂时过载，请稍后重试。",
+            true,
+        ),
+        Some("badRequest" | "contextWindowExceeded") => failure(
+            ErrorCode::AnalysisUnavailable,
+            "Codex 拒绝本次分析请求，请检查模型与输入配置。",
+            false,
+        ),
+        _ => match status {
+            Some(401 | 403) => failure(
+                ErrorCode::AnalysisAuthenticationFailed,
+                "Codex 认证失败，请检查登录状态。",
+                false,
+            ),
+            Some(402) => failure(
+                ErrorCode::AnalysisQuotaExceeded,
+                "Codex 使用额度不足，已暂停分析。",
+                false,
+            ),
+            Some(429 | 529) => failure(
+                ErrorCode::AnalysisOverloaded,
+                "Codex 服务暂时受限，请稍后重试。",
+                true,
+            ),
+            Some(422) => failure(
+                ErrorCode::AnalysisUnavailable,
+                "Codex 拒绝本次分析请求，请检查模型与输入配置。",
+                false,
+            ),
+            _ => failure(
+                ErrorCode::AnalysisUnavailable,
+                "分析回合未成功完成，旧总结已保留。",
+                true,
+            ),
+        },
+    }
+}
+
 fn original_codex_home(override_home: Option<&Path>) -> Option<PathBuf> {
     override_home.map(Path::to_path_buf).or_else(|| {
         env::var_os("CODEX_HOME")
@@ -276,6 +344,7 @@ async fn await_turn(
     let mut cancelling = false;
     let mut interrupt_id = None;
     let mut cancel_deadline = None;
+    let mut last_error: Option<Value> = None;
     loop {
         let event = if cancelling {
             match timeout(
@@ -337,6 +406,22 @@ async fn await_turn(
             continue;
         }
         match event.get("method").and_then(Value::as_str) {
+            Some("error") => {
+                last_error = event.pointer("/params/error").cloned();
+                if event.pointer("/params/willRetry").and_then(Value::as_bool) == Some(true) {
+                    // A model retry inside app-server has no separate budget ticket.
+                    // Interrupt this turn instead of accepting an uncounted retry.
+                    cancelling = true;
+                    on_event(AnalysisEvent::Cancelling)?;
+                    let id = session.next_id;
+                    session.next_id += 1;
+                    interrupt_id = Some(id);
+                    if session.write(&json!({"id":id,"method":"turn/interrupt","params":{"threadId":thread_id,"turnId":turn_id}})).await.is_err() {
+                        return Err(failure(ErrorCode::AnalysisCancelled, "专用分析进程已退出，内部重试已停止。", false));
+                    }
+                    cancel_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(4));
+                }
+            }
             Some("item/started") | Some("item/completed") => {
                 let item = &event["params"]["item"];
                 let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
@@ -392,11 +477,7 @@ async fn await_turn(
                             false,
                         ));
                     }
-                    return Err(failure(
-                        ErrorCode::AnalysisUnavailable,
-                        "分析回合未成功完成，旧总结已保留。",
-                        true,
-                    ));
+                    return Err(turn_failure(turn.get("error").or(last_error.as_ref())));
                 }
                 if final_message.is_none() {
                     final_message = turn
@@ -455,8 +536,16 @@ async fn analyze_in_home(
 ) -> Result<AnalysisOutput, AppError> {
     let mut session = Session::start_with_home(binary, Some(home), Some(cwd)).await?;
     let result = async {
-        session.initialize(false).await.map_err(protocol)?;
-        verify_isolated_config(&mut session).await?;
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)),
+            result = session.initialize(false) => result.map_err(protocol)?,
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)),
+            result = verify_isolated_config(&mut session) => result?,
+        }
         if cancel.is_cancelled() { return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)); }
         let started = tokio::select! {
             biased;

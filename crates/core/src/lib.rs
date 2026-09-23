@@ -1,3 +1,4 @@
+mod analysis_batch;
 mod candidates;
 mod facts;
 mod projects;
@@ -44,6 +45,11 @@ pub struct SourceService {
     refresh_active: std::sync::Mutex<Option<(String, CancellationToken)>>,
     summary_active:
         std::sync::Mutex<std::collections::HashMap<String, (String, CancellationToken)>>,
+    analysis_active:
+        std::sync::Mutex<std::collections::HashMap<String, analysis_batch::AnalysisControl>>,
+    analysis_update_lock: std::sync::Mutex<()>,
+    analysis_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
+    model_slots: Arc<tokio::sync::Semaphore>,
     analysis_auth_home: Option<PathBuf>,
 }
 
@@ -80,6 +86,10 @@ impl SourceService {
             jev_cancel: Mutex::new(CancellationToken::new()),
             refresh_active: std::sync::Mutex::new(None),
             summary_active: std::sync::Mutex::new(std::collections::HashMap::new()),
+            analysis_active: std::sync::Mutex::new(std::collections::HashMap::new()),
+            analysis_update_lock: std::sync::Mutex::new(()),
+            analysis_clock: Arc::new(|| now_ms() as i64),
+            model_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             analysis_auth_home: None,
         };
         service.reconcile_projects()?;
@@ -149,6 +159,7 @@ impl SourceService {
             base_url: base_url.clone(),
             model,
         };
+        next.jev_revision = next.jev_revision.saturating_add(1);
         self.store.save(&next)?;
         *preferences = next;
         drop(preferences);
@@ -158,6 +169,12 @@ impl SourceService {
     pub async fn delete_jev_credential(&self) -> Result<JevStatus, AppError> {
         let _gate = self.stop_jev().await;
         self.credentials.delete()?;
+        let mut preferences = self.preferences.lock().await;
+        let mut next = preferences.clone();
+        next.jev_revision = next.jev_revision.saturating_add(1);
+        self.store.save(&next)?;
+        *preferences = next;
+        drop(preferences);
         self.jev_status().await
     }
 
@@ -186,8 +203,14 @@ impl SourceService {
     }
 
     pub async fn test_jev_inference(&self) -> Result<JevInferenceResult, AppError> {
-        let _gate = self.jev_gate.read().await;
         let token = self.jev_cancel.lock().await.clone();
+        let _slot = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err(jev_cancelled()),
+            acquired = self.model_slots.acquire() => acquired.map_err(|_| AppError::jev(
+                ErrorCode::AnalysisUnavailable, "模型调用队列不可用。", true))?,
+        };
+        let _gate = self.jev_gate.read().await;
         tokio::select! {
             biased;
             _ = token.cancelled() => Err(jev_cancelled()),
@@ -235,6 +258,7 @@ impl SourceService {
             selected_binary: preferences.selected_binary.clone(),
             theme,
             jev: preferences.jev.clone(),
+            jev_revision: preferences.jev_revision,
         };
         self.store.save(&next)?;
         *preferences = next;
@@ -242,6 +266,16 @@ impl SourceService {
     }
 
     pub async fn connect(&self, selected_binary: Option<String>) -> Result<SourceStatus, AppError> {
+        let runs: Vec<_> = self
+            .analysis_active
+            .lock()
+            .unwrap()
+            .values()
+            .map(|control| control.id.clone())
+            .collect();
+        for id in runs {
+            let _ = self.cancel_analysis_run(&id).await;
+        }
         for (_, token) in self.summary_active.lock().unwrap().values() {
             token.cancel();
         }
@@ -255,6 +289,7 @@ impl SourceService {
                 selected_binary: choice.clone(),
                 theme: preferences.theme.clone(),
                 jev: preferences.jev.clone(),
+                jev_revision: preferences.jev_revision,
             };
             self.store.save(&next)?;
             *preferences = next;
@@ -282,6 +317,16 @@ impl SourceService {
     }
 
     pub async fn shutdown(&self) {
+        let runs: Vec<_> = self
+            .analysis_active
+            .lock()
+            .unwrap()
+            .values()
+            .map(|control| control.id.clone())
+            .collect();
+        for id in runs {
+            let _ = self.cancel_analysis_run(&id).await;
+        }
         self.cancel_jev().await;
         for (_, token) in self.summary_active.lock().unwrap().values() {
             token.cancel();

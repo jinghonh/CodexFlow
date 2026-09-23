@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 type Summary = { content: { goal: string; activity: string; outcome: string; decisions: string; issues: string };
   evidenceIds: string[]; model: string; createdAtUnixMs: number; sourceUpdatedAt: number };
@@ -47,6 +48,20 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
   }, [threadId, revision]);
 
   useEffect(() => { setEvidenceChecks({}); setEvidenceMessage(""); }, [threadId, preview?.cachedSummary?.createdAtUnixMs]);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    listen<{ units: { id: string; state: string }[] }>("analysis-run", (event) => {
+      if (!active || !event.payload.units.some((unit) => unit.id === threadId && unit.state === "succeeded")) return;
+      void Promise.all([
+        invoke<Preview>("get_summary_preview", { threadId }),
+        invoke<Run | null>("get_latest_summary_run", { threadId }),
+      ]).then(([nextPreview, nextRun]) => { if (active) { setPreview(nextPreview); setRun(nextRun); } })
+        .catch((caught) => { if (active) setError(errorText(caught)); });
+    }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});
+    return () => { active = false; unlisten?.(); };
+  }, [threadId]);
 
   useEffect(() => {
     if (!run || (run.state !== "running" && run.state !== "cancelling")) return;

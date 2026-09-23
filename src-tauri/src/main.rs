@@ -1,10 +1,10 @@
 use codexflow_core::SourceService;
 use codexflow_domain::{
-    AppError, CandidatePreview, DisplayTheme, EvidenceCheck, EvidencePage, FactPage,
-    HistoryCoverage, HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun,
-    JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph,
-    ProjectSessions, ProjectTimeline, SessionList, SourceStatus, SummaryEvidenceCheck,
-    SummaryPreview, SummaryRun,
+    AnalysisLimits, AnalysisPreview, AnalysisRun, AppError, CandidatePreview, DisplayTheme,
+    EvidenceCheck, EvidencePage, FactPage, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
+    HistoryTurnPage, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
+    ProjectGraph, ProjectSessions, ProjectTimeline, SessionList, SourceStatus,
+    SummaryEvidenceCheck, SummaryPreview, SummaryRun,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -277,6 +277,80 @@ fn get_candidate_preview(
 }
 
 #[tauri::command]
+async fn get_analysis_preview(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    limits: AnalysisLimits,
+) -> Result<AnalysisPreview, AppError> {
+    service(&state)?.analysis_preview(&project_id, limits).await
+}
+
+#[tauri::command]
+async fn start_project_analysis(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    project_id: String,
+    limits: AnalysisLimits,
+) -> Result<AnalysisRun, AppError> {
+    service(&state)?
+        .clone()
+        .start_project_analysis(project_id, limits, move |run| {
+            let _ = app.emit("analysis-run", run);
+        })
+        .await
+}
+
+#[tauri::command]
+fn get_analysis_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<Option<AnalysisRun>, AppError> {
+    service(&state)?.analysis_run(&run_id)
+}
+
+#[tauri::command]
+fn get_latest_analysis_run(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<Option<AnalysisRun>, AppError> {
+    service(&state)?.latest_analysis_run(&project_id)
+}
+
+#[tauri::command]
+fn pause_analysis_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<AnalysisRun, AppError> {
+    service(&state)?.pause_analysis_run(&run_id)
+}
+
+#[tauri::command]
+async fn cancel_analysis_run(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    run_id: String,
+) -> Result<AnalysisRun, AppError> {
+    let run = service(&state)?.cancel_analysis_run(&run_id).await?;
+    let _ = app.emit("analysis-run", &run);
+    Ok(run)
+}
+
+#[tauri::command]
+async fn continue_analysis_run(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+    run_id: String,
+    call_limit: u32,
+) -> Result<AnalysisRun, AppError> {
+    service(&state)?
+        .clone()
+        .continue_analysis_run(&run_id, call_limit, move |run| {
+            let _ = app.emit("analysis-run", run);
+        })
+        .await
+}
+
+#[tauri::command]
 fn get_project_timeline(
     state: tauri::State<'_, AppState>,
     project_id: String,
@@ -344,6 +418,13 @@ fn main() {
             get_project_sessions,
             get_project_graph,
             get_candidate_preview,
+            get_analysis_preview,
+            start_project_analysis,
+            get_analysis_run,
+            get_latest_analysis_run,
+            pause_analysis_run,
+            cancel_analysis_run,
+            continue_analysis_run,
             get_project_timeline,
             choose_project,
             choose_existing_project

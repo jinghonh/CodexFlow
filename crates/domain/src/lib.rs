@@ -14,6 +14,8 @@ pub struct AppError {
     pub retryable: bool,
     pub cache_preserved: bool,
     pub backend: String,
+    #[serde(default)]
+    pub retry_after_ms: Option<u64>,
 }
 
 impl AppError {
@@ -24,6 +26,7 @@ impl AppError {
             retryable,
             cache_preserved: true,
             backend: "jev".into(),
+            retry_after_ms: None,
         }
     }
     pub fn codex(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
@@ -33,6 +36,7 @@ impl AppError {
             retryable,
             cache_preserved: true,
             backend: "codex".into(),
+            retry_after_ms: None,
         }
     }
 
@@ -43,6 +47,7 @@ impl AppError {
             retryable: true,
             cache_preserved: true,
             backend: "store".into(),
+            retry_after_ms: None,
         }
     }
 
@@ -53,6 +58,7 @@ impl AppError {
             retryable: false,
             cache_preserved: true,
             backend: "store".into(),
+            retry_after_ms: None,
         }
     }
 
@@ -63,6 +69,7 @@ impl AppError {
             retryable: true,
             cache_preserved: true,
             backend: "core".into(),
+            retry_after_ms: None,
         }
     }
 }
@@ -100,6 +107,140 @@ pub enum ErrorCode {
     AnalysisNotFound,
     AnalysisInvalidResult,
     AnalysisCancelled,
+    AnalysisBudgetInvalid,
+    AnalysisConfigChanged,
+    AnalysisTimeout,
+    AnalysisAuthenticationFailed,
+    AnalysisQuotaExceeded,
+    AnalysisOverloaded,
+}
+
+/// A stage is scheduled by core, while its transport remains in its adapter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnalysisStage {
+    Summary,
+    Relation,
+    EvidenceSelection,
+    Naming,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisLimits {
+    pub call_limit: u32,
+    pub concurrency_limit: u8,
+    pub timeout_seconds: u64,
+    pub retry_limit: u8,
+    pub input_character_limit: usize,
+}
+
+impl Default for AnalysisLimits {
+    fn default() -> Self {
+        Self {
+            call_limit: 100,
+            concurrency_limit: 2,
+            timeout_seconds: 180,
+            retry_limit: 2,
+            input_character_limit: 40_000,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisStagePlan {
+    pub stage: AnalysisStage,
+    pub service: String,
+    pub model: String,
+    pub send_scope: String,
+    pub pending_items: u64,
+    pub maximum_calls: u64,
+    pub available: bool,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisPreview {
+    pub project_id: String,
+    pub input_version: String,
+    pub stages: Vec<AnalysisStagePlan>,
+    pub cached_summaries: u64,
+    pub unavailable_summaries: u64,
+    pub maximum_candidates: u64,
+    pub evidence_selection_call_limit: u64,
+    pub pending_groups: Option<u64>,
+    pub limits: AnalysisLimits,
+    pub jev_configured: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnalysisRunState {
+    Queued,
+    Running,
+    Cancelling,
+    Cancelled,
+    Paused,
+    Complete,
+    Partial,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AnalysisUnitState {
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisUnit {
+    pub id: String,
+    pub stage: AnalysisStage,
+    pub input_version: String,
+    pub state: AnalysisUnitState,
+    pub attempts: u32,
+    pub active_summary_run_id: Option<String>,
+    pub requested_model: String,
+    pub actual_model: Option<String>,
+    pub error: Option<AppError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisRun {
+    pub id: String,
+    pub project_id: String,
+    pub state: AnalysisRunState,
+    pub pause_reason: Option<String>,
+    pub input_version: String,
+    pub codex_binary: Option<String>,
+    pub codex_version: Option<String>,
+    pub codex_model: String,
+    pub jev_base_url: String,
+    pub jev_model: String,
+    pub jev_config_revision: u64,
+    pub limits: AnalysisLimits,
+    pub batch_number: u32,
+    pub batch_calls: u32,
+    pub total_calls: u32,
+    pub total_questions: u32,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub processed: u32,
+    pub succeeded: u32,
+    pub failed: u32,
+    pub pending: u32,
+    pub units: Vec<AnalysisUnit>,
+    pub started_at_unix_ms: i64,
+    pub finished_at_unix_ms: Option<i64>,
+    pub interrupted: bool,
+    pub error: Option<AppError>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -801,6 +942,8 @@ pub struct Preferences {
     pub theme: DisplayTheme,
     #[serde(default)]
     pub jev: JevConfig,
+    #[serde(default)]
+    pub jev_revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -858,6 +1001,7 @@ impl Default for Preferences {
             selected_binary: None,
             theme: DisplayTheme::System,
             jev: JevConfig::default(),
+            jev_revision: 0,
         }
     }
 }

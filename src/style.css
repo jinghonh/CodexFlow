@@ -297,3 +297,16 @@ button:disabled { cursor: wait; opacity: .6; }
 .summary-evidence > div { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; margin-top: .5rem; }
 .summary-evidence code { overflow-wrap: anywhere; }
 .summary-evidence blockquote { width: 100%; margin: .2rem 0 .5rem; white-space: pre-wrap; }
+.analysis-limits {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 12px;
+  margin: 18px 0;
+}
+.analysis-limits label { display: grid; gap: 6px; font-size: 0.85rem; }
+.analysis-limits input { width: 100%; padding: 8px; border: 1px solid var(--line, #aaa); border-radius: 6px; background: transparent; color: inherit; }
+.analysis-stage-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(235px, 1fr)); gap: 10px; margin: 18px 0; }
+.analysis-stage { display: grid; gap: 7px; padding: 14px; border: 1px solid var(--line, #aaa); border-radius: 8px; }
+.analysis-stage small, .analysis-note { line-height: 1.55; }
+.analysis-progress { display: grid; gap: 7px; margin-top: 18px; padding: 14px; border: 1px solid var(--line, #aaa); border-radius: 8px; }
+.analysis-progress em { font-style: normal; color: var(--danger, #b85740); }

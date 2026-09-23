@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ProjectGraphView } from "./ProjectGraphView";
 import { CandidatePreviewView } from "./CandidatePreviewView";
+import { ProjectAnalysisView } from "./ProjectAnalysisView";
 import { ProjectTimelineView } from "./ProjectTimelineView";
 import { ThreadHistoryView } from "./ThreadHistoryView";
 import "./style.css";
@@ -170,6 +171,17 @@ function App() {
       invoke<IndexRun | null>("get_latest_index_run").then((run) => { if (active) recordRun(run); }).catch(() => {});
     }, 4000);
     return () => { active = false; unlisten?.(); window.clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    listen<{ state: string }>("analysis-run", (event) => {
+      if (active && ["complete", "partial", "failed", "cancelled"].includes(event.payload.state)) {
+        setGraphVersion((version) => version + 1);
+      }
+    }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});
+    return () => { active = false; unlisten?.(); };
   }, []);
 
   useEffect(() => {
@@ -449,6 +461,7 @@ function App() {
         {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} locationRequest={evidenceLocation} onHistoryLoaded={() => setTimelineVersion((value) => value + 1)} />}
         {!showUnassigned && projectSessions && <ProjectGraphView projectId={projectSessions.project.id} refreshVersion={graphVersion + timelineVersion} onSelectEvidence={selectEvidence} />}
         {!showUnassigned && projectSessions && <CandidatePreviewView projectId={projectSessions.project.id} refreshVersion={`${graphVersion}-${timelineVersion}`} onSelectEvidence={selectEvidence} />}
+        {!showUnassigned && projectSessions && <ProjectAnalysisView projectId={projectSessions.project.id} refreshVersion={`${graphVersion}-${timelineVersion}`} />}
         <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。Jev 连接检查不运行推理；只有点击“测试固定合成推理”才会发起该次模型调用。</p>
       </div>
     </main>

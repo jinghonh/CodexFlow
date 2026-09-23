@@ -221,11 +221,23 @@ for line in sys.stdin:
         assert request["params"]["outputSchema"]["required"] == ["goal", "activity", "outcome", "decisions", "issues", "evidenceIds"]
         response = {"id": request["id"], "result": {"turn": {"id": analysis_turn, "status": "inProgress", "items": []}}}
         print(json.dumps(response), flush=True)
-        if mode.endswith(("cancel", "late")):
+        if mode.endswith("flaky") and not (pathlib.Path(__file__).parent / "first-failure").exists():
+            (pathlib.Path(__file__).parent / "first-failure").touch()
+            raise SystemExit(0)
+        if mode.endswith("internal-retry"):
+            print(json.dumps({"method":"error","params":{"threadId":analysis_thread,"turnId":analysis_turn,
+                "willRetry":True,"error":{"message":"temporary","codexErrorInfo":"serverOverloaded"}}}), flush=True)
+            continue
+        if mode.endswith("slow-success"):
+            time.sleep(0.2)
+        if mode.endswith(("cancel", "late")) and not (mode.endswith("once-late") and (pathlib.Path(__file__).parent / "once-cancelled").exists()):
             continue
         if mode.endswith("model-fail"):
             message = json.dumps({"error":{"message":"The 'unsupported' model is not supported when using Codex with a ChatGPT account."}})
             print(json.dumps({"method":"turn/completed","params":{"threadId":analysis_thread,"turn":{"id":analysis_turn,"status":"failed","items":[],"error":{"message":message}}}}), flush=True)
+            continue
+        if mode.endswith("quota"):
+            print(json.dumps({"method":"turn/completed","params":{"threadId":analysis_thread,"turn":{"id":analysis_turn,"status":"failed","items":[],"error":{"message":"quota","codexErrorInfo":"usageLimitExceeded"}}}}), flush=True)
             continue
         if mode.endswith("tool"):
             print(json.dumps({"method":"item/started","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"commandExecution","id":"cmd-1"}}}), flush=True)
@@ -236,6 +248,10 @@ for line in sys.stdin:
         continue
     elif mode.startswith("fake-analysis-") and method == "turn/interrupt":
         assert request["params"] == {"threadId":analysis_thread,"turnId":analysis_turn}
+        if mode.endswith("internal-retry"):
+            (pathlib.Path(__file__).parent / "retry-interrupted").touch()
+        if mode.endswith("once-late"):
+            (pathlib.Path(__file__).parent / "once-cancelled").touch()
         print(json.dumps({"id":request["id"],"result":{}}), flush=True)
         if mode.endswith("late"):
             print(json.dumps({"method":"item/completed","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"agentMessage","id":"late","phase":"final_answer","text":json.dumps({"goal":"迟到","activity":"迟到","outcome":"迟到","decisions":"迟到","issues":"迟到","evidenceIds":["item:turn-1:item-1"]},ensure_ascii=False)}}}), flush=True)

@@ -4,7 +4,10 @@ use codexflow_domain::{
 };
 use reqwest::{header, redirect::Policy, Client, StatusCode};
 use serde::Deserialize;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 use url::{Host, Url};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
@@ -115,9 +118,13 @@ pub struct JevClient {
 
 impl JevClient {
     pub fn new() -> Result<Self, AppError> {
+        Self::with_timeout(Duration::from_secs(180))
+    }
+
+    pub fn with_timeout(timeout: Duration) -> Result<Self, AppError> {
         let client = Client::builder()
             .redirect(Policy::none())
-            .timeout(Duration::from_secs(180))
+            .timeout(timeout)
             .build()
             .map_err(|_| {
                 error(
@@ -281,11 +288,29 @@ fn reject_secret_in_model(credential: &Credential, model: &str) -> Result<(), Ap
     }
 }
 
+fn retry_after_ms(headers: &header::HeaderMap, now: SystemTime) -> Option<u64> {
+    headers
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .parse::<u64>()
+                .ok()
+                .and_then(|seconds| seconds.checked_mul(1000))
+                .or_else(|| {
+                    httpdate::parse_http_date(value).ok().and_then(|date| {
+                        u64::try_from(date.duration_since(now).unwrap_or_default().as_millis()).ok()
+                    })
+                })
+        })
+}
+
 async fn success(response: reqwest::Response) -> Result<reqwest::Response, AppError> {
     let status = response.status();
     if status.is_success() {
         return Ok(response);
     }
+    let retry_after_ms = retry_after_ms(response.headers(), SystemTime::now());
     // 只读取结构化错误码；服务返回的自由文本可能包含请求材料或凭据。
     let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
     let code = body
@@ -305,7 +330,7 @@ async fn success(response: reqwest::Response) -> Result<reqwest::Response, AppEr
         code,
         "model_not_found" | "unsupported_model" | "model_unsupported"
     );
-    Err(if quota || status == StatusCode::PAYMENT_REQUIRED {
+    let mut result = if quota || status == StatusCode::PAYMENT_REQUIRED {
         error(
             ErrorCode::JevQuotaExceeded,
             "Jev 额度不足，请检查 TypeSafe 账户。",
@@ -343,7 +368,14 @@ async fn success(response: reqwest::Response) -> Result<reqwest::Response, AppEr
         )
     } else {
         protocol_error()
-    })
+    };
+    if matches!(
+        result.code,
+        ErrorCode::JevRateLimited | ErrorCode::JevOverloaded
+    ) {
+        result.retry_after_ms = retry_after_ms;
+    }
+    Err(result)
 }
 
 #[cfg(target_os = "macos")]
@@ -499,6 +531,22 @@ mod tests {
         net::TcpListener,
         thread,
     };
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_date_with_fixed_clock() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let mut headers = header::HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("7"));
+        assert_eq!(retry_after_ms(&headers, now), Some(7_000));
+        let date = httpdate::fmt_http_date(now + Duration::from_secs(12));
+        headers.insert(header::RETRY_AFTER, date.parse().unwrap());
+        assert_eq!(retry_after_ms(&headers, now), Some(12_000));
+        headers.insert(
+            header::RETRY_AFTER,
+            header::HeaderValue::from_static("invalid"),
+        );
+        assert_eq!(retry_after_ms(&headers, now), None);
+    }
 
     fn server(status: u16, body: &'static str) -> (String, thread::JoinHandle<String>) {
         server_with_headers(status, body, String::new())
