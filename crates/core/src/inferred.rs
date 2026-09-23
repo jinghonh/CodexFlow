@@ -271,6 +271,7 @@ pub(crate) fn outcome(
         status: status.into(),
         unknown_count,
         decisions: classification.choices.clone(),
+        jev_identity: None,
         relations,
     })
 }

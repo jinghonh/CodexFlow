@@ -12,6 +12,9 @@ use reqwest::header;
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeMap, time::Duration};
 
+/// Bump when relation questions, evidence choices, or their interpretation change.
+pub const RELATION_RULES_VERSION: &str = "v1-12-choice-2";
+
 const KINDS: &[(InferredRelationKind, &str)] = &[
     (
         InferredRelationKind::Continues,
@@ -87,6 +90,97 @@ fn valid_model_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
+type ClassificationSpec = (String, InferredRelationKind, String, String);
+
+fn classification_questions(
+    candidate: &RelationCandidate,
+) -> (Map<String, Value>, Vec<ClassificationSpec>) {
+    let mut questions = Map::new();
+    let mut specifications = Vec::new();
+    for &(kind, meaning) in KINDS {
+        for reverse in 0..(if kind.directed() { 2 } else { 1 }) {
+            let (from, to, direction) = if reverse == 0 {
+                (
+                    &candidate.left_thread_id,
+                    &candidate.right_thread_id,
+                    "leftThread → rightThread",
+                )
+            } else {
+                (
+                    &candidate.right_thread_id,
+                    &candidate.left_thread_id,
+                    "rightThread → leftThread",
+                )
+            };
+            let key = format!(
+                "{}_{}",
+                kind.as_str().to_lowercase(),
+                if reverse == 0 { "ab" } else { "ba" }
+            );
+            let (instructions, support, reject) = if kind.directed() {
+                (format!("独立判断具体关系 {key}：{meaning}。方向为 {direction}，即前序 {from} 指向后续 {to}。只能根据 state 中双方实际材料判断；同一对可有多种关系，不依赖其他题的答案。"),
+                    "双方材料明确支持这一具体类型和方向", "双方材料不支持这一具体类型和方向，或明显是另一回事")
+            } else {
+                (format!("独立判断具体无向关系 {key}：{meaning}。双方是 leftThread {from} 与 rightThread {to}；端点顺序仅用于稳定身份，不表示时间先后或因果。只能根据 state 中双方实际材料判断；同一对可有多种关系，不依赖其他题的答案。"),
+                    "双方材料明确支持这一具体无向关系", "双方材料不支持这一具体无向关系，或明显是另一回事")
+            };
+            questions.insert(key.clone(), json!({
+                "type": "choice", "instructions": instructions,
+                "criteria": {"SUPPORTS": support, "REJECTS": reject, "UNKNOWN": "材料不足或有歧义，无法判断"}
+            }));
+            specifications.push((key, kind, from.clone(), to.clone()));
+        }
+    }
+    (questions, specifications)
+}
+
+fn selection_questions(
+    supported: &[RelationChoice],
+    count: usize,
+) -> (Map<String, Value>, Vec<String>) {
+    let mut options: BTreeMap<String, String> = BTreeMap::new();
+    options.insert(
+        "INSUFFICIENT".into(),
+        "没有任何一组双方证据足以支持此命题".into(),
+    );
+    for index in 0..count {
+        options.insert(
+            format!("p{index}"),
+            format!("选择 state.evidencePairs 中 option=p{index} 的双侧原始摘录"),
+        );
+    }
+    let mut questions = Map::new();
+    for choice in supported {
+        let instructions = if choice.kind.directed() {
+            format!("独立选择一组最能支持 {} 的双侧证据：前序 {} → 后续 {}；若没有充分双侧证据，选 INSUFFICIENT。不要依赖其他题的答案。", choice.kind.as_str(), choice.from_thread_id, choice.to_thread_id)
+        } else {
+            format!("独立选择一组最能支持无向关系 {} 的双侧证据：会话 {} 与会话 {}；端点顺序不表示时间先后或因果。若没有充分双侧证据，选 INSUFFICIENT。不要依赖其他题的答案。", choice.kind.as_str(), choice.from_thread_id, choice.to_thread_id)
+        };
+        questions.insert(
+            choice.key.clone(),
+            json!({
+                "type": "choice", "instructions": instructions, "criteria": options
+            }),
+        );
+    }
+    (questions, options.keys().cloned().collect())
+}
+
+fn request_characters(state: &Value, model: &str, questions: &Map<String, Value>) -> usize {
+    json!({"state": state, "model": model, "questions": questions})
+        .to_string()
+        .chars()
+        .count()
+}
+
+fn input_limit_error() -> AppError {
+    AppError::jev(
+        ErrorCode::JevInvalidRequest,
+        "Jev 完整请求超过本次输入字符上限。",
+        false,
+    )
+}
+
 pub struct JevRelationAnalyzer {
     client: JevClient,
     material_limit: usize,
@@ -128,45 +222,61 @@ impl JevRelationAnalyzer {
         (classification, selection)
     }
 
-    fn sampled_pairs(&self, candidate: &RelationCandidate) -> usize {
-        let mut count = candidate.evidence.pairs.len().min(20);
-        while count > 0 {
-            let (classification, selection) = Self::states(candidate, count);
-            if classification
-                .to_string()
-                .chars()
-                .count()
-                .max(selection.to_string().chars().count())
-                <= self.material_limit
-            {
-                break;
-            }
-            count -= 1;
-        }
-        count
-    }
-
-    pub fn validate_material(&self, candidate: &RelationCandidate) -> Result<(), AppError> {
+    fn prepare_classification(
+        &self,
+        candidate: &RelationCandidate,
+        model: &str,
+    ) -> Result<(Value, Map<String, Value>, Vec<ClassificationSpec>), AppError> {
         if candidate.left_thread_id == candidate.right_thread_id
             || candidate.evidence.pairs.len() > 20
         {
             return Err(protocol_error());
         }
-        let (classification, selection) = Self::states(candidate, self.sampled_pairs(candidate));
-        if classification
-            .to_string()
-            .chars()
-            .count()
-            .max(selection.to_string().chars().count())
-            > self.material_limit
-        {
-            return Err(AppError::jev(
-                ErrorCode::JevInvalidRequest,
-                "Jev 来源材料超过本次输入上限。",
-                false,
-            ));
+        let (questions, specifications) = classification_questions(candidate);
+        for count in (0..=candidate.evidence.pairs.len()).rev() {
+            let (state, _) = Self::states(candidate, count);
+            if request_characters(&state, model, &questions) <= self.material_limit {
+                return Ok((state, questions, specifications));
+            }
         }
-        Ok(())
+        Err(input_limit_error())
+    }
+
+    fn prepare_selection(
+        &self,
+        candidate: &RelationCandidate,
+        supported: &[RelationChoice],
+        model: &str,
+    ) -> Result<(Value, Map<String, Value>, Vec<String>), AppError> {
+        if supported.is_empty() || candidate.evidence.pairs.len() > 20 {
+            return Err(protocol_error());
+        }
+        for count in (0..=candidate.evidence.pairs.len()).rev() {
+            let (_, state) = Self::states(candidate, count);
+            let (questions, options) = selection_questions(supported, count);
+            if request_characters(&state, model, &questions) <= self.material_limit {
+                return Ok((state, questions, options));
+            }
+        }
+        Err(input_limit_error())
+    }
+
+    pub fn validate_classification(
+        &self,
+        candidate: &RelationCandidate,
+        model: &str,
+    ) -> Result<(), AppError> {
+        self.prepare_classification(candidate, model).map(|_| ())
+    }
+
+    pub fn validate_evidence_selection(
+        &self,
+        candidate: &RelationCandidate,
+        supported: &[RelationChoice],
+        model: &str,
+    ) -> Result<(), AppError> {
+        self.prepare_selection(candidate, supported, model)
+            .map(|_| ())
     }
 
     async fn submit(
@@ -177,12 +287,9 @@ impl JevRelationAnalyzer {
         questions: Map<String, Value>,
     ) -> Result<InferenceResponse, AppError> {
         reject_secret_in_model(credential, model)?;
-        if state.to_string().chars().count() > self.material_limit {
-            return Err(AppError::jev(
-                ErrorCode::JevInvalidRequest,
-                "Jev 来源材料超过本次输入上限。",
-                false,
-            ));
+        let payload = json!({"state": state, "model": model, "questions": questions});
+        if payload.to_string().chars().count() > self.material_limit {
+            return Err(input_limit_error());
         }
         let url = format!("{}/v1/systemone", normalize_base_url(&credential.base_url)?);
         let response = self
@@ -191,7 +298,7 @@ impl JevRelationAnalyzer {
             .post(url)
             .header(header::CONTENT_TYPE, "application/json")
             .bearer_auth(&credential.key)
-            .json(&json!({"state": state, "model": model, "questions": questions}))
+            .json(&payload)
             .send()
             .await
             .map_err(network_error)?;
@@ -215,44 +322,7 @@ impl JevRelationAnalyzer {
         model: &str,
         candidate: &RelationCandidate,
     ) -> Result<JevRelationClassification, AppError> {
-        if candidate.left_thread_id == candidate.right_thread_id {
-            return Err(protocol_error());
-        }
-        let (state, _) = Self::states(candidate, self.sampled_pairs(candidate));
-        let mut questions = Map::new();
-        let mut specifications = Vec::new();
-        for &(kind, meaning) in KINDS {
-            for reverse in 0..(if kind.directed() { 2 } else { 1 }) {
-                let (from, to, direction) = if reverse == 0 {
-                    (
-                        &candidate.left_thread_id,
-                        &candidate.right_thread_id,
-                        "leftThread → rightThread",
-                    )
-                } else {
-                    (
-                        &candidate.right_thread_id,
-                        &candidate.left_thread_id,
-                        "rightThread → leftThread",
-                    )
-                };
-                let key = format!(
-                    "{}_{}",
-                    kind.as_str().to_lowercase(),
-                    if reverse == 0 { "ab" } else { "ba" }
-                );
-                questions.insert(key.clone(), json!({
-                    "type": "choice",
-                    "instructions": format!("独立判断具体关系 {key}：{meaning}。方向为 {direction}，即前序 {from} 指向后续 {to}。只能根据 state 中双方实际材料判断；同一对可有多种关系，不依赖其他题的答案。"),
-                    "criteria": {
-                        "SUPPORTS": "双方材料明确支持这一具体类型和方向",
-                        "REJECTS": "双方材料不支持这一具体类型和方向，或明显是另一回事",
-                        "UNKNOWN": "材料不足或有歧义，无法判断"
-                    }
-                }));
-                specifications.push((key, kind, from.clone(), to.clone()));
-            }
-        }
+        let (state, questions, specifications) = self.prepare_classification(candidate, model)?;
         let body = self.submit(credential, model, state, questions).await?;
         let options = ["SUPPORTS".into(), "REJECTS".into(), "UNKNOWN".into()];
         let mut choices = Vec::new();
@@ -288,32 +358,8 @@ impl JevRelationAnalyzer {
         candidate: &RelationCandidate,
         supported: &[RelationChoice],
     ) -> Result<JevEvidenceSelection, AppError> {
-        if supported.is_empty() || candidate.evidence.pairs.len() > 20 {
-            return Err(protocol_error());
-        }
-        let count = self.sampled_pairs(candidate);
-        let (_, state) = Self::states(candidate, count);
-        let mut questions = Map::new();
-        let mut options: BTreeMap<String, String> = BTreeMap::new();
-        options.insert(
-            "INSUFFICIENT".into(),
-            "没有任何一组双方证据足以支持此命题".into(),
-        );
-        for index in 0..count {
-            options.insert(
-                format!("p{index}"),
-                format!("选择 state.evidencePairs 中 option=p{index} 的双侧原始摘录"),
-            );
-        }
-        for choice in supported {
-            questions.insert(choice.key.clone(), json!({
-                "type": "choice",
-                "instructions": format!("独立选择一组最能支持 {} 的双侧证据：{} → {}；若没有充分双侧证据，选 INSUFFICIENT。不要依赖其他题的答案。", choice.kind.as_str(), choice.from_thread_id, choice.to_thread_id),
-                "criteria": options
-            }));
-        }
+        let (state, questions, keys) = self.prepare_selection(candidate, supported, model)?;
         let body = self.submit(credential, model, state, questions).await?;
-        let keys: Vec<String> = options.keys().cloned().collect();
         let mut choices = Vec::new();
         for relation in supported {
             let parsed = answer(
@@ -402,6 +448,20 @@ mod tests {
                 }],
             },
         }
+    }
+
+    fn long_candidate() -> RelationCandidate {
+        let mut candidate = candidate();
+        candidate.evidence.pairs = (0..20)
+            .map(|index| {
+                let mut pair = candidate.evidence.pairs[0].clone();
+                pair.id = format!("pair-{index}");
+                pair.left.excerpt = "中文".repeat(120);
+                pair.right.excerpt = "技术".repeat(120);
+                pair
+            })
+            .collect();
+        candidate
     }
 
     fn server(
@@ -652,20 +712,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_material_limit_reduces_the_number_of_sent_evidence_pairs() {
-        let mut candidate = candidate();
-        candidate.evidence.pairs = (0..20)
-            .map(|index| {
-                let mut pair = candidate.evidence.pairs[0].clone();
-                pair.id = format!("pair-{index}");
-                pair.left.excerpt = "中文".repeat(120);
-                pair.right.excerpt = "技术".repeat(120);
-                pair
-            })
-            .collect();
+    async fn full_request_limit_reduces_the_number_of_sent_evidence_pairs() {
+        let candidate = long_candidate();
+        let (questions, _) = classification_questions(&candidate);
+        let base = request_characters(
+            &JevRelationAnalyzer::states(&candidate, 0).0,
+            "jev-latest",
+            &questions,
+        );
+        let full = request_characters(
+            &JevRelationAnalyzer::states(&candidate, 20).0,
+            "jev-latest",
+            &questions,
+        );
+        let limit = base + (full - base) / 2;
         let (url, handle) =
             server(|request| response(&request, |_, options| choice("REJECTS", options)));
-        JevRelationAnalyzer::with_timeout_and_material_limit(Duration::from_secs(3), 2_000)
+        JevRelationAnalyzer::with_timeout_and_material_limit(Duration::from_secs(3), limit)
             .unwrap()
             .classify(&credential(url), "jev-latest", &candidate)
             .await
@@ -676,6 +739,127 @@ mod tests {
             .unwrap()
             .len();
         assert!(sent > 0 && sent < 20);
-        assert!(request["state"].to_string().chars().count() <= 2_000);
+        assert!(request.to_string().chars().count() <= limit);
+    }
+
+    #[tokio::test]
+    async fn multiple_evidence_questions_count_repeated_choices_in_the_full_request() {
+        let candidate = long_candidate();
+        let supported: Vec<_> = (0..8)
+            .map(|index| RelationChoice {
+                key: format!("fixes_ab_{index}"),
+                kind: InferredRelationKind::Fixes,
+                from_thread_id: "thread-a".into(),
+                to_thread_id: "thread-b".into(),
+                judgment: RelationJudgment::Supported,
+                answer: JevChoiceAnswer {
+                    choice: "SUPPORTS".into(),
+                    confidence: 0.8,
+                    probabilities: BTreeMap::from([
+                        ("SUPPORTS".into(), 0.8),
+                        ("REJECTS".into(), 0.1),
+                        ("UNKNOWN".into(), 0.1),
+                    ]),
+                },
+            })
+            .collect();
+        let size = |count| {
+            let (_, state) = JevRelationAnalyzer::states(&candidate, count);
+            let (questions, _) = selection_questions(&supported, count);
+            request_characters(&state, "jev-latest", &questions)
+        };
+        let base = size(0);
+        let full = size(20);
+        assert!(full > base);
+        let tiny =
+            JevRelationAnalyzer::with_timeout_and_material_limit(Duration::from_secs(3), base - 1)
+                .unwrap();
+        assert!(matches!(
+            tiny.validate_evidence_selection(&candidate, &supported, "jev-latest")
+                .unwrap_err()
+                .code,
+            ErrorCode::JevInvalidRequest
+        ));
+        let limit = base + (full - base) / 3;
+        let (url, handle) =
+            server(|request| response(&request, |_, options| choice("INSUFFICIENT", options)));
+        let selected =
+            JevRelationAnalyzer::with_timeout_and_material_limit(Duration::from_secs(3), limit)
+                .unwrap()
+                .select_evidence(&credential(url), "jev-latest", &candidate, &supported)
+                .await
+                .unwrap();
+        assert!(selected.choices.iter().all(|item| item.pair_id.is_none()));
+        let request = handle.join().unwrap();
+        let sent = request["state"]["evidencePairs"].as_array().unwrap().len();
+        assert!(sent > 0 && sent < 20);
+        assert_eq!(request["questions"].as_object().unwrap().len(), 8);
+        assert_eq!(
+            request["questions"]["fixes_ab_0"]["criteria"]
+                .as_object()
+                .unwrap()
+                .len(),
+            sent + 1
+        );
+        assert!(request.to_string().chars().count() <= limit);
+    }
+
+    #[tokio::test]
+    async fn undirected_questions_do_not_describe_a_causal_order() {
+        let (url, handle) = server(|request| {
+            response(&request, |key, options| {
+                choice(
+                    if key == "related_ab" || key == "alternative_to_ab" {
+                        "SUPPORTS"
+                    } else {
+                        "REJECTS"
+                    },
+                    options,
+                )
+            })
+        });
+        let classification = JevRelationAnalyzer::with_timeout(Duration::from_secs(3))
+            .unwrap()
+            .classify(&credential(url), "jev-latest", &candidate())
+            .await
+            .unwrap();
+        let request = handle.join().unwrap();
+        for key in ["related_ab", "alternative_to_ab"] {
+            let question = &request["questions"][key];
+            let instructions = question["instructions"].as_str().unwrap();
+            assert!(instructions.contains("无向关系"));
+            assert!(
+                !instructions.contains("前序")
+                    && !instructions.contains("后续")
+                    && !instructions.contains('→')
+            );
+            assert!(!question["criteria"].to_string().contains("方向"));
+        }
+        assert!(request["questions"]["fixes_ab"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("前序"));
+        let supported: Vec<_> = classification
+            .choices
+            .into_iter()
+            .filter(|item| item.judgment == RelationJudgment::Supported)
+            .collect();
+        let (url, handle) =
+            server(|request| response(&request, |_, options| choice("p0", options)));
+        JevRelationAnalyzer::with_timeout(Duration::from_secs(3))
+            .unwrap()
+            .select_evidence(&credential(url), "jev-latest", &candidate(), &supported)
+            .await
+            .unwrap();
+        let request = handle.join().unwrap();
+        for key in ["related_ab", "alternative_to_ab"] {
+            let instructions = request["questions"][key]["instructions"].as_str().unwrap();
+            assert!(instructions.contains("无向关系"));
+            assert!(
+                !instructions.contains("前序")
+                    && !instructions.contains("后续")
+                    && !instructions.contains('→')
+            );
+        }
     }
 }

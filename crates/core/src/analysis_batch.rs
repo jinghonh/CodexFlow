@@ -3,9 +3,9 @@ use super::{inferred, now_ms, SourceService};
 use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisRunState, AnalysisStage,
     AnalysisStagePlan, AnalysisUnit, AnalysisUnitState, AppError, CapabilityState, ErrorCode,
-    RelationJudgment, SummaryRun, SummaryRunState,
+    InferredPairOutcome, JevDecisionIdentity, RelationJudgment, SummaryRun, SummaryRunState,
 };
-use codexflow_jev::JevRelationAnalyzer;
+use codexflow_jev::{JevRelationAnalyzer, RELATION_RULES_VERSION};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
@@ -21,6 +21,46 @@ static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
 enum JevUnitResult {
     Classification(codexflow_domain::JevRelationClassification),
     Evidence(codexflow_domain::JevEvidenceSelection),
+}
+
+fn pinned_jev_model(model: &str) -> bool {
+    model.strip_prefix("jev-").is_some_and(|version| {
+        let parts: Vec<_> = version.split('.').collect();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
+fn reusable_jev_outcome(
+    result: &InferredPairOutcome,
+    candidate_id: &str,
+    input_version: &str,
+    base_url: &str,
+    requested_model: &str,
+    input_character_limit: usize,
+) -> bool {
+    result.candidate_id == candidate_id
+        && result.input_version == input_version
+        && pinned_jev_model(requested_model)
+        && result.jev_identity.as_ref().is_some_and(|identity| {
+            identity.base_url == base_url
+                && identity.requested_model == requested_model
+                && identity.actual_model == requested_model
+                && identity.rules_version == RELATION_RULES_VERSION
+                && identity.input_character_limit == input_character_limit
+        })
+}
+
+fn stamp_jev_outcome(result: &mut InferredPairOutcome, run: &AnalysisRun, actual_model: &str) {
+    result.jev_identity = Some(JevDecisionIdentity {
+        base_url: run.jev_base_url.clone(),
+        requested_model: run.jev_model.clone(),
+        actual_model: actual_model.into(),
+        rules_version: RELATION_RULES_VERSION.into(),
+        input_character_limit: run.limits.input_character_limit,
+    });
 }
 
 type Update = Arc<dyn Fn(AnalysisRun) + Send + Sync>;
@@ -169,10 +209,16 @@ impl SourceService {
         let mut pending_candidates = 0;
         for pair in &candidate.candidates {
             let version = inferred::candidate_version(self, pair)?;
-            if !existing
-                .iter()
-                .any(|result| result.candidate_id == pair.id && result.input_version == version)
-            {
+            if !existing.iter().any(|result| {
+                reusable_jev_outcome(
+                    result,
+                    &pair.id,
+                    &version,
+                    &jev.config.base_url,
+                    &jev.config.model,
+                    limits.input_character_limit,
+                )
+            }) {
                 pending_candidates += 1;
             }
         }
@@ -208,7 +254,7 @@ impl SourceService {
                 maximum_calls: candidate_upper_bound.saturating_mul(attempts),
                 available: jev_configured,
                 note: if jev_configured {
-                    "每对候选一次分类 POST；重试另计。"
+                    "每对候选一次分类 POST；重试另计。只复用服务、规则和实际版本一致的固定模型结果；别名会重新判断。"
                 } else {
                     "Jev 未配置，关系阶段暂不可执行。"
                 }
@@ -401,6 +447,7 @@ impl SourceService {
             codex_model: preview.stages[0].model.clone(),
             jev_base_url: jev.jev.base_url,
             jev_model: jev.jev.model,
+            jev_rules_version: RELATION_RULES_VERSION.into(),
             jev_config_revision: jev.jev_revision,
             limits,
             batch_number: 1,
@@ -550,6 +597,7 @@ impl SourceService {
             || source.version != run.codex_version
             || preview.stages[0].model != run.codex_model
             || jev_revision != run.jev_config_revision
+            || run.jev_rules_version != RELATION_RULES_VERSION
         {
             return Err(core_error(
                 ErrorCode::AnalysisConfigChanged,
@@ -726,7 +774,14 @@ impl SourceService {
                     for pair in &preview.candidates {
                         let version = inferred::candidate_version(self, pair)?;
                         if existing.iter().any(|result| {
-                            result.candidate_id == pair.id && result.input_version == version
+                            reusable_jev_outcome(
+                                result,
+                                &pair.id,
+                                &version,
+                                &run.jev_base_url,
+                                &run.jev_model,
+                                run.limits.input_character_limit,
+                            )
                         }) {
                             continue;
                         }
@@ -792,6 +847,7 @@ impl SourceService {
                 || source.version != run.codex_version
                 || model != run.codex_model
                 || jev_revision != run.jev_config_revision
+                || run.jev_rules_version != RELATION_RULES_VERSION
             {
                 run.state = AnalysisRunState::Paused;
                 run.pause_reason = Some("分析配置已变化；旧运行不会混入新配置。".into());
@@ -1103,7 +1159,12 @@ impl SourceService {
             Duration::from_secs(run.limits.timeout_seconds),
             run.limits.input_character_limit,
         )?;
-        if let Err(error) = analyzer.validate_material(candidate) {
+        let preflight = if phase == AnalysisStage::Relation {
+            analyzer.validate_classification(candidate, &model)
+        } else {
+            analyzer.validate_evidence_selection(candidate, &supported, &model)
+        };
+        if let Err(error) = preflight {
             run.units[index].state = AnalysisUnitState::Failed;
             run.units[index].error = Some(error);
             self.save_analysis(&mut run, &control.update)?;
@@ -1182,7 +1243,7 @@ impl SourceService {
                     current.units[index].state = AnalysisUnitState::Pending;
                     current.units[index].attempts = 0;
                 } else {
-                    let result = inferred::outcome(
+                    let mut result = inferred::outcome(
                         self,
                         &current.project_id,
                         candidate,
@@ -1190,6 +1251,7 @@ impl SourceService {
                         &classification,
                         None,
                     )?;
+                    stamp_jev_outcome(&mut result, &current, &classification.actual_model);
                     outcome = Some(result);
                     current.units[index].state = AnalysisUnitState::Succeeded;
                 }
@@ -1231,7 +1293,7 @@ impl SourceService {
                     .ok_or_else(|| {
                         core_error(ErrorCode::AnalysisInvalidResult, "分类结果丢失。", false)
                     })?;
-                let result = inferred::outcome(
+                let mut result = inferred::outcome(
                     self,
                     &current.project_id,
                     candidate,
@@ -1239,6 +1301,7 @@ impl SourceService {
                     classification,
                     Some(&selection),
                 )?;
+                stamp_jev_outcome(&mut result, &current, &selection.actual_model);
                 outcome = Some(result);
                 current.units[index].state = AnalysisUnitState::Succeeded;
                 current.units[index].actual_model = Some(selection.actual_model);
@@ -2645,5 +2708,150 @@ mod tests {
             server.join().unwrap();
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[tokio::test]
+    async fn jev_cache_requires_matching_nonsecret_config_rules_and_pinned_actual_model() {
+        let root = root("jev-cache-identity");
+        let service = service(&root, "ok", 2).await;
+        let base = "http://127.0.0.1:4242";
+        service
+            .save_jev(
+                base.into(),
+                "jev-1.13.0".into(),
+                Some("synthetic-key-a".into()),
+            )
+            .await
+            .unwrap();
+        let candidate = service
+            .candidate_preview("project-test")
+            .unwrap()
+            .candidates
+            .remove(0);
+        let input_version = inferred::candidate_version(&service, &candidate).unwrap();
+        let mut saved = InferredPairOutcome {
+            candidate_id: candidate.id.clone(),
+            project_id: "project-test".into(),
+            input_version: input_version.clone(),
+            status: "none".into(),
+            unknown_count: 0,
+            decisions: Vec::new(),
+            relations: Vec::new(),
+            jev_identity: Some(JevDecisionIdentity {
+                base_url: base.into(),
+                requested_model: "jev-1.13.0".into(),
+                actual_model: "jev-1.13.0".into(),
+                rules_version: RELATION_RULES_VERSION.into(),
+                input_character_limit: AnalysisLimits::default().input_character_limit,
+            }),
+        };
+        async fn pending(service: &SourceService) -> u64 {
+            service
+                .analysis_preview("project-test", AnalysisLimits::default())
+                .await
+                .unwrap()
+                .stages[1]
+                .pending_items
+        }
+        service.sessions.save_inferred_pair_outcome(&saved).unwrap();
+        assert_eq!(pending(&service).await, 0);
+        assert_eq!(
+            service
+                .analysis_preview(
+                    "project-test",
+                    AnalysisLimits {
+                        input_character_limit: 8_000,
+                        ..AnalysisLimits::default()
+                    }
+                )
+                .await
+                .unwrap()
+                .stages[1]
+                .pending_items,
+            1
+        );
+        service
+            .save_jev(
+                base.into(),
+                "jev-1.13.0".into(),
+                Some("synthetic-key-b".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending(&service).await, 0, "API Key 轮换不改变判断身份");
+
+        saved.jev_identity.as_mut().unwrap().actual_model = "jev-1.14.0".into();
+        service.sessions.save_inferred_pair_outcome(&saved).unwrap();
+        assert_eq!(pending(&service).await, 1);
+        saved.jev_identity.as_mut().unwrap().actual_model = "jev-1.13.0".into();
+        saved.jev_identity.as_mut().unwrap().rules_version = "older-choice-rules".into();
+        service.sessions.save_inferred_pair_outcome(&saved).unwrap();
+        assert_eq!(pending(&service).await, 1);
+        saved.jev_identity.as_mut().unwrap().rules_version = RELATION_RULES_VERSION.into();
+        service.sessions.save_inferred_pair_outcome(&saved).unwrap();
+        service
+            .save_jev(base.into(), "jev-1.14.0".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(pending(&service).await, 1);
+        service
+            .save_jev(
+                "http://127.0.0.1:4343".into(),
+                "jev-1.13.0".into(),
+                Some("synthetic-key-c".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending(&service).await, 1);
+        service
+            .save_jev(
+                base.into(),
+                "jev-latest".into(),
+                Some("synthetic-key-d".into()),
+            )
+            .await
+            .unwrap();
+        saved.jev_identity.as_mut().unwrap().requested_model = "jev-latest".into();
+        saved.jev_identity.as_mut().unwrap().actual_model = "jev-1.13.0".into();
+        service.sessions.save_inferred_pair_outcome(&saved).unwrap();
+        assert_eq!(pending(&service).await, 1, "别名目标未经探测时不复用旧判断");
+        saved.jev_identity.as_mut().unwrap().actual_model = "jev-1.14.0".into();
+        service.sessions.save_inferred_pair_outcome(&saved).unwrap();
+        assert_eq!(pending(&service).await, 1, "别名目标变更仍需重新判断");
+        saved.jev_identity = None;
+        service.sessions.save_inferred_pair_outcome(&saved).unwrap();
+        assert_eq!(pending(&service).await, 1, "旧缓存缺少配置身份时不可复用");
+
+        service
+            .save_jev(base.into(), "jev-1.14.0".into(), None)
+            .await
+            .unwrap();
+        let run = service
+            .start_project_analysis(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 2,
+                    ..AnalysisLimits::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &run.id, AnalysisRunState::Paused).await;
+        assert!(paused
+            .units
+            .iter()
+            .any(|unit| unit.stage == AnalysisStage::Relation && unit.id == candidate.id));
+        let mut old_rules = paused.clone();
+        old_rules.jev_rules_version = "older-choice-rules".into();
+        service.sessions.save_analysis_run(&old_rules).unwrap();
+        assert!(matches!(
+            service.continue_analysis_run(&run.id, 2, |_| {}).await,
+            Err(AppError {
+                code: ErrorCode::AnalysisConfigChanged,
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(root);
     }
 }

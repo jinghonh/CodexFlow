@@ -226,6 +226,8 @@ pub struct AnalysisRun {
     pub codex_model: String,
     pub jev_base_url: String,
     pub jev_model: String,
+    #[serde(default)]
+    pub jev_rules_version: String,
     pub jev_config_revision: u64,
     pub limits: AnalysisLimits,
     pub batch_number: u32,
@@ -960,7 +962,20 @@ pub struct InferredPairOutcome {
     pub unknown_count: u32,
     #[serde(default)]
     pub decisions: Vec<RelationChoice>,
+    #[serde(default)]
+    pub jev_identity: Option<JevDecisionIdentity>,
     pub relations: Vec<InferredRelation>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevDecisionIdentity {
+    pub base_url: String,
+    pub requested_model: String,
+    pub actual_model: String,
+    pub rules_version: String,
+    #[serde(default)]
+    pub input_character_limit: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

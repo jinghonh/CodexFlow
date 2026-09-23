@@ -11,7 +11,7 @@ use std::{
 use url::{Host, Url};
 
 mod relation;
-pub use relation::JevRelationAnalyzer;
+pub use relation::{JevRelationAnalyzer, RELATION_RULES_VERSION};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 
