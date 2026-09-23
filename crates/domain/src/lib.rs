@@ -95,6 +95,7 @@ pub enum ErrorCode {
     RefreshAlreadyRunning,
     RefreshNotFound,
     AnalysisUnavailable,
+    AnalysisModelUnsupported,
     AnalysisAlreadyRunning,
     AnalysisNotFound,
     AnalysisInvalidResult,

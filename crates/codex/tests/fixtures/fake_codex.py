@@ -185,6 +185,8 @@ for line in sys.stdin:
         assert request["params"]["sandbox"] == "read-only"
         assert request["params"]["approvalPolicy"] == "never"
         assert pathlib.Path(os.environ["CODEX_HOME"]) != pathlib.Path.home() / ".codex"
+        if mode.endswith("model-fail"):
+            assert request["params"]["model"] == "unsupported"
         response = {"id": request["id"], "result": {"thread": {"id": analysis_thread, "ephemeral": True}, "sandbox": {"type":"readOnly","networkAccess":False}, "approvalPolicy": "never", "model": "test-model"}}
     elif mode.startswith("fake-analysis-") and method == "turn/start":
         assert request["params"]["threadId"] == analysis_thread
@@ -192,6 +194,10 @@ for line in sys.stdin:
         response = {"id": request["id"], "result": {"turn": {"id": analysis_turn, "status": "inProgress", "items": []}}}
         print(json.dumps(response), flush=True)
         if mode.endswith(("cancel", "late")):
+            continue
+        if mode.endswith("model-fail"):
+            message = json.dumps({"error":{"message":"The 'unsupported' model is not supported when using Codex with a ChatGPT account."}})
+            print(json.dumps({"method":"turn/completed","params":{"threadId":analysis_thread,"turn":{"id":analysis_turn,"status":"failed","items":[],"error":{"message":message}}}}), flush=True)
             continue
         if mode.endswith("tool"):
             print(json.dumps({"method":"item/started","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"commandExecution","id":"cmd-1"}}}), flush=True)

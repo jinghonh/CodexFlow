@@ -1,9 +1,10 @@
-use super::{exclude_analysis_thread, resolve_binary, ProbeError, Session};
+use super::{exclude_analysis_thread, resolve_binary, ProbeError, Session, NEXT_PROBE};
 use codexflow_domain::{AppError, ErrorCode};
 use serde_json::{json, Value};
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    sync::atomic::Ordering,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{io::AsyncBufReadExt, time::timeout};
@@ -57,7 +58,11 @@ fn isolated_home() -> Result<PathBuf, AppError> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let dir = env::temp_dir().join(format!("codexflow-analysis-{}-{nonce}", std::process::id()));
+    let dir = env::temp_dir().join(format!(
+        "codexflow-analysis-{}-{nonce}-{}",
+        std::process::id(),
+        NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::create_dir(&dir).map_err(|_| {
         failure(
             ErrorCode::AnalysisUnavailable,
@@ -106,6 +111,18 @@ fn isolated_home() -> Result<PathBuf, AppError> {
         )
     })?;
     Ok(dir)
+}
+
+pub fn configured_summary_model() -> Option<String> {
+    let home = env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    let config = fs::read_to_string(home.join("config.toml")).ok()?;
+    let parsed: toml::Value = toml::from_str(&config).ok()?;
+    parsed
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .map(str::to_owned)
 }
 
 async fn frame(session: &mut Session) -> Result<Value, ProbeError> {
@@ -267,6 +284,27 @@ async fn await_turn(
                     ));
                 }
                 if turn.get("status").and_then(Value::as_str) != Some("completed") {
+                    let unsupported_model = turn
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .and_then(|message| serde_json::from_str::<Value>(message).ok())
+                        .and_then(|value| {
+                            value
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
+                        .is_some_and(|message| {
+                            message.contains("model is not supported")
+                                || message.contains("model is not available")
+                        });
+                    if unsupported_model {
+                        return Err(failure(
+                            ErrorCode::AnalysisModelUnsupported,
+                            "当前 Codex 账户不支持所配置的模型；请在 Codex 配置中更换模型后重试。",
+                            false,
+                        ));
+                    }
                     return Err(failure(
                         ErrorCode::AnalysisUnavailable,
                         "分析回合未成功完成，旧总结已保留。",
@@ -294,6 +332,7 @@ async fn await_turn(
 
 pub async fn analyze_summary(
     binary_choice: Option<&str>,
+    model_choice: Option<&str>,
     prompt: String,
     cancel: CancellationToken,
     mut on_event: impl FnMut(AnalysisEvent) -> Result<(), AppError>,
@@ -303,7 +342,8 @@ pub async fn analyze_summary(
     }
     let binary = resolve_binary(binary_choice)?;
     let home = isolated_home()?;
-    let result = analyze_in_home(&binary, &home, prompt, &cancel, &mut on_event).await;
+    let result =
+        analyze_in_home(&binary, &home, model_choice, prompt, &cancel, &mut on_event).await;
     let _ = fs::remove_dir_all(&home);
     result
 }
@@ -311,6 +351,7 @@ pub async fn analyze_summary(
 async fn analyze_in_home(
     binary: &Path,
     home: &Path,
+    model_choice: Option<&str>,
     prompt: String,
     cancel: &CancellationToken,
     on_event: &mut impl FnMut(AnalysisEvent) -> Result<(), AppError>,
@@ -323,7 +364,7 @@ async fn analyze_in_home(
             biased;
             _ = cancel.cancelled() => return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)),
             result = session.request("thread/start", json!({
-            "ephemeral":true,"cwd":home,"sandbox":"read-only","approvalPolicy":"never",
+            "ephemeral":true,"cwd":home,"sandbox":"read-only","approvalPolicy":"never","model":model_choice,
             "config":{"web_search":"disabled","features":{"multi_agent":false}},
             })) => result.map_err(protocol)?,
         };

@@ -1,6 +1,6 @@
 mod analysis;
 mod history;
-pub use analysis::{analyze_summary, AnalysisEvent, AnalysisOutput};
+pub use analysis::{analyze_summary, configured_summary_model, AnalysisEvent, AnalysisOutput};
 
 use codexflow_domain::{
     AppError, Capability, ErrorCode, GitMetadata, ListScopeStatus, SourceCapabilities,
@@ -515,6 +515,7 @@ mod tests {
         let mut events = Vec::new();
         let output = analyze_summary(
             Some(path.to_str().unwrap()),
+            None,
             "受控摘要".into(),
             CancellationToken::new(),
             |event| {
@@ -543,6 +544,7 @@ mod tests {
             let trigger = token.clone();
             let result = analyze_summary(
                 Some(path.to_str().unwrap()),
+                None,
                 "受控摘要".into(),
                 token,
                 |event| {
@@ -569,6 +571,7 @@ mod tests {
         let path = fake_binary("analysis-tool");
         let result = analyze_summary(
             Some(path.to_str().unwrap()),
+            None,
             "受控摘要".into(),
             CancellationToken::new(),
             |_| Ok(()),
@@ -589,6 +592,7 @@ mod tests {
         let path = fake_binary("analysis-list-pollution");
         analyze_summary(
             Some(path.to_str().unwrap()),
+            None,
             "受控摘要".into(),
             CancellationToken::new(),
             |_| Ok(()),
@@ -605,12 +609,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unsupported_configured_model_has_actionable_error() {
+        let path = fake_binary("analysis-model-fail");
+        let result = analyze_summary(
+            Some(path.to_str().unwrap()),
+            Some("unsupported"),
+            "受控摘要".into(),
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError {
+                code: ErrorCode::AnalysisModelUnsupported,
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
     #[ignore = "手动受控真实 Codex 冒烟，会调用模型"]
     async fn real_ephemeral_summary_does_not_enter_regular_history() {
         let token = CancellationToken::new();
         let stop = token.clone();
         let mut temporary_id = None;
         let output = tokio::time::timeout(Duration::from_secs(180), analyze_summary(
+            None,
             None,
             "仅使用此合成材料填写五个总结字段，evidenceIds 填空数组：目标是检查摘要接口；活动是阅读本句；结果是完成检查；决定和问题均为未知。禁止使用工具。".into(),
             token,
@@ -653,6 +679,7 @@ mod tests {
         let trigger = cancel.clone();
         let mut terminal = None;
         let result = analyze_summary(
+            None,
             None,
             "这是一条合成的中断验证材料。请仅根据这句话填写总结字段。".into(),
             cancel,
