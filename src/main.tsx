@@ -23,6 +23,16 @@ type SourceStatus = {
   checkedAtUnixMs: number | null;
 };
 type Settings = { theme: Theme; source: SourceStatus };
+type Thread = {
+  id: string; sessionId: string; title: string | null; preview: string; cwd: string;
+  projectId: string | null; sourceKind: string; sourceDetail: string | null;
+  threadSource: string | null; parentThreadId: string | null; forkedFromId: string | null;
+  git: { branch: string | null; sha: string | null; originUrl: string | null } | null;
+  createdAt: number; updatedAt: number; archived: boolean; metadataComplete: boolean;
+  contentComplete: boolean; readError: string | null; observedAtUnixMs: number;
+};
+type Scope = { archived: boolean; complete: boolean; attemptedAtUnixMs: number | null; completedAtUnixMs: number | null; error: string | null };
+type SessionList = { threads: Thread[]; scopes: Scope[] };
 
 const labels: { key: keyof SourceStatus["capabilities"]; title: string; number: string }[] = [
   { key: "metadata", title: "会话元数据", number: "01" },
@@ -43,17 +53,34 @@ function App() {
   const [theme, setTheme] = useState<Theme>("system");
   const [busy, setBusy] = useState(true);
   const [pageError, setPageError] = useState("");
+  const [sessionList, setSessionList] = useState<SessionList | null>(null);
+  const [listError, setListError] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [query, setQuery] = useState("");
 
   useEffect(() => {
     let active = true;
     invoke<Settings>("get_settings")
       .then(async (settings) => {
         if (!active) return;
+        try {
+          const cached = await invoke<SessionList>("get_session_list");
+          if (active) setSessionList(cached);
+        } catch (error) { if (active) setListError(errorText(error)); }
+        if (!active) return;
         setTheme(settings.theme);
         setPath(settings.source.selectedBinary ?? "");
         setSource(settings.source);
         const next = await invoke<SourceStatus>("connect_source", { selectedBinary: settings.source.selectedBinary });
         if (active) setSource(next);
+        if (active && next.connection === "connected") {
+          setRefreshing(true);
+          try {
+            const list = await invoke<SessionList>("refresh_session_list");
+            if (active) { setSessionList(list); setListError(""); }
+          } catch (error) { if (active) setListError(errorText(error)); }
+          finally { if (active) setRefreshing(false); }
+        }
       })
       .catch((error) => { if (active) setPageError(errorText(error)); })
       .finally(() => { if (active) setBusy(false); });
@@ -74,8 +101,17 @@ function App() {
       const next = await invoke<SourceStatus>("connect_source", { selectedBinary: value.trim() || null });
       setSource(next);
       setPath(value);
+      if (next.connection === "connected") await refreshSessions();
     } catch (error) { setPageError(errorText(error)); }
     finally { setBusy(false); }
+  }
+
+  async function refreshSessions() {
+    setRefreshing(true);
+    setListError("");
+    try { setSessionList(await invoke<SessionList>("refresh_session_list")); }
+    catch (error) { setListError(errorText(error)); }
+    finally { setRefreshing(false); }
   }
 
   async function browse() {
@@ -95,12 +131,18 @@ function App() {
   const connected = source?.connection === "connected";
   const failed = source?.connection === "failed";
   const checkedAt = source?.checkedAtUnixMs ? new Date(source.checkedAtUnixMs).toLocaleString("zh-CN") : "尚未检查";
+  const scopes = sessionList?.scopes ?? [];
+  const attempted = scopes.some((scope) => scope.attemptedAtUnixMs !== null);
+  const complete = scopes.length === 2 && scopes.every((scope) => scope.complete);
+  const visibleThreads = (sessionList?.threads ?? []).filter((thread) =>
+    [thread.title, thread.preview, thread.id, thread.cwd].some((value) => value?.toLowerCase().includes(query.toLowerCase()))
+  );
 
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">C<span>F</span></span><div><strong>CodexFlow</strong><small>本地工作过程</small></div></div>
-      <div className="side-group"><span className="side-caption">工作空间</span><div className="side-link active"><span className="side-dot" />来源连接 <span className="side-index">01</span></div></div>
-      <div className="side-note"><span className="side-note-line" />此阶段只验证本机 Codex 数据源。项目、会话与分析功能会在后续逐步接入。</div>
+      <div className="side-group"><span className="side-caption">工作空间</span><div className="side-link active"><span className="side-dot" />来源连接 <span className="side-index">01</span></div><a className="side-link" href="#sessions"><span className="side-dot" />会话列表 <span className="side-index">02</span></a></div>
+      <div className="side-note"><span className="side-note-line" />本机持久会话会保存到应用缓存。项目归属与历史内容在后续阶段接入。</div>
       <div className="sidebar-bottom"><span className="sidebar-bottom-symbol">↗</span><div>本机运行<br /><strong>数据留在你的设备</strong></div></div>
     </aside>
 
@@ -143,7 +185,15 @@ function App() {
         </div>
 
         <section className="footer-panel"><div><div className="panel-kicker">显示偏好</div><h3>界面外观</h3></div><div className="theme-picker" role="group" aria-label="界面外观">{(["system", "light", "dark"] as const).map((value) => <button key={value} className={theme === value ? "selected" : ""} onClick={() => changeTheme(value)}>{value === "system" ? "跟随系统" : value === "light" ? "浅色" : "深色"}</button>)}</div><small>保存于应用管理的本机用户数据目录</small></section>
-        <p className="disclaimer">诊断只检查协议，不会恢复会话、读取会话正文或发起模型调用。完整历史兼容性由后续采集流程验证。</p>
+        <section id="sessions" className="panel session-panel">
+          <div className="session-heading"><div><div className="panel-kicker">02 / 持久会话</div><h2>已发现的会话</h2><p className="panel-intro">按 Codex Thread ID 保存；包括归档与子代理。重新打开应用时先显示本地缓存。</p></div><button className="primary-button" disabled={!connected || refreshing} onClick={() => void refreshSessions()}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button></div>
+          <div className="list-summary"><strong>{sessionList?.threads.length ?? 0} 条会话</strong><span>{!attempted ? "尚未采集" : complete ? "列表完整" : "列表部分完成；旧缓存仍在"}</span><span>历史内容：待采集</span></div>
+          {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "已归档" : "未归档"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "列表完整" : "读取不完整"}</span><small>{scope.completedAtUnixMs ? `上次完整读取 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整读取记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}
+          {listError && <div className="page-error" role="alert">{listError} 已保存的会话仍可浏览。</div>}
+          <label className="session-search">查找会话<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="标题、预览、Thread ID 或工作目录" /></label>
+          <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{query ? "没有匹配的会话。" : "缓存中尚无会话。连接来源后可以刷新。"}</p> : visibleThreads.map((thread) => <article className="thread-row" key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>来源项目</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
+        </section>
+        <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。历史内容完整性由后续采集流程验证。</p>
       </div>
     </main>
   </div>;

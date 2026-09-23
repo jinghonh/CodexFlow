@@ -1,5 +1,5 @@
 use codexflow_core::SourceService;
-use codexflow_domain::{AppError, DisplayTheme, SourceStatus};
+use codexflow_domain::{AppError, DisplayTheme, SessionList, SourceStatus};
 use serde::Serialize;
 use tauri::Manager;
 
@@ -45,6 +45,16 @@ async fn set_display_theme(
     service(&state)?.set_theme(theme).await
 }
 
+#[tauri::command]
+fn get_session_list(state: tauri::State<'_, AppState>) -> Result<SessionList, AppError> {
+    service(&state)?.cached_sessions()
+}
+
+#[tauri::command]
+async fn refresh_session_list(state: tauri::State<'_, AppState>) -> Result<SessionList, AppError> {
+    service(&state)?.refresh_sessions().await
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -59,7 +69,9 @@ fn main() {
             get_settings,
             get_source_status,
             connect_source,
-            set_display_theme
+            set_display_theme,
+            get_session_list,
+            refresh_session_list
         ])
         .build(tauri::generate_context!())
         .expect("无法启动 CodexFlow 桌面应用")

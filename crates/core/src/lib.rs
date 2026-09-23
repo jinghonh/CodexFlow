@@ -1,8 +1,8 @@
 use codexflow_codex::{diagnose, Session};
 use codexflow_domain::{
-    AppError, ConnectionState, DisplayTheme, ErrorCode, Preferences, SourceStatus,
+    AppError, ConnectionState, DisplayTheme, ErrorCode, Preferences, SessionList, SourceStatus,
 };
-use codexflow_store::PreferenceStore;
+use codexflow_store::{PreferenceStore, SessionStore};
 use std::{
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 
 pub struct SourceService {
     store: PreferenceStore,
+    sessions: SessionStore,
     state: Mutex<State>,
 }
 
@@ -22,11 +23,13 @@ struct State {
 
 impl SourceService {
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
-        let store = PreferenceStore::new(app_data_dir);
+        let store = PreferenceStore::new(app_data_dir.clone());
+        let sessions = SessionStore::new(app_data_dir)?;
         let preferences = store.load()?;
         let status = SourceStatus::new(preferences.selected_binary.clone());
         Ok(Self {
             store,
+            sessions,
             state: Mutex::new(State {
                 preferences,
                 status,
@@ -96,6 +99,26 @@ impl SourceService {
         if let Some(mut session) = state.session.take() {
             session.close().await;
         }
+    }
+
+    pub fn cached_sessions(&self) -> Result<SessionList, AppError> {
+        self.sessions.list()
+    }
+
+    pub async fn refresh_sessions(&self) -> Result<SessionList, AppError> {
+        let mut state = self.state.lock().await;
+        check_process(&mut state);
+        let session = state.session.as_mut().ok_or_else(|| {
+            AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "Codex 来源当前不可用。请先连接，已有会话缓存仍可浏览。",
+                true,
+            )
+        })?;
+        let collection = session.collect_threads(now_ms() as i64).await;
+        self.sessions
+            .save_collection(&collection.threads, &collection.scopes)?;
+        self.sessions.list()
     }
 }
 
@@ -174,6 +197,116 @@ mod tests {
         let (theme, source) = reopened.settings().await;
         assert!(matches!(theme, DisplayTheme::Dark));
         assert_eq!(source.selected_binary.as_deref(), binary.to_str());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn complete_and_partial_lists_keep_one_cached_thread_per_id() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codexflow-list-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for mode in ["list-rich", "list-partial", "list-moved"] {
+            let binary = root.join(format!("fake-{mode}.py"));
+            let mut file = fs::File::create(&binary).unwrap();
+            file.write_all(include_bytes!("../../codex/tests/fixtures/fake_codex.py"))
+                .unwrap();
+            file.set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let service = SourceService::new(root.join("data")).unwrap();
+        service
+            .connect(Some(
+                root.join("fake-list-rich.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let first = service.refresh_sessions().await.unwrap();
+        assert_eq!(first.threads.len(), 4);
+        assert!(first.scopes.iter().all(|scope| scope.complete));
+        let archived = first
+            .threads
+            .iter()
+            .find(|thread| thread.id == "thread-a")
+            .unwrap();
+        assert!(archived.archived);
+        assert!(first
+            .threads
+            .iter()
+            .find(|thread| thread.id == "thread-b")
+            .unwrap()
+            .read_error
+            .is_some());
+        assert_eq!(
+            first
+                .threads
+                .iter()
+                .find(|thread| thread.id == "thread-b")
+                .unwrap()
+                .parent_thread_id
+                .as_deref(),
+            Some("thread-a")
+        );
+        assert_eq!(service.refresh_sessions().await.unwrap().threads.len(), 4);
+        service.shutdown().await;
+
+        let reopened = SourceService::new(root.join("data")).unwrap();
+        assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
+        assert!(reopened.refresh_sessions().await.is_err());
+        assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
+        reopened
+            .connect(Some(
+                root.join("fake-list-partial.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let partial = reopened.refresh_sessions().await.unwrap();
+        assert_eq!(partial.threads.len(), 4);
+        assert!(partial.threads.iter().any(|thread| thread.id == "thread-c"));
+        assert!(
+            !partial
+                .scopes
+                .iter()
+                .find(|scope| !scope.archived)
+                .unwrap()
+                .complete
+        );
+        assert!(
+            partial
+                .scopes
+                .iter()
+                .find(|scope| scope.archived)
+                .unwrap()
+                .complete
+        );
+        reopened
+            .connect(Some(
+                root.join("fake-list-moved.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let moved = reopened.refresh_sessions().await.unwrap();
+        assert_eq!(moved.threads.len(), 4);
+        assert!(
+            moved
+                .threads
+                .iter()
+                .find(|thread| thread.id == "thread-b")
+                .unwrap()
+                .archived
+        );
+        reopened.shutdown().await;
         let _ = fs::remove_dir_all(root);
     }
 }
