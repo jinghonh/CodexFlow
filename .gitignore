@@ -1,2 +1,5 @@
 .DS_Store
 docs/*
+!docs/SPEC.md
+!docs/TICKETS.md
+!docs/adr/
