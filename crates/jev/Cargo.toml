@@ -1,0 +1,7 @@
+[package]
+name = "codexflow-jev"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+codexflow-domain = { path = "../domain" }

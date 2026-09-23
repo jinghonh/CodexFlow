@@ -1,0 +1,15 @@
+[package]
+name = "codexflow-desktop"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+codexflow-core = { path = "../crates/core" }
+codexflow-domain = { path = "../crates/domain" }
+serde = { version = "1", features = ["derive"] }

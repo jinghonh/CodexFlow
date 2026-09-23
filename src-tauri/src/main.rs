@@ -1,0 +1,74 @@
+use codexflow_core::SourceService;
+use codexflow_domain::{AppError, DisplayTheme, SourceStatus};
+use serde::Serialize;
+use tauri::Manager;
+
+struct AppState {
+    service: Result<SourceService, AppError>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SettingsView {
+    theme: DisplayTheme,
+    source: SourceStatus,
+}
+
+fn service<'a>(state: &'a tauri::State<'_, AppState>) -> Result<&'a SourceService, AppError> {
+    state.service.as_ref().map_err(Clone::clone)
+}
+
+#[tauri::command]
+async fn get_settings(state: tauri::State<'_, AppState>) -> Result<SettingsView, AppError> {
+    let (theme, source) = service(&state)?.settings().await;
+    Ok(SettingsView { theme, source })
+}
+
+#[tauri::command]
+async fn get_source_status(state: tauri::State<'_, AppState>) -> Result<SourceStatus, AppError> {
+    Ok(service(&state)?.status().await)
+}
+
+#[tauri::command]
+async fn connect_source(
+    state: tauri::State<'_, AppState>,
+    selected_binary: Option<String>,
+) -> Result<SourceStatus, AppError> {
+    service(&state)?.connect(selected_binary).await
+}
+
+#[tauri::command]
+async fn set_display_theme(
+    state: tauri::State<'_, AppState>,
+    theme: DisplayTheme,
+) -> Result<DisplayTheme, AppError> {
+    service(&state)?.set_theme(theme).await
+}
+
+fn main() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            let data_dir = app.path().app_data_dir()?;
+            app.manage(AppState {
+                service: SourceService::new(data_dir),
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            get_settings,
+            get_source_status,
+            connect_source,
+            set_display_theme
+        ])
+        .build(tauri::generate_context!())
+        .expect("无法启动 CodexFlow 桌面应用")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                let state = app.state::<AppState>();
+                if let Ok(service) = &state.service {
+                    tauri::async_runtime::block_on(service.shutdown());
+                }
+            }
+        });
+}
