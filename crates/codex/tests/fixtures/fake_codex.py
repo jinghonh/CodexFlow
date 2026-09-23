@@ -184,17 +184,19 @@ for line in sys.stdin:
         home = pathlib.Path(os.environ["CODEX_HOME"])
         assert pathlib.Path.cwd() != home
         assert not (home / "auth.json").exists()
-        keys = ("shell_tool", "apps", "hooks", "multi_agent", "remote_plugin", "plugins", "view_image",
+        keys = ("shell_tool", "unified_exec", "apps", "hooks", "multi_agent", "remote_plugin", "plugins", "view_image",
                 "browser_use", "browser_use_external", "browser_use_full_cdp_access", "computer_use",
                 "in_app_browser", "in_app_local_automation", "image_generation", "shell_snapshot", "skill_search",
                 "skill_mcp_dependency_install", "tool_call_mcp_elicitation", "tool_suggest", "workspace_dependencies", "goals")
         features = {key: False for key in keys}
         if mode.endswith("unsafe-config"):
             features["shell_tool"] = True
+        if mode.endswith("unified-exec-on"):
+            features["unified_exec"] = True
         response = {"id":request["id"], "result":{"config":{"features":features,"web_search":"disabled",
             "cli_auth_credentials_store":"keyring","mcp_servers":{}}}}
     elif mode.startswith("fake-analysis-") and method == "thread/start":
-        if mode.endswith("unsafe-config"):
+        if mode.endswith(("unsafe-config", "unified-exec-on")):
             (pathlib.Path(__file__).parent / "unexpected-thread-start").touch()
         assert request["params"]["ephemeral"] is True
         assert request["params"]["sandbox"] == "read-only"
@@ -202,8 +204,19 @@ for line in sys.stdin:
         assert pathlib.Path(os.environ["CODEX_HOME"]) != pathlib.Path.home() / ".codex"
         if mode.endswith("model-fail"):
             assert request["params"]["model"] == "unsupported"
-        response = {"id": request["id"], "result": {"thread": {"id": analysis_thread, "ephemeral": True}, "sandbox": {"type":"readOnly","networkAccess":False}, "approvalPolicy": "never", "model": "test-model"}}
+        sandbox = {"type":"readOnly","networkAccess":False}
+        if mode.endswith("network-missing"):
+            sandbox.pop("networkAccess")
+        elif mode.endswith("network-null"):
+            sandbox["networkAccess"] = None
+        elif mode.endswith("network-string"):
+            sandbox["networkAccess"] = "false"
+        elif mode.endswith("network-true"):
+            sandbox["networkAccess"] = True
+        response = {"id": request["id"], "result": {"thread": {"id": analysis_thread, "ephemeral": True}, "sandbox": sandbox, "approvalPolicy": "never", "model": "test-model"}}
     elif mode.startswith("fake-analysis-") and method == "turn/start":
+        if mode.endswith(("network-missing", "network-null", "network-string", "network-true")):
+            (pathlib.Path(__file__).parent / "unexpected-turn-start").touch()
         assert request["params"]["threadId"] == analysis_thread
         assert request["params"]["outputSchema"]["required"] == ["goal", "activity", "outcome", "decisions", "issues", "evidenceIds"]
         response = {"id": request["id"], "result": {"turn": {"id": analysis_turn, "status": "inProgress", "items": []}}}
