@@ -1,6 +1,9 @@
+mod projects;
+
 use codexflow_codex::{diagnose, Session};
 use codexflow_domain::{
-    AppError, ConnectionState, DisplayTheme, ErrorCode, Preferences, SessionList, SourceStatus,
+    AppError, ConnectionState, DisplayTheme, ErrorCode, Preferences, ProjectCatalog,
+    ProjectSessions, SessionList, SourceStatus,
 };
 use codexflow_store::{PreferenceStore, SessionStore};
 use std::{
@@ -27,7 +30,7 @@ impl SourceService {
         let sessions = SessionStore::new(app_data_dir)?;
         let preferences = store.load()?;
         let status = SourceStatus::new(preferences.selected_binary.clone());
-        Ok(Self {
+        let service = Self {
             store,
             sessions,
             state: Mutex::new(State {
@@ -35,7 +38,9 @@ impl SourceService {
                 status,
                 session: None,
             }),
-        })
+        };
+        service.reconcile_projects()?;
+        Ok(service)
     }
 
     pub async fn settings(&self) -> (DisplayTheme, SourceStatus) {
@@ -105,6 +110,37 @@ impl SourceService {
         self.sessions.list()
     }
 
+    fn reconcile_projects(&self) -> Result<(), AppError> {
+        let threads = self.sessions.list()?.threads;
+        let projects = self.sessions.projects()?;
+        let previous = self.sessions.attributions()?;
+        let (projects, attributions) = projects::reconcile(&threads, projects, &previous);
+        self.sessions
+            .save_projects_and_attributions(&projects, &attributions)
+    }
+
+    pub fn project_catalog(&self) -> Result<ProjectCatalog, AppError> {
+        self.sessions.catalog()
+    }
+
+    pub fn project_sessions(&self, project_id: &str) -> Result<ProjectSessions, AppError> {
+        self.sessions.project_sessions(project_id)
+    }
+
+    pub fn choose_project(&self, path: &str) -> Result<ProjectCatalog, AppError> {
+        let project = projects::selected_project(path).map_err(AppError::project)?;
+        self.sessions
+            .save_projects_and_attributions(&[project.clone()], &[])?;
+        self.reconcile_projects()?;
+        self.sessions.select_project(&project.id)?;
+        self.sessions.catalog()
+    }
+
+    pub fn choose_existing_project(&self, project_id: &str) -> Result<ProjectCatalog, AppError> {
+        self.sessions.select_project(project_id)?;
+        self.sessions.catalog()
+    }
+
     pub async fn refresh_sessions(&self) -> Result<SessionList, AppError> {
         let mut state = self.state.lock().await;
         let attempted_at = now_ms() as i64;
@@ -132,6 +168,7 @@ impl SourceService {
                 .fail_refresh(attempted_at, "保存会话列表失败；旧缓存已保留。");
             return Err(error);
         }
+        self.reconcile_projects()?;
         self.sessions.list()
     }
 }
@@ -347,6 +384,72 @@ mod tests {
             .unwrap();
         assert_eq!(after_failure.threads.len(), 4);
         assert!(after_failure.scopes.iter().all(|scope| !scope.complete));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_non_git_project_queries_only_its_threads_after_restart() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("codexflow-project-service-{nonce}"));
+        let project = root.join("notes");
+        let other = root.join("notes-other");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&other).unwrap();
+        let service = SourceService::new(root.join("data")).unwrap();
+        let make_thread = |id: &str, cwd: &std::path::Path| codexflow_domain::ThreadMetadata {
+            id: id.into(),
+            session_id: id.into(),
+            title: None,
+            preview: String::new(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: None,
+            forked_from_id: None,
+            git: None,
+            created_at: 0,
+            updated_at: 1,
+            archived: false,
+            metadata_complete: true,
+            content_complete: false,
+            read_error: None,
+            observed_at_unix_ms: 1,
+        };
+        service
+            .sessions
+            .save_collection(
+                &[
+                    make_thread("inside", &project),
+                    make_thread("outside", &other),
+                ],
+                &[],
+            )
+            .unwrap();
+        let catalog = service.choose_project(project.to_str().unwrap()).unwrap();
+        let id = catalog.selected_project_id.unwrap();
+        assert_eq!(catalog.unassigned.len(), 1);
+        let sessions = service.project_sessions(&id).unwrap();
+        assert_eq!(sessions.threads.len(), 1);
+        assert_eq!(sessions.threads[0].thread.id, "inside");
+        assert_eq!(
+            sessions.workspaces,
+            vec![fs::canonicalize(&project)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()]
+        );
+        drop(service);
+        let reopened = SourceService::new(root.join("data")).unwrap();
+        assert_eq!(
+            reopened.project_catalog().unwrap().selected_project_id,
+            Some(id.clone())
+        );
+        assert_eq!(reopened.project_sessions(&id).unwrap().threads.len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 }

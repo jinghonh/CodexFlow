@@ -1,5 +1,7 @@
 use codexflow_core::SourceService;
-use codexflow_domain::{AppError, DisplayTheme, SessionList, SourceStatus};
+use codexflow_domain::{
+    AppError, DisplayTheme, ProjectCatalog, ProjectSessions, SessionList, SourceStatus,
+};
 use serde::Serialize;
 use tauri::Manager;
 
@@ -55,6 +57,35 @@ async fn refresh_session_list(state: tauri::State<'_, AppState>) -> Result<Sessi
     service(&state)?.refresh_sessions().await
 }
 
+#[tauri::command]
+fn get_project_catalog(state: tauri::State<'_, AppState>) -> Result<ProjectCatalog, AppError> {
+    service(&state)?.project_catalog()
+}
+
+#[tauri::command]
+fn get_project_sessions(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectSessions, AppError> {
+    service(&state)?.project_sessions(&project_id)
+}
+
+#[tauri::command]
+fn choose_project(
+    state: tauri::State<'_, AppState>,
+    path: String,
+) -> Result<ProjectCatalog, AppError> {
+    service(&state)?.choose_project(&path)
+}
+
+#[tauri::command]
+fn choose_existing_project(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectCatalog, AppError> {
+    service(&state)?.choose_existing_project(&project_id)
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -71,7 +102,11 @@ fn main() {
             connect_source,
             set_display_theme,
             get_session_list,
-            refresh_session_list
+            refresh_session_list,
+            get_project_catalog,
+            get_project_sessions,
+            choose_project,
+            choose_existing_project
         ])
         .build(tauri::generate_context!())
         .expect("无法启动 CodexFlow 桌面应用")

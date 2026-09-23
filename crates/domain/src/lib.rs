@@ -40,6 +40,16 @@ impl AppError {
             backend: "store".into(),
         }
     }
+
+    pub fn project(message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::ProjectResolutionFailed,
+            message: message.into(),
+            retryable: true,
+            cache_preserved: true,
+            backend: "core".into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -53,6 +63,7 @@ pub enum ErrorCode {
     SourceReadFailed,
     StorageFailed,
     MigrationFailed,
+    ProjectResolutionFailed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,6 +112,53 @@ pub struct ListScopeStatus {
 #[serde(rename_all = "camelCase")]
 pub struct SessionList {
     pub threads: Vec<ThreadMetadata>,
+    pub scopes: Vec<ListScopeStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalProject {
+    pub id: String,
+    pub name: String,
+    pub root: String,
+    pub git_common_dir: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadAttribution {
+    pub thread_id: String,
+    pub project_id: Option<String>,
+    pub workspace_root: Option<String>,
+    pub basis: String,
+    pub detail: String,
+    pub diagnostic: Option<String>,
+    pub source_project_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttributedThread {
+    pub thread: ThreadMetadata,
+    pub attribution: ThreadAttribution,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectCatalog {
+    pub projects: Vec<LocalProject>,
+    pub selected_project_id: Option<String>,
+    pub recent_project_ids: Vec<String>,
+    pub unassigned: Vec<AttributedThread>,
+    pub scopes: Vec<ListScopeStatus>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectSessions {
+    pub project: LocalProject,
+    pub workspaces: Vec<String>,
+    pub threads: Vec<AttributedThread>,
     pub scopes: Vec<ListScopeStatus>,
 }
 

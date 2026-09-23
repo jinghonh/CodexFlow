@@ -92,6 +92,21 @@ button:disabled { cursor: wait; opacity: .6; }
 .theme-picker button.selected { background: var(--green-soft); color: var(--green); font-weight: 700; }
 .disclaimer { color: var(--muted); font-size: 10px; line-height: 1.7; margin: 17px 0 0; }
 .session-panel { margin-top: 20px; scroll-margin-top: 24px; }
+.project-panel { margin-top: 20px; scroll-margin-top: 24px; }
+.project-picker { display: flex; gap: 7px; margin-bottom: 18px; }
+.project-picker input { flex: 1; min-width: 0; padding: 10px; border: 1px solid var(--line); background: var(--page); color: var(--ink); font-family: ui-monospace, monospace; font-size: 11px; }
+.project-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 9px; }
+.project-choice { text-align: left; border: 1px solid var(--line); background: var(--page); color: var(--ink); padding: 12px; min-width: 0; }
+.project-choice.selected, .unassigned-choice.selected { border-color: var(--green); background: var(--green-soft); }
+.project-choice strong, .project-choice small, .project-choice span { display: block; overflow-wrap: anywhere; }
+.project-choice strong { font-size: 12px; }
+.project-choice small { color: var(--muted); font-size: 10px; margin: 5px 0; }
+.project-choice span { color: var(--green); font-size: 10px; }
+.unassigned-choice { margin-top: 12px; padding: 9px 12px; border: 1px solid var(--line); background: var(--page); color: var(--ink); font-size: 11px; }
+.workspace-list { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 11px 0; border-top: 1px solid var(--line); font-size: 10px; }
+.workspace-list strong { margin-right: 8px; }
+.workspace-list code { padding: 5px 7px; background: var(--green-soft); color: var(--green); overflow-wrap: anywhere; }
+.attribution-diagnostic strong { color: var(--red); font-weight: 500; }
 .session-heading { display: flex; justify-content: space-between; gap: 18px; align-items: center; }
 .session-heading .panel-intro { margin-bottom: 12px; min-height: 0; }
 .list-summary { display: flex; flex-wrap: wrap; gap: 10px 18px; padding: 14px 0; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); }
