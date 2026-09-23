@@ -197,6 +197,7 @@ impl Default for JevConfig {
 pub struct JevStatus {
     pub config: JevConfig,
     pub credential_configured: bool,
+    pub credential_error: Option<AppError>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -211,8 +212,17 @@ pub struct JevConnectionResult {
 pub struct JevInferenceResult {
     pub requested_model: String,
     pub actual_model: String,
+    pub answer: JevChoiceAnswer,
     pub input_tokens: u64,
     pub output_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevChoiceAnswer {
+    pub choice: String,
+    pub confidence: f64,
+    pub probabilities: std::collections::BTreeMap<String, f64>,
 }
 
 impl Default for Preferences {

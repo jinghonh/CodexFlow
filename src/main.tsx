@@ -23,9 +23,15 @@ type SourceStatus = {
   checkedAtUnixMs: number | null;
 };
 type Settings = { theme: Theme; source: SourceStatus };
-type JevStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean };
+type JevStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean; credentialError: AppError | null };
 type JevConnectionResult = { models: string[]; requestedModel: string };
-type JevInferenceResult = { requestedModel: string; actualModel: string; inputTokens: number; outputTokens: number };
+type JevInferenceResult = {
+  requestedModel: string;
+  actualModel: string;
+  answer: { choice: "resolved" | "unresolved"; confidence: number; probabilities: { resolved: number; unresolved: number } };
+  inputTokens: number;
+  outputTokens: number;
+};
 
 const labels: { key: keyof SourceStatus["capabilities"]; title: string; number: string }[] = [
   { key: "metadata", title: "会话元数据", number: "01" },
@@ -132,6 +138,13 @@ function App() {
     finally { setJevSaving(false); }
   }
 
+  async function refreshJevStatus() {
+    try {
+      setJevStatus(await invoke<JevStatus>("get_jev_status"));
+      setJevError("");
+    } catch (error) { setJevError(errorText(error)); }
+  }
+
   async function deleteJev() {
     if (!window.confirm("删除钥匙串中的 Jev API Key？已有本地结果会保留。")) return;
     jevEpoch.current += 1;
@@ -150,6 +163,8 @@ function App() {
     const epoch = jevEpoch.current;
     setJevRequestBusy(true);
     setJevError("");
+    if (kind === "connection") setJevConnection(null);
+    else setJevInference(null);
     try {
       if (kind === "connection") {
         const result = await invoke<JevConnectionResult>("check_jev_connection");
@@ -230,12 +245,14 @@ function App() {
           <div className="jev-fields">
             <label htmlFor="jev-url">服务根地址<input id="jev-url" spellCheck={false} value={jevBaseUrl} onChange={(event) => setJevBaseUrl(event.target.value)} placeholder="https://api.typesafe.ai" /></label>
             <label htmlFor="jev-model">模型 ID<input id="jev-model" spellCheck={false} value={jevModel} onChange={(event) => setJevModel(event.target.value)} placeholder="jev-latest" /></label>
-            <label htmlFor="jev-key">API Key<input id="jev-key" type="password" autoComplete="off" spellCheck={false} value={jevKey} onChange={(event) => setJevKey(event.target.value)} placeholder={jevStatus?.credentialConfigured ? "已保存；留空则保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
+            <label htmlFor="jev-key">API Key<input id="jev-key" type="password" autoComplete="off" spellCheck={false} value={jevKey} onChange={(event) => setJevKey(event.target.value)} placeholder={jevStatus?.credentialError ? "钥匙串不可用；请先解锁" : jevStatus?.credentialConfigured ? "已保存；留空则保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
           </div>
-          <p className="jev-key-state">钥匙串状态：{jevStatus?.credentialConfigured ? "已保存地址已配置密钥" : "已保存地址未配置密钥"}。更换服务地址时需填写新密钥。{jevUnsaved ? "请先保存修改，再运行验证。" : ""}</p>
+          <p className="jev-key-state">钥匙串状态：{jevStatus?.credentialError ? "暂时无法读取" : jevStatus?.credentialConfigured ? "已保存地址已配置密钥" : "已保存地址未配置密钥"}。更换服务地址时需填写新密钥。{jevUnsaved ? "请先保存修改，再运行验证。" : ""}</p>
+          {jevStatus?.credentialError && <div className="page-error" role="alert">{jevStatus.credentialError.message} 已保存的服务地址与模型仍可查看；解锁后重新检查钥匙串。</div>}
           {jevError && <div className="page-error" role="alert">{jevError}</div>}
           <div className="jev-actions">
             <button className="primary-button" disabled={jevBusy} onClick={saveJev}>保存设置</button>
+            {jevStatus?.credentialError && <button className="browse-button" disabled={jevBusy} onClick={refreshJevStatus}>重查钥匙串</button>}
             <button className="browse-button" disabled={jevBusy || jevUnsaved || !jevStatus?.credentialConfigured} onClick={() => runJev("connection")}>验证连接</button>
             <button className="browse-button" disabled={jevBusy || jevUnsaved || !jevStatus?.credentialConfigured} onClick={() => runJev("inference")}>测试固定合成推理</button>
             {jevRequestBusy && <button className="plain-button" onClick={cancelJev}>取消请求</button>}
@@ -243,7 +260,7 @@ function App() {
           </div>
           <p className="jev-cost-note">测试推理会向所填服务发送固定合成材料，并消耗一次推理调用。取消仅确认本地请求结束，远端计算或计费可能继续。</p>
           {!jevUnsaved && jevConnection && <div className="jev-result" role="status"><strong>连接已验证</strong><span>可用名称：{jevConnection.models.join("、") || "列表为空"}。所填版本化模型 ID 仍可单独测试。</span></div>}
-          {!jevUnsaved && jevInference && <div className="jev-result" role="status"><strong>合成推理已验证</strong><span>实际模型：{jevInference.actualModel}；输入 {jevInference.inputTokens}，输出 {jevInference.outputTokens} 个令牌。</span></div>}
+          {!jevUnsaved && jevInference && <div className="jev-result" role="status"><strong>合成推理已验证</strong><span>判定：{jevInference.answer.choice === "resolved" ? "已处理" : "尚未处理"}；置信度 {(jevInference.answer.confidence * 100).toFixed(1)}%；选项概率：已处理 {(jevInference.answer.probabilities.resolved * 100).toFixed(1)}%、尚未处理 {(jevInference.answer.probabilities.unresolved * 100).toFixed(1)}%。实际模型：{jevInference.actualModel}；输入 {jevInference.inputTokens}，输出 {jevInference.outputTokens} 个令牌。</span></div>}
         </section>
 
         <section className="footer-panel"><div><div className="panel-kicker">显示偏好</div><h3>界面外观</h3></div><div className="theme-picker" role="group" aria-label="界面外观">{(["system", "light", "dark"] as const).map((value) => <button key={value} className={theme === value ? "selected" : ""} onClick={() => changeTheme(value)}>{value === "system" ? "跟随系统" : value === "light" ? "浅色" : "深色"}</button>)}</div><small>保存于应用管理的本机用户数据目录</small></section>

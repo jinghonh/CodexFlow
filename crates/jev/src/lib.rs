@@ -1,5 +1,7 @@
 //! TypeSafe 原生 HTTP 与系统凭据边界。公开结果不含密钥或原始响应。
-use codexflow_domain::{AppError, ErrorCode, JevConnectionResult, JevInferenceResult};
+use codexflow_domain::{
+    AppError, ErrorCode, JevChoiceAnswer, JevConnectionResult, JevInferenceResult,
+};
 use reqwest::{header, redirect::Policy, Client, StatusCode};
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
@@ -132,6 +134,7 @@ impl JevClient {
         credential: &Credential,
         model: &str,
     ) -> Result<JevConnectionResult, AppError> {
+        reject_secret_in_model(credential, model)?;
         let url = format!("{}/v1/models", normalize_base_url(&credential.base_url)?);
         let response = self
             .client
@@ -142,7 +145,11 @@ impl JevClient {
             .map_err(network_error)?;
         let response = success(response).await?;
         let body: ModelsResponse = response.json().await.map_err(|_| protocol_error())?;
-        if body.models.iter().any(|entry| entry.name.trim().is_empty()) {
+        if body
+            .models
+            .iter()
+            .any(|entry| entry.name.trim().is_empty() || entry.name.contains(&credential.key))
+        {
             return Err(protocol_error());
         }
         Ok(JevConnectionResult {
@@ -156,6 +163,7 @@ impl JevClient {
         credential: &Credential,
         model: &str,
     ) -> Result<JevInferenceResult, AppError> {
+        reject_secret_in_model(credential, model)?;
         let url = format!("{}/v1/systemone", normalize_base_url(&credential.base_url)?);
         let body = serde_json::json!({
             "state": {"ticket": "合成工单 A", "resolution": "已由小组甲处理"},
@@ -181,21 +189,36 @@ impl JevClient {
             .answers
             .get("classification")
             .ok_or_else(protocol_error)?;
+        let resolved = answer.probabilities.get("resolved");
+        let unresolved = answer.probabilities.get("unresolved");
+        let valid_distribution = match (resolved, unresolved) {
+            (Some(resolved), Some(unresolved)) => {
+                answer.probabilities.len() == 2
+                    && (0.0..=1.0).contains(resolved)
+                    && (0.0..=1.0).contains(unresolved)
+                    && (resolved + unresolved - 1.0).abs() <= 0.01
+                    && (answer.choice != "resolved" || resolved >= unresolved)
+                    && (answer.choice != "unresolved" || unresolved >= resolved)
+            }
+            _ => false,
+        };
         if body.model.trim().is_empty()
+            || body.model.contains(&credential.key)
             || answer.kind != "choice"
             || !matches!(answer.choice.as_str(), "resolved" | "unresolved")
             || !(0.0..=1.0).contains(&answer.confidence)
-            || answer.probabilities.len() != 2
-            || answer
-                .probabilities
-                .values()
-                .any(|v| !(0.0..=1.0).contains(v))
+            || !valid_distribution
         {
             return Err(protocol_error());
         }
         Ok(JevInferenceResult {
             requested_model: model.to_owned(),
             actual_model: body.model,
+            answer: JevChoiceAnswer {
+                choice: answer.choice.clone(),
+                confidence: answer.confidence,
+                probabilities: answer.probabilities.clone(),
+            },
             input_tokens: body.usage.input_tokens,
             output_tokens: body.usage.output_tokens,
         })
@@ -221,7 +244,7 @@ struct ChoiceAnswer {
     kind: String,
     choice: String,
     confidence: f64,
-    probabilities: std::collections::HashMap<String, f64>,
+    probabilities: std::collections::BTreeMap<String, f64>,
 }
 #[derive(Deserialize)]
 struct InferenceResponse {
@@ -248,6 +271,14 @@ fn protocol_error() -> AppError {
         "Jev 返回的数据不符合 TypeSafe 协议。",
         false,
     )
+}
+
+fn reject_secret_in_model(credential: &Credential, model: &str) -> Result<(), AppError> {
+    if credential.key.is_empty() || model.contains(&credential.key) {
+        Err(protocol_error())
+    } else {
+        Ok(())
+    }
 }
 
 async fn success(response: reqwest::Response) -> Result<reqwest::Response, AppError> {
@@ -570,6 +601,10 @@ mod tests {
             .unwrap();
         assert_eq!(inferred.actual_model, "jev-1.13.0");
         assert_eq!(inferred.input_tokens, 42);
+        assert_eq!(inferred.answer.choice, "resolved");
+        assert_eq!(inferred.answer.confidence, 0.9);
+        assert_eq!(inferred.answer.probabilities["resolved"], 0.9);
+        assert_eq!(inferred.answer.probabilities["unresolved"], 0.1);
         let request = request.join().unwrap();
         assert!(request.starts_with("POST /v1/systemone "));
         let body: serde_json::Value =
@@ -612,6 +647,62 @@ mod tests {
                 std::mem::discriminant(&actual.code),
                 std::mem::discriminant(&expected)
             );
+            request.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn echoed_credential_never_reaches_connection_or_inference_results() {
+        let client = JevClient::new().unwrap();
+        let (base, request) = server(200, r#"{"models":[{"name":"jev-synthetic-only-key"}]}"#);
+        let credential = Credential {
+            base_url: base,
+            key: "synthetic-only-key".into(),
+        };
+        let result = client.check_connection(&credential, "jev-latest").await;
+        assert!(result.is_err(), "回显密钥的模型列表必须被拒绝");
+        let error = result.err().unwrap();
+        assert!(matches!(error.code, ErrorCode::JevProtocolInvalid));
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains("synthetic-only-key"));
+        request.join().unwrap();
+
+        let (base, request) = server(
+            200,
+            r#"{"model":"jev-synthetic-only-key","answers":{"classification":{"type":"choice","choice":"resolved","confidence":0.9,"probabilities":{"resolved":0.9,"unresolved":0.1}}},"usage":{"input_tokens":42,"output_tokens":3}}"#,
+        );
+        let credential = Credential {
+            base_url: base,
+            key: "synthetic-only-key".into(),
+        };
+        let result = client.test_inference(&credential, "jev-latest").await;
+        assert!(result.is_err(), "回显密钥的实际模型必须被拒绝");
+        let error = result.err().unwrap();
+        assert!(matches!(error.code, ErrorCode::JevProtocolInvalid));
+        assert!(!serde_json::to_string(&error)
+            .unwrap()
+            .contains("synthetic-only-key"));
+        request.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn synthetic_choice_rejects_wrong_probability_keys_and_sum() {
+        let client = JevClient::new().unwrap();
+        for body in [
+            r#"{"model":"jev-1.13.0","answers":{"classification":{"type":"choice","choice":"resolved","confidence":0.9,"probabilities":{"resolved":0.9,"other":0.1}}},"usage":{"input_tokens":42,"output_tokens":3}}"#,
+            r#"{"model":"jev-1.13.0","answers":{"classification":{"type":"choice","choice":"resolved","confidence":0.9,"probabilities":{"resolved":0.4,"unresolved":0.1}}},"usage":{"input_tokens":42,"output_tokens":3}}"#,
+            r#"{"model":"jev-1.13.0","answers":{"classification":{"type":"choice","choice":"resolved","confidence":0.9,"probabilities":{"resolved":0.1,"unresolved":0.9}}},"usage":{"input_tokens":42,"output_tokens":3}}"#,
+        ] {
+            let (base, request) = server(200, body);
+            let credential = Credential {
+                base_url: base,
+                key: "synthetic-only-key".into(),
+            };
+            let result = client.test_inference(&credential, "jev-latest").await;
+            assert!(result.is_err(), "无效概率分布必须被拒绝");
+            let error = result.err().unwrap();
+            assert!(matches!(error.code, ErrorCode::JevProtocolInvalid));
             request.join().unwrap();
         }
     }

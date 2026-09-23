@@ -56,11 +56,18 @@ impl SourceService {
 
     pub async fn jev_status(&self) -> Result<JevStatus, AppError> {
         let config = self.state.lock().await.preferences.jev.clone();
-        let credential = self.credentials.load()?;
+        let (credential_configured, credential_error) = match self.credentials.load() {
+            Ok(credential) => (
+                credential
+                    .as_ref()
+                    .is_some_and(|item| item.base_url == config.base_url),
+                None,
+            ),
+            Err(error) => (false, Some(error)),
+        };
         Ok(JevStatus {
-            credential_configured: credential
-                .as_ref()
-                .is_some_and(|item| item.base_url == config.base_url),
+            credential_configured,
+            credential_error,
             config,
         })
     }
@@ -92,14 +99,18 @@ impl SourceService {
         }
         let _gate = self.stop_jev().await;
         let mut state = self.state.lock().await;
-        let previous_url = &state.preferences.jev.base_url;
+        if state.preferences.jev.base_url != base_url && api_key.is_none() {
+            return Err(AppError::jev(
+                ErrorCode::JevNotConfigured,
+                "更换服务地址时请填写新 API Key；删除旧密钥需单独操作。",
+                false,
+            ));
+        }
         if let Some(key) = api_key {
             self.credentials.save(&Credential {
                 base_url: base_url.clone(),
                 key: key.trim().to_owned(),
             })?;
-        } else if previous_url != &base_url {
-            self.credentials.delete()?;
         }
         let mut next = state.preferences.clone();
         next.jev = JevConfig {
@@ -353,15 +364,15 @@ mod tests {
 
         let reopened = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
         assert!(reopened.jev_status().await.unwrap().credential_configured);
-        reopened
+        assert!(reopened
             .save_jev("https://other.example".into(), "jev-latest".into(), None)
             .await
-            .unwrap();
-        assert!(!reopened.jev_status().await.unwrap().credential_configured);
-        assert!(matches!(
-            reopened.check_jev_connection().await.unwrap_err().code,
-            ErrorCode::JevNotConfigured
-        ));
+            .is_err());
+        assert_eq!(
+            reopened.jev_status().await.unwrap().config.base_url,
+            "https://api.typesafe.ai"
+        );
+        assert!(reopened.jev_status().await.unwrap().credential_configured);
         reopened
             .save_jev(
                 "https://other.example".into(),
@@ -434,10 +445,56 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error.code, ErrorCode::JevCredentialFailed));
         assert!(!dir.join("preferences.json").exists());
+        let status = service.jev_status().await.unwrap();
+        assert_eq!(status.config.base_url, "https://api.typesafe.ai");
+        assert!(!status.credential_configured);
         assert!(matches!(
-            service.jev_status().await.unwrap_err().code,
+            status.credential_error.unwrap().code,
             ErrorCode::JevCredentialFailed
         ));
+    }
+
+    #[tokio::test]
+    async fn locked_keychain_keeps_saved_nonsecret_config_visible() {
+        let dir = temp_data_dir();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let service = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
+        service
+            .save_jev(
+                "https://old.example".into(),
+                "jev-1.13.0".into(),
+                Some("synthetic-only-key".into()),
+            )
+            .await
+            .unwrap();
+        drop(service);
+
+        let locked =
+            SourceService::with_credentials(dir.clone(), Arc::new(UnavailableCredentials)).unwrap();
+        let status = locked.jev_status().await.unwrap();
+        assert_eq!(status.config.base_url, "https://old.example");
+        assert_eq!(status.config.model, "jev-1.13.0");
+        assert!(!status.credential_configured);
+        assert!(matches!(
+            status.credential_error.unwrap().code,
+            ErrorCode::JevCredentialFailed
+        ));
+        drop(locked);
+
+        let unlocked = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
+        assert!(unlocked
+            .save_jev("https://new.example".into(), "jev-latest".into(), None)
+            .await
+            .is_err());
+        assert_eq!(
+            unlocked.jev_status().await.unwrap().config.base_url,
+            "https://old.example"
+        );
+        assert_eq!(
+            credentials.load().unwrap().unwrap().base_url,
+            "https://old.example"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
