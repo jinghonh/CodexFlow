@@ -12,7 +12,10 @@ use codexflow_jev::{
 use codexflow_store::{PreferenceStore, SessionStore};
 use std::{
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
@@ -27,6 +30,8 @@ pub struct SourceService {
     state: Mutex<State>,
     credentials: Arc<dyn CredentialStore>,
     project_updates: std::sync::Mutex<()>,
+    // Invalidates ownership computed from stale source and project snapshots.
+    reconciliation_revision: AtomicU64,
     jev_gate: RwLock<()>,
     jev_cancel: Mutex<CancellationToken>,
 }
@@ -59,6 +64,7 @@ impl SourceService {
             }),
             credentials,
             project_updates: std::sync::Mutex::new(()),
+            reconciliation_revision: AtomicU64::new(0),
             jev_gate: RwLock::new(()),
             jev_cancel: Mutex::new(CancellationToken::new()),
         };
@@ -274,21 +280,36 @@ impl SourceService {
         self.reconcile_projects_with(|| {})
     }
 
-    // Keep the hook inside the critical section so tests can pause a computed
-    // reconciliation before its write and exercise the read/compute/write race.
-    fn reconcile_projects_with(&self, before_save: impl FnOnce()) -> Result<(), AppError> {
-        let _updates = self.lock_project_updates();
-        self.reconcile_projects_locked(before_save)
-    }
+    // The hook pauses after the snapshot and before path/Git attribution work,
+    // so tests can model a slow reconciliation without holding project_updates.
+    fn reconcile_projects_with(&self, during_recompute: impl FnOnce()) -> Result<(), AppError> {
+        let mut during_recompute = Some(during_recompute);
+        loop {
+            let revision = self.reconciliation_revision.load(Ordering::Relaxed);
+            let threads = self.sessions.list()?.threads;
+            let projects = self.sessions.projects()?;
+            let previous = self.sessions.attributions()?;
 
-    fn reconcile_projects_locked(&self, before_save: impl FnOnce()) -> Result<(), AppError> {
-        let threads = self.sessions.list()?.threads;
-        let projects = self.sessions.projects()?;
-        let previous = self.sessions.attributions()?;
-        let (projects, attributions) = projects::reconcile(&threads, projects, &previous);
-        before_save();
-        self.sessions
-            .save_projects_and_attributions(&projects, &attributions)
+            // Recheck after reading the independent SQLite views. If source
+            // sessions or projects changed during the snapshot, take a fresh one.
+            if self.reconciliation_revision.load(Ordering::Relaxed) != revision {
+                continue;
+            }
+
+            if let Some(hook) = during_recompute.take() {
+                hook();
+            }
+            let (projects, attributions) = projects::reconcile(&threads, projects, &previous);
+
+            let _updates = self.lock_project_updates();
+            if self.reconciliation_revision.load(Ordering::Relaxed) != revision {
+                continue;
+            }
+            self.sessions
+                .save_projects_and_attributions(&projects, &attributions)?;
+            self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
     }
 
     fn lock_project_updates(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -307,16 +328,18 @@ impl SourceService {
 
     pub fn choose_project(&self, path: &str) -> Result<ProjectCatalog, AppError> {
         let project = projects::selected_project(path).map_err(AppError::project)?;
-        let _updates = self.lock_project_updates();
-        self.sessions
-            .save_projects_and_attributions(&[project.clone()], &[])?;
-        self.reconcile_projects_locked(|| {})?;
-        self.sessions.select_project(&project.id)?;
+        {
+            let _updates = self.lock_project_updates();
+            self.sessions
+                .save_projects_and_attributions(&[project.clone()], &[])?;
+            self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
+            self.sessions.select_project(&project.id)?;
+        }
+        self.reconcile_projects()?;
         self.sessions.catalog()
     }
 
     pub fn choose_existing_project(&self, project_id: &str) -> Result<ProjectCatalog, AppError> {
-        let _updates = self.lock_project_updates();
         self.sessions.select_project(project_id)?;
         self.sessions.catalog()
     }
@@ -339,10 +362,20 @@ impl SourceService {
             }
         };
         let collection = session.collect_threads(attempted_at).await;
-        if let Err(error) = self
-            .sessions
-            .save_collection(&collection.threads, &collection.scopes)
-        {
+        let save_result = {
+            let _updates = self.lock_project_updates();
+            match self
+                .sessions
+                .save_collection(&collection.threads, &collection.scopes)
+            {
+                Ok(()) => {
+                    self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = save_result {
             let _ = self
                 .sessions
                 .fail_refresh(attempted_at, "保存会话列表失败；旧缓存已保留。");
@@ -993,7 +1026,90 @@ mod tests {
     }
 
     #[test]
-    fn project_choice_survives_a_refresh_reconciliation_that_started_first() {
+    fn existing_project_selection_does_not_wait_for_slow_reconciliation() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let root = temp_data_dir();
+        let first_project = root.join("first");
+        let second_project = root.join("second");
+        fs::create_dir_all(&first_project).unwrap();
+        fs::create_dir_all(&second_project).unwrap();
+        let service = Arc::new(
+            SourceService::with_credentials(
+                root.join("data"),
+                Arc::new(MemoryCredentials::default()),
+            )
+            .unwrap(),
+        );
+        service
+            .choose_project(first_project.to_str().unwrap())
+            .unwrap();
+        let catalog = service
+            .choose_project(second_project.to_str().unwrap())
+            .unwrap();
+        let target_id = catalog
+            .projects
+            .iter()
+            .find(|project| {
+                project.root == fs::canonicalize(&first_project).unwrap().to_string_lossy()
+            })
+            .unwrap()
+            .id
+            .clone();
+
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let refreshing = Arc::clone(&service);
+        let refresh = thread::spawn(move || {
+            refreshing.reconcile_projects_with(|| {
+                snapshot_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            })
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("重算应进入模拟慢归属解析阶段");
+
+        let (choice_started_tx, choice_started_rx) = mpsc::channel();
+        let (choice_done_tx, choice_done_rx) = mpsc::channel();
+        let choosing = Arc::clone(&service);
+        let selected_id = target_id.clone();
+        let choice = thread::spawn(move || {
+            choice_started_tx.send(()).unwrap();
+            let result = choosing.choose_existing_project(&selected_id);
+            choice_done_tx.send(result.is_ok()).unwrap();
+            result
+        });
+        choice_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("已有项目选择线程应已启动");
+        let responded_during_recompute = matches!(
+            choice_done_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(true)
+        );
+
+        resume_tx.send(()).unwrap();
+        refresh.join().unwrap().unwrap();
+        let selected_catalog = choice.join().unwrap().unwrap();
+        assert!(
+            responded_during_recompute,
+            "已有项目选择应在归属重算期间完成"
+        );
+        assert_eq!(
+            selected_catalog.selected_project_id.as_deref(),
+            Some(target_id.as_str())
+        );
+        let final_catalog = service.project_catalog().unwrap();
+        assert_eq!(
+            final_catalog.selected_project_id.as_deref(),
+            Some(target_id.as_str())
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn new_project_added_during_slow_reconciliation_is_attributed_afterward() {
         use std::{sync::mpsc, thread, time::Duration};
 
         let root = temp_data_dir();
@@ -1045,29 +1161,28 @@ mod tests {
         });
         snapshot_rx
             .recv_timeout(Duration::from_secs(2))
-            .expect("刷新应先取得旧项目快照");
+            .expect("重算应进入模拟慢归属解析阶段");
 
-        let (choice_started_tx, choice_started_rx) = mpsc::channel();
         let (choice_done_tx, choice_done_rx) = mpsc::channel();
         let choosing = Arc::clone(&service);
         let project_path = project.to_string_lossy().into_owned();
         let choice = thread::spawn(move || {
-            choice_started_tx.send(()).unwrap();
             let result = choosing.choose_project(&project_path);
             choice_done_tx.send(result.is_ok()).unwrap();
             result
         });
-        choice_started_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("项目选择线程应已启动");
-        assert!(matches!(
-            choice_done_rx.recv_timeout(Duration::from_millis(250)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ));
+        let responded_during_recompute = matches!(
+            choice_done_rx.recv_timeout(Duration::from_secs(1)),
+            Ok(true)
+        );
 
         resume_tx.send(()).unwrap();
         refresh.join().unwrap().unwrap();
         choice.join().unwrap().unwrap();
+        assert!(
+            responded_during_recompute,
+            "新项目选择应能在另一轮慢归属重算期间完成"
+        );
 
         let catalog = service.project_catalog().unwrap();
         let selected_id = catalog.selected_project_id.unwrap();
