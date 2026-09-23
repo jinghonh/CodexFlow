@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 type Coverage = {
@@ -115,8 +115,9 @@ function SourceFactsView({ threadId, updatedAt, coverage, revision, onLocate }: 
   </div>;
 }
 
-export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoaded }: {
+export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoaded, locationRequest }: {
   threadId: string; updatedAt: number; connected: boolean; onHistoryLoaded?: () => void;
+  locationRequest?: { threadId: string; turnId: string; itemId: string; nonce: number } | null;
 }) {
   const [turns, setTurns] = useState<TurnPage | null>(null);
   const [items, setItems] = useState<ItemPage | null>(null);
@@ -130,6 +131,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoa
   const [lookupMessage, setLookupMessage] = useState("");
   const [highlight, setHighlight] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
+  const locatedNonce = useRef<number | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -230,6 +232,17 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoa
     setHighlight(itemId);
     document.getElementById("thread-history-items")?.scrollIntoView?.({ behavior: "smooth", block: "start" });
   }
+
+  useEffect(() => {
+    if (!locationRequest || locationRequest.threadId !== threadId || !turns || loading || locatedNonce.current === locationRequest.nonce) return;
+    locatedNonce.current = locationRequest.nonce;
+    invoke<Location | null>("locate_history_item", { threadId, turnId: locationRequest.turnId, itemId: locationRequest.itemId })
+      .then(async (location) => {
+        if (!location) { setLookupMessage("来源条目已失效或当前历史不完整。"); return; }
+        await showLocation(location, locationRequest.itemId);
+        setLookupMessage(`已定位到回合 ${location.turnId}。`);
+      }).catch((caught) => setLookupMessage(errorText(caught)));
+  }, [locationRequest?.nonce, threadId, turns?.total, loading]);
 
   const coverage = turns?.coverage ?? null;
   return <section id="thread-history" className="panel history-panel" aria-label="会话历史">

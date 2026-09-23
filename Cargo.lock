@@ -348,6 +348,7 @@ dependencies = [
  "codexflow-jev",
  "codexflow-store",
  "rusqlite",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-util",
@@ -390,6 +391,7 @@ version = "0.1.0"
 dependencies = [
  "codexflow-domain",
  "rusqlite",
+ "serde",
  "serde_json",
 ]
 

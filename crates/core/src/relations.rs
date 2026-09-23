@@ -111,6 +111,7 @@ pub(crate) fn project_graph(
         project: sessions.project,
         nodes: nodes.into_values().collect(),
         relations,
+        derived_relations: Vec::new(),
         diagnostics,
     }
 }
