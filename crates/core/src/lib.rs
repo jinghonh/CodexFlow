@@ -26,6 +26,7 @@ pub struct SourceService {
     preferences: Mutex<Preferences>,
     state: Mutex<State>,
     credentials: Arc<dyn CredentialStore>,
+    project_updates: std::sync::Mutex<()>,
     jev_gate: RwLock<()>,
     jev_cancel: Mutex<CancellationToken>,
 }
@@ -57,6 +58,7 @@ impl SourceService {
                 session: None,
             }),
             credentials,
+            project_updates: std::sync::Mutex::new(()),
             jev_gate: RwLock::new(()),
             jev_cancel: Mutex::new(CancellationToken::new()),
         };
@@ -269,12 +271,30 @@ impl SourceService {
     }
 
     fn reconcile_projects(&self) -> Result<(), AppError> {
+        self.reconcile_projects_with(|| {})
+    }
+
+    // Keep the hook inside the critical section so tests can pause a computed
+    // reconciliation before its write and exercise the read/compute/write race.
+    fn reconcile_projects_with(&self, before_save: impl FnOnce()) -> Result<(), AppError> {
+        let _updates = self.lock_project_updates();
+        self.reconcile_projects_locked(before_save)
+    }
+
+    fn reconcile_projects_locked(&self, before_save: impl FnOnce()) -> Result<(), AppError> {
         let threads = self.sessions.list()?.threads;
         let projects = self.sessions.projects()?;
         let previous = self.sessions.attributions()?;
         let (projects, attributions) = projects::reconcile(&threads, projects, &previous);
+        before_save();
         self.sessions
             .save_projects_and_attributions(&projects, &attributions)
+    }
+
+    fn lock_project_updates(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.project_updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn project_catalog(&self) -> Result<ProjectCatalog, AppError> {
@@ -287,14 +307,16 @@ impl SourceService {
 
     pub fn choose_project(&self, path: &str) -> Result<ProjectCatalog, AppError> {
         let project = projects::selected_project(path).map_err(AppError::project)?;
+        let _updates = self.lock_project_updates();
         self.sessions
             .save_projects_and_attributions(&[project.clone()], &[])?;
-        self.reconcile_projects()?;
+        self.reconcile_projects_locked(|| {})?;
         self.sessions.select_project(&project.id)?;
         self.sessions.catalog()
     }
 
     pub fn choose_existing_project(&self, project_id: &str) -> Result<ProjectCatalog, AppError> {
+        let _updates = self.lock_project_updates();
         self.sessions.select_project(project_id)?;
         self.sessions.catalog()
     }
@@ -967,6 +989,94 @@ mod tests {
             .unwrap();
         assert_eq!(after_failure.threads.len(), 4);
         assert!(after_failure.scopes.iter().all(|scope| !scope.complete));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_choice_survives_a_refresh_reconciliation_that_started_first() {
+        use std::{sync::mpsc, thread, time::Duration};
+
+        let root = temp_data_dir();
+        let project = root.join("notes");
+        fs::create_dir_all(&project).unwrap();
+        let service = Arc::new(
+            SourceService::with_credentials(
+                root.join("data"),
+                Arc::new(MemoryCredentials::default()),
+            )
+            .unwrap(),
+        );
+        service
+            .sessions
+            .save_collection(
+                &[codexflow_domain::ThreadMetadata {
+                    id: "new-project-session".into(),
+                    session_id: "new-project-session".into(),
+                    title: None,
+                    preview: String::new(),
+                    cwd: project.to_string_lossy().into_owned(),
+                    project_id: None,
+                    source_kind: "cli".into(),
+                    source_detail: None,
+                    thread_source: None,
+                    parent_thread_id: None,
+                    forked_from_id: None,
+                    git: None,
+                    created_at: 0,
+                    updated_at: 1,
+                    archived: false,
+                    metadata_complete: true,
+                    content_complete: false,
+                    read_error: None,
+                    observed_at_unix_ms: 1,
+                }],
+                &[],
+            )
+            .unwrap();
+
+        let (snapshot_tx, snapshot_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let refreshing = Arc::clone(&service);
+        let refresh = thread::spawn(move || {
+            refreshing.reconcile_projects_with(|| {
+                snapshot_tx.send(()).unwrap();
+                resume_rx.recv().unwrap();
+            })
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("刷新应先取得旧项目快照");
+
+        let (choice_started_tx, choice_started_rx) = mpsc::channel();
+        let (choice_done_tx, choice_done_rx) = mpsc::channel();
+        let choosing = Arc::clone(&service);
+        let project_path = project.to_string_lossy().into_owned();
+        let choice = thread::spawn(move || {
+            choice_started_tx.send(()).unwrap();
+            let result = choosing.choose_project(&project_path);
+            choice_done_tx.send(result.is_ok()).unwrap();
+            result
+        });
+        choice_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("项目选择线程应已启动");
+        assert!(matches!(
+            choice_done_rx.recv_timeout(Duration::from_millis(250)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        resume_tx.send(()).unwrap();
+        refresh.join().unwrap().unwrap();
+        choice.join().unwrap().unwrap();
+
+        let catalog = service.project_catalog().unwrap();
+        let selected_id = catalog.selected_project_id.unwrap();
+        assert!(catalog.projects.iter().any(|item| item.id == selected_id));
+        let sessions = service.project_sessions(&selected_id).unwrap();
+        assert_eq!(sessions.threads.len(), 1);
+        assert_eq!(sessions.threads[0].thread.id, "new-project-session");
+        assert!(catalog.unassigned.is_empty());
+
         let _ = fs::remove_dir_all(root);
     }
 
