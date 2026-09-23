@@ -179,6 +179,16 @@ button:disabled { cursor: wait; opacity: .6; }
 .history-pager { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 10px; }
 .history-pager button { padding: 7px 9px; border: 1px solid var(--line); background: var(--page); color: var(--ink); }
 .history-pager button:disabled { opacity: 0.45; }
+.source-facts { margin: 18px 0; border-top: 1px solid var(--line); padding-top: 14px; }
+.source-facts h3 { margin: 0 0 7px; font-size: 12px; }
+.source-facts h3 small, .source-facts-note { color: var(--muted); }
+.source-facts-note { font-size: 11px; }
+.source-fact { display: grid; gap: 7px; border: 1px solid var(--line); padding: 11px; margin: 8px 0; font-size: 11px; overflow-wrap: anywhere; }
+.source-fact > div { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.source-fact > code { white-space: pre-wrap; }
+.source-fact > small { color: var(--muted); }
+.source-fact blockquote { margin: 0; padding: 8px; background: var(--page); white-space: pre-wrap; }
+.source-fact button { justify-self: start; }
 @media (max-width: 850px) { .history-columns { grid-template-columns: 1fr; } }
 @media (max-width: 1050px) { .thread-row { grid-template-columns: 1fr; gap: 11px; } }
 @media (max-width: 1050px) { .sidebar { width: 198px; } .page-body { padding: 35px 27px; } .topbar { padding: 0 27px; } .columns { gap: 12px; } .panel { padding: 23px 20px; } .footer-panel { flex-wrap: wrap; } }

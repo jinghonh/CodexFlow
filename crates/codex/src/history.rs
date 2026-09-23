@@ -166,7 +166,11 @@ fn parse_item(
                         Some(HistoryFileChange {
                             path: change.get("path")?.as_str()?.to_owned(),
                             kind: change.get("kind")?.as_str()?.to_owned(),
-                            diff: change.get("diff")?.as_str()?.to_owned(),
+                            diff: change
+                                .get("diff")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned(),
                         })
                     })
                     .collect();
@@ -406,5 +410,72 @@ fn rpc_error(error: ProbeError) -> ReadFailure {
     ReadFailure {
         detail: error.description().to_owned(),
         incompatible: error.unsupported(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_items_preserve_execution_and_file_fields_without_promoting_plan_text() {
+        let command = parse_item(
+            &json!({"id":"exec","type":"commandExecution",
+            "command":"cargo test","cwd":"/tmp/project","aggregatedOutput":"1 test failed",
+            "exitCode":1,"status":"failed"}),
+            "thread",
+            "turn",
+            0,
+            100,
+        )
+        .unwrap();
+        assert_eq!(command.command.as_deref(), Some("cargo test"));
+        assert_eq!(command.exit_code, Some(1));
+        assert_eq!(command.status.as_deref(), Some("failed"));
+        assert!(command.supported);
+        let pending = parse_item(
+            &json!({"id":"pending","type":"commandExecution",
+            "command":"cargo build","status":"inProgress"}),
+            "thread",
+            "turn",
+            1,
+            100,
+        )
+        .unwrap();
+        assert_eq!(pending.exit_code, None);
+        let file = parse_item(
+            &json!({"id":"patch","type":"fileChange",
+            "status":"completed","changes":[{"path":"src/lib.rs","kind":"add","diff":"+new"}]}),
+            "thread",
+            "turn",
+            2,
+            100,
+        )
+        .unwrap();
+        assert_eq!(file.changes[0].path, "src/lib.rs");
+        assert_eq!(file.changes[0].kind, "add");
+        assert!(file.supported);
+        let without_diff = parse_item(
+            &json!({"id":"patch-no-diff","type":"fileChange",
+            "status":"completed","changes":[{"path":"README.md","kind":"add"}]}),
+            "thread",
+            "turn",
+            3,
+            100,
+        )
+        .unwrap();
+        assert_eq!(without_diff.changes[0].diff, "");
+        assert!(without_diff.supported);
+        let plan = parse_item(
+            &json!({"id":"plan","type":"plan",
+            "text":"计划运行 cargo test 并新增 src/lib.rs"}),
+            "thread",
+            "turn",
+            4,
+            100,
+        )
+        .unwrap();
+        assert!(plan.command.is_none());
+        assert!(plan.changes.is_empty());
     }
 }

@@ -1,8 +1,8 @@
 use codexflow_domain::{
-    AppError, AttributedThread, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
-    HistorySnapshot, HistoryTurnPage, IndexRun, IndexRunState, ListScopeStatus, LocalProject,
-    ObservedRelation, Preferences, ProjectCatalog, ProjectSessions, SessionList, ThreadAttribution,
-    ThreadMetadata,
+    AppError, AttributedThread, EvidencePage, FactPage, HistoryCoverage, HistoryItem,
+    HistoryItemLocation, HistoryItemPage, HistorySnapshot, HistoryTurnPage, IndexRun,
+    IndexRunState, ListScopeStatus, LocalProject, ObservedRelation, Preferences, ProjectCatalog,
+    ProjectSessions, SessionList, SourceEvidence, SourceFact, ThreadAttribution, ThreadMetadata,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
@@ -72,7 +72,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 6 {
+        if version > 7 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -239,6 +239,34 @@ impl SessionStore {
                 .commit()
                 .map_err(|_| AppError::migration("提交条目身份数据库迁移失败，原数据已保留。"))?;
         }
+        if version < 7 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始事实与证据数据库迁移失败。"))?;
+            transaction.execute_batch(
+                "CREATE TABLE IF NOT EXISTS source_facts (
+                    id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL, fact_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS source_facts_thread ON source_facts(thread_id, ordinal, id);
+                CREATE TABLE IF NOT EXISTS source_evidence (
+                    id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL, evidence_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS source_evidence_thread ON source_evidence(thread_id, ordinal, id);
+                CREATE TABLE IF NOT EXISTS fact_index (
+                    thread_id TEXT PRIMARY KEY NOT NULL, content_digest TEXT NOT NULL,
+                    rule_version TEXT NOT NULL, history_generation INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS history_revisions (
+                    thread_id TEXT PRIMARY KEY NOT NULL, generation INTEGER NOT NULL
+                );
+                PRAGMA user_version = 7;",
+            ).map_err(|_| AppError::migration("迁移事实与证据数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交事实与证据数据库迁移失败，原数据已保留。"))?;
+        }
         store.recover_interrupted_runs()?;
         Ok(store)
     }
@@ -353,6 +381,12 @@ impl SessionStore {
             params![metadata_json, coverage.thread_id],
         )
         .map_err(|_| AppError::store("更新会话完整性失败。"))?;
+        tx.execute(
+            "INSERT INTO history_revisions (thread_id,generation) VALUES (?1,1)
+             ON CONFLICT(thread_id) DO UPDATE SET generation=generation+1",
+            [&coverage.thread_id],
+        )
+        .map_err(|_| AppError::store("更新历史内容版本失败。"))?;
         tx.commit()
             .map_err(|_| AppError::store("提交会话历史失败，旧缓存已保留。"))?;
         Ok(coverage)
@@ -483,6 +517,258 @@ impl SessionStore {
                 .unwrap_or(0);
         }
         Ok(location)
+    }
+
+    pub fn all_history_items(&self, thread_id: &str) -> Result<Vec<HistoryItem>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare(
+                "SELECT i.item_json FROM history_items i LEFT JOIN history_turns t
+            ON t.thread_id=i.thread_id AND t.id=i.turn_id WHERE i.thread_id=?1
+            ORDER BY t.ordinal,i.turn_id,i.ordinal,i.id",
+            )
+            .map_err(|_| AppError::store("读取事实来源条目失败。"))?;
+        let rows = query
+            .query_map([thread_id], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询事实来源条目失败。"))?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| AppError::store("读取事实来源条目失败。"))?)
+                .map_err(|_| AppError::store("事实来源条目损坏。"))
+        })
+        .collect()
+    }
+
+    pub fn history_generation(&self, thread_id: &str) -> Result<i64, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT generation FROM history_revisions WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|value| value.unwrap_or(0))
+            .map_err(|_| AppError::store("读取历史内容版本失败。"))
+    }
+
+    pub fn fact_index(&self, thread_id: &str) -> Result<Option<(String, String, i64)>, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT content_digest,rule_version,history_generation FROM fact_index WHERE thread_id=?1",
+                [thread_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取事实提取版本失败。"))
+    }
+
+    pub fn replace_automatic_facts(
+        &self,
+        thread_id: &str,
+        content_digest: &str,
+        rule_version: &str,
+        generation: i64,
+        facts: &[SourceFact],
+        evidence: &[SourceEvidence],
+    ) -> Result<(), AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始更新自动事实失败。"))?;
+        tx.execute(
+            "DELETE FROM source_evidence WHERE thread_id=?1",
+            [thread_id],
+        )
+        .map_err(|_| AppError::store("替换旧证据失败。"))?;
+        tx.execute("DELETE FROM source_facts WHERE thread_id=?1", [thread_id])
+            .map_err(|_| AppError::store("替换旧事实失败。"))?;
+        for (ordinal, fact) in facts.iter().enumerate() {
+            let json =
+                serde_json::to_string(fact).map_err(|_| AppError::store("序列化事实失败。"))?;
+            tx.execute(
+                "INSERT INTO source_facts (id,thread_id,ordinal,fact_json) VALUES (?1,?2,?3,?4)",
+                params![fact.id, thread_id, ordinal as i64, json],
+            )
+            .map_err(|_| AppError::store("保存自动事实失败。"))?;
+        }
+        for (ordinal, item) in evidence.iter().enumerate() {
+            let json =
+                serde_json::to_string(item).map_err(|_| AppError::store("序列化证据失败。"))?;
+            tx.execute("INSERT INTO source_evidence (id,thread_id,ordinal,evidence_json) VALUES (?1,?2,?3,?4)",
+                params![item.id, thread_id, ordinal as i64, json])
+                .map_err(|_| AppError::store("保存自动证据失败。"))?;
+        }
+        tx.execute("INSERT INTO fact_index (thread_id,content_digest,rule_version,history_generation) VALUES (?1,?2,?3,?4)
+            ON CONFLICT(thread_id) DO UPDATE SET content_digest=excluded.content_digest,rule_version=excluded.rule_version,history_generation=excluded.history_generation",
+            params![thread_id, content_digest, rule_version, generation])
+            .map_err(|_| AppError::store("保存事实提取版本失败。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交自动事实失败。"))
+    }
+
+    pub fn mark_fact_index_current(
+        &self,
+        thread_id: &str,
+        generation: i64,
+    ) -> Result<(), AppError> {
+        self.connection()?
+            .execute(
+                "UPDATE fact_index SET history_generation=?2 WHERE thread_id=?1",
+                params![thread_id, generation],
+            )
+            .map_err(|_| AppError::store("更新事实索引版本失败。"))?;
+        Ok(())
+    }
+
+    pub fn facts(&self, thread_id: &str, offset: u64, limit: u32) -> Result<FactPage, AppError> {
+        let limit = limit.clamp(1, 100);
+        let connection = self.connection()?;
+        let total: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_facts WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| AppError::store("统计事实失败。"))?;
+        let mut query = connection.prepare("SELECT fact_json FROM source_facts WHERE thread_id=?1 ORDER BY ordinal,id LIMIT ?2 OFFSET ?3")
+            .map_err(|_| AppError::store("读取事实失败。"))?;
+        let rows = query
+            .query_map(
+                params![thread_id, limit, offset.min(i64::MAX as u64) as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| AppError::store("查询事实失败。"))?;
+        let facts = rows
+            .map(|row| {
+                serde_json::from_str(&row.map_err(|_| AppError::store("读取事实失败。"))?)
+                    .map_err(|_| AppError::store("事实缓存损坏。"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(FactPage {
+            facts,
+            total,
+            offset,
+            limit,
+            coverage: self.history_coverage(thread_id)?,
+        })
+    }
+
+    pub fn evidence_page(
+        &self,
+        thread_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<EvidencePage, AppError> {
+        let limit = limit.clamp(1, 100);
+        let connection = self.connection()?;
+        let total: u64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM source_evidence WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| AppError::store("统计证据失败。"))?;
+        let mut query = connection.prepare("SELECT evidence_json FROM source_evidence WHERE thread_id=?1 ORDER BY ordinal,id LIMIT ?2 OFFSET ?3")
+            .map_err(|_| AppError::store("读取证据失败。"))?;
+        let rows = query
+            .query_map(
+                params![thread_id, limit, offset.min(i64::MAX as u64) as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| AppError::store("查询证据失败。"))?;
+        let evidence = rows
+            .map(|row| {
+                serde_json::from_str(&row.map_err(|_| AppError::store("读取证据失败。"))?)
+                    .map_err(|_| AppError::store("证据缓存损坏。"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(EvidencePage {
+            evidence,
+            total,
+            offset,
+            limit,
+        })
+    }
+
+    pub fn evidence(&self, evidence_id: &str) -> Result<Option<SourceEvidence>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT evidence_json FROM source_evidence WHERE id=?1",
+                [evidence_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取证据失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("证据缓存损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn source_fact(&self, fact_id: &str) -> Result<Option<SourceFact>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT fact_json FROM source_facts WHERE id=?1",
+                [fact_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取证据所属事实失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("事实缓存损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn history_turn_exists(&self, thread_id: &str, turn_id: &str) -> Result<bool, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT 1 FROM history_turns WHERE thread_id=?1 AND id=?2",
+                params![thread_id, turn_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|_| AppError::store("检查证据回合失败。"))
+    }
+
+    pub fn history_item(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<Option<HistoryItem>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT item_json FROM history_items WHERE thread_id=?1 AND turn_id=?2 AND id=?3",
+                params![thread_id, turn_id, item_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查证据条目失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("证据条目损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn item_id_in_other_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+    ) -> Result<bool, AppError> {
+        self.connection()?
+            .query_row(
+                "SELECT 1 FROM history_items WHERE thread_id=?1 AND turn_id<>?2 AND id=?3 LIMIT 1",
+                params![thread_id, turn_id, item_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(|_| AppError::store("检查证据层级失败。"))
     }
 
     pub fn begin_refresh(&self, attempted_at_unix_ms: i64) -> Result<(), AppError> {
@@ -1102,7 +1388,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 7;")
+            .execute_batch("PRAGMA user_version = 8;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -1113,7 +1399,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1328,7 +1614,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1389,7 +1675,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -1550,7 +1836,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (6, 1));
+        assert_eq!((version, count), (7, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1583,7 +1869,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1686,7 +1972,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 6);
+            assert_eq!(version, 7);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

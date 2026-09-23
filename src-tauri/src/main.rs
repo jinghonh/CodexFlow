@@ -1,8 +1,9 @@
 use codexflow_core::SourceService;
 use codexflow_domain::{
-    AppError, DisplayTheme, HistoryCoverage, HistoryItemLocation, HistoryItemPage, HistoryTurnPage,
-    IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph,
-    ProjectSessions, SessionList, SourceStatus,
+    AppError, DisplayTheme, EvidenceCheck, EvidencePage, FactPage, HistoryCoverage,
+    HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, JevConnectionResult,
+    JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph, ProjectSessions, SessionList,
+    SourceStatus,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -135,6 +136,34 @@ fn locate_history_item(
 }
 
 #[tauri::command]
+fn get_source_facts(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    offset: u64,
+    limit: u32,
+) -> Result<FactPage, AppError> {
+    service(&state)?.source_facts(&thread_id, offset, limit)
+}
+
+#[tauri::command]
+fn get_source_evidence(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    offset: u64,
+    limit: u32,
+) -> Result<EvidencePage, AppError> {
+    service(&state)?.source_evidence(&thread_id, offset, limit)
+}
+
+#[tauri::command]
+fn validate_source_evidence(
+    state: tauri::State<'_, AppState>,
+    evidence_id: String,
+) -> Result<EvidenceCheck, AppError> {
+    service(&state)?.validate_source_evidence(&evidence_id)
+}
+
+#[tauri::command]
 async fn refresh_session_list(state: tauri::State<'_, AppState>) -> Result<SessionList, AppError> {
     service(&state)?.refresh_sessions().await
 }
@@ -228,6 +257,9 @@ fn main() {
             get_history_turns,
             get_history_items,
             locate_history_item,
+            get_source_facts,
+            get_source_evidence,
+            validate_source_evidence,
             refresh_session_list,
             start_index_run,
             get_latest_index_run,

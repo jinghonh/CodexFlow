@@ -1,12 +1,14 @@
+mod facts;
 mod projects;
 mod relations;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
 use codexflow_domain::{
-    AppError, ConnectionState, DisplayTheme, ErrorCode, HistoryCoverage, HistoryItemLocation,
-    HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig, JevConnectionResult,
-    JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph, ProjectSessions,
-    SessionList, SourceStatus,
+    AppError, ConnectionState, DisplayTheme, ErrorCode, EvidenceCheck, EvidenceField, EvidencePage,
+    EvidenceState, FactPage, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
+    HistoryTurnPage, IndexRun, IndexRunState, JevConfig, JevConnectionResult, JevInferenceResult,
+    JevStatus, Preferences, ProjectCatalog, ProjectGraph, ProjectSessions, SessionList,
+    SourceEvidence, SourceStatus,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -304,7 +306,9 @@ impl SourceService {
             .collect_history(thread_id, thread.updated_at, now_ms() as i64)
             .await;
         drop(state);
-        self.sessions.save_history(&snapshot)
+        let coverage = self.sessions.save_history(&snapshot)?;
+        self.ensure_facts(thread_id)?;
+        Ok(coverage)
     }
 
     pub fn history_turns(
@@ -335,6 +339,159 @@ impl SourceService {
     ) -> Result<Option<HistoryItemLocation>, AppError> {
         self.sessions
             .locate_history_item(thread_id, turn_id, item_id)
+    }
+
+    fn ensure_facts(&self, thread_id: &str) -> Result<(), AppError> {
+        if self.sessions.thread(thread_id)?.is_none() {
+            return Err(AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "会话未在本地索引中。",
+                false,
+            ));
+        }
+        let generation = self.sessions.history_generation(thread_id)?;
+        let index = self.sessions.fact_index(thread_id)?;
+        if index.as_ref().is_some_and(|(_, rule, saved_generation)| {
+            rule == facts::RULE_VERSION && *saved_generation == generation
+        }) {
+            return Ok(());
+        }
+        let items = self.sessions.all_history_items(thread_id)?;
+        let digest = facts::content_digest(&items);
+        if index
+            .as_ref()
+            .is_some_and(|(saved, rule, _)| saved == &digest && rule == facts::RULE_VERSION)
+        {
+            return self.sessions.mark_fact_index_current(thread_id, generation);
+        }
+        let (facts, evidence) = facts::extract(&items);
+        self.sessions.replace_automatic_facts(
+            thread_id,
+            &digest,
+            facts::RULE_VERSION,
+            generation,
+            &facts,
+            &evidence,
+        )
+    }
+
+    pub fn source_facts(
+        &self,
+        thread_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<FactPage, AppError> {
+        self.ensure_facts(thread_id)?;
+        self.sessions.facts(thread_id, offset, limit)
+    }
+
+    pub fn source_evidence(
+        &self,
+        thread_id: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<EvidencePage, AppError> {
+        self.ensure_facts(thread_id)?;
+        self.sessions.evidence_page(thread_id, offset, limit)
+    }
+
+    pub fn check_evidence(&self, evidence: &SourceEvidence) -> Result<EvidenceCheck, AppError> {
+        let result = |state, message: &str| EvidenceCheck {
+            state,
+            message: message.into(),
+            location: None,
+        };
+        let Some(thread) = self.sessions.thread(&evidence.thread_id)? else {
+            return Ok(result(EvidenceState::MissingThread, "证据所指会话不存在。"));
+        };
+        if !self
+            .sessions
+            .history_turn_exists(&evidence.thread_id, &evidence.turn_id)?
+        {
+            return Ok(result(EvidenceState::MissingTurn, "证据所指回合不存在。"));
+        }
+        let Some(item) = self.sessions.history_item(
+            &evidence.thread_id,
+            &evidence.turn_id,
+            &evidence.item_id,
+        )?
+        else {
+            if self.sessions.item_id_in_other_turn(
+                &evidence.thread_id,
+                &evidence.turn_id,
+                &evidence.item_id,
+            )? {
+                return Ok(result(
+                    EvidenceState::WrongHierarchy,
+                    "条目标识存在，但不属于证据指定的回合。",
+                ));
+            }
+            return Ok(result(
+                EvidenceState::MissingItem,
+                "证据所指条目不存在；历史可能只读取了部分内容。",
+            ));
+        };
+        if let Some(fact) = self.sessions.source_fact(&evidence.fact_id)? {
+            if fact.thread_id != evidence.thread_id
+                || fact.turn_id != evidence.turn_id
+                || fact.item_id != evidence.item_id
+                || fact.evidence_id != evidence.id
+            {
+                return Ok(result(
+                    EvidenceState::WrongHierarchy,
+                    "证据定位与所属事实的会话、回合或条目不匹配。",
+                ));
+            }
+        }
+        if item.content_version != evidence.content_version
+            || item.source_updated_at != thread.updated_at
+        {
+            return Ok(result(
+                EvidenceState::StaleVersion,
+                "证据内容版本已失效；请重新读取来源历史。",
+            ));
+        }
+        let source = match evidence.field {
+            EvidenceField::Command => item.command.as_deref(),
+            EvidenceField::Output => item.output.as_deref(),
+            EvidenceField::ChangePath => evidence
+                .change_index
+                .and_then(|index| item.changes.get(index as usize))
+                .map(|change| change.path.as_str()),
+            EvidenceField::ChangeDiff => evidence
+                .change_index
+                .and_then(|index| item.changes.get(index as usize))
+                .map(|change| change.diff.as_str()),
+        };
+        if evidence.excerpt.is_empty()
+            || !source.is_some_and(|text| text.contains(&evidence.excerpt))
+        {
+            return Ok(result(
+                EvidenceState::ExcerptMissing,
+                "证据摘录无法在指定的来源字段中定位。",
+            ));
+        }
+        let location = self.sessions.locate_history_item(
+            &evidence.thread_id,
+            &evidence.turn_id,
+            &evidence.item_id,
+        )?;
+        Ok(EvidenceCheck {
+            state: EvidenceState::Valid,
+            message: "证据有效。".into(),
+            location,
+        })
+    }
+
+    pub fn validate_source_evidence(&self, evidence_id: &str) -> Result<EvidenceCheck, AppError> {
+        let evidence = self.sessions.evidence(evidence_id)?.ok_or_else(|| {
+            AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "证据不存在或已被新的自动事实替换。",
+                false,
+            )
+        })?;
+        self.check_evidence(&evidence)
     }
 
     fn reconcile_projects(&self) -> Result<(), AppError> {
@@ -1795,6 +1952,200 @@ mod tests {
             );
             let _ = fs::remove_dir_all(root);
         }
+    }
+
+    #[test]
+    fn facts_persist_and_evidence_checks_hierarchy_excerpt_and_version() {
+        use codexflow_domain::{
+            HistoryItem, HistoryReadPath, HistorySnapshot, HistoryTurn, ThreadMetadata,
+        };
+        let root = temp_data_dir();
+        let service =
+            SourceService::with_credentials(root.clone(), Arc::new(MemoryCredentials::default()))
+                .unwrap();
+        let thread = ThreadMetadata {
+            id: "fact-thread".into(),
+            session_id: "session".into(),
+            title: None,
+            preview: String::new(),
+            cwd: "/tmp".into(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: None,
+            forked_from_id: None,
+            git: None,
+            created_at: 0,
+            updated_at: 100,
+            archived: false,
+            metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
+            content_complete: false,
+            read_error: None,
+            observed_at_unix_ms: 1,
+        };
+        service
+            .sessions
+            .save_collection(&[thread.clone()], &[])
+            .unwrap();
+        let make_turn = |id: &str, ordinal| HistoryTurn {
+            thread_id: thread.id.clone(),
+            id: id.into(),
+            ordinal,
+            status: "completed".into(),
+            started_at_unix_ms: None,
+            completed_at_unix_ms: None,
+            duration_ms: None,
+            source_updated_at: 100,
+            content_version: "turn-v1".into(),
+        };
+        let make_item = |turn_id: &str, command: &str| HistoryItem {
+            thread_id: thread.id.clone(),
+            turn_id: turn_id.into(),
+            id: "same-item".into(),
+            ordinal: 0,
+            source_type: "commandExecution".into(),
+            supported: true,
+            text: None,
+            command: Some(command.into()),
+            cwd: None,
+            output: None,
+            exit_code: Some(0),
+            status: Some("completed".into()),
+            changes: vec![],
+            source_updated_at: 100,
+            content_version: format!("version-{turn_id}"),
+        };
+        let snapshot = HistorySnapshot {
+            coverage: HistoryCoverage {
+                thread_id: thread.id.clone(),
+                source_updated_at: 100,
+                attempted_at_unix_ms: 1,
+                path: HistoryReadPath::FullRead,
+                turns_complete: true,
+                items_complete: true,
+                turn_pages: 0,
+                item_pages: 0,
+                loaded_turns: 2,
+                loaded_items: 2,
+                incompatible: false,
+                error: None,
+            },
+            turns: vec![make_turn("turn-1", 0), make_turn("turn-2", 1)],
+            items: vec![
+                make_item("turn-1", "cargo test"),
+                make_item("turn-2", "cargo build"),
+            ],
+        };
+        service.sessions.save_history(&snapshot).unwrap();
+        let facts = service.source_facts(&thread.id, 0, 1).unwrap();
+        assert_eq!(facts.total, 2);
+        assert_eq!(facts.facts.len(), 1);
+        assert_eq!(service.source_evidence(&thread.id, 0, 1).unwrap().total, 2);
+        let evidence = service.source_evidence(&thread.id, 0, 10).unwrap().evidence;
+        assert_ne!(evidence[0].id, evidence[1].id);
+        assert_eq!(
+            service
+                .validate_source_evidence(&evidence[0].id)
+                .unwrap()
+                .state,
+            EvidenceState::Valid
+        );
+        assert_eq!(
+            service
+                .validate_source_evidence(&evidence[0].id)
+                .unwrap()
+                .location
+                .unwrap()
+                .turn_offset,
+            0
+        );
+        let mut wrong = evidence[0].clone();
+        wrong.turn_id = "turn-2".into();
+        assert_eq!(
+            service.check_evidence(&wrong).unwrap().state,
+            EvidenceState::WrongHierarchy
+        );
+        wrong.turn_id = "missing-turn".into();
+        assert_eq!(
+            service.check_evidence(&wrong).unwrap().state,
+            EvidenceState::MissingTurn
+        );
+        wrong = evidence[0].clone();
+        wrong.item_id = "missing-item".into();
+        assert_eq!(
+            service.check_evidence(&wrong).unwrap().state,
+            EvidenceState::MissingItem
+        );
+        wrong = evidence[0].clone();
+        wrong.excerpt = "does not appear".into();
+        assert_eq!(
+            service.check_evidence(&wrong).unwrap().state,
+            EvidenceState::ExcerptMissing
+        );
+        wrong = evidence[0].clone();
+        wrong.content_version = "old".into();
+        assert_eq!(
+            service.check_evidence(&wrong).unwrap().state,
+            EvidenceState::StaleVersion
+        );
+        let mut changed_thread = thread.clone();
+        changed_thread.updated_at = 101;
+        service
+            .sessions
+            .save_collection(&[changed_thread], &[])
+            .unwrap();
+        assert_eq!(
+            service.check_evidence(&evidence[0]).unwrap().state,
+            EvidenceState::StaleVersion
+        );
+        drop(service);
+        let reopened =
+            SourceService::with_credentials(root.clone(), Arc::new(MemoryCredentials::default()))
+                .unwrap();
+        assert_eq!(reopened.source_facts(&thread.id, 0, 10).unwrap().total, 2);
+        let mut updated = snapshot.clone();
+        updated.coverage.source_updated_at = 101;
+        updated.items[0].command = Some("cargo clippy".into());
+        updated.items[0].content_version = "new-content-version".into();
+        for item in &mut updated.items {
+            item.source_updated_at = 101;
+        }
+        for turn in &mut updated.turns {
+            turn.source_updated_at = 101;
+        }
+        reopened.sessions.save_history(&updated).unwrap();
+        let rebuilt = reopened.source_facts(&thread.id, 0, 10).unwrap();
+        assert_eq!(rebuilt.total, 2);
+        assert!(rebuilt
+            .facts
+            .iter()
+            .any(|fact| fact.subject == "cargo clippy"));
+        assert!(!rebuilt
+            .facts
+            .iter()
+            .any(|fact| fact.subject == "cargo test"));
+        assert_eq!(
+            reopened.source_facts(&thread.id, 0, 10).unwrap().facts[0].id,
+            rebuilt.facts[0].id
+        );
+        let connection = rusqlite::Connection::open(root.join("sessions.sqlite3")).unwrap();
+        connection
+            .execute(
+                "UPDATE fact_index SET rule_version='old-rule' WHERE thread_id=?1",
+                [&thread.id],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(reopened.source_facts(&thread.id, 0, 10).unwrap().total, 2);
+        assert_eq!(
+            reopened.sessions.fact_index(&thread.id).unwrap().unwrap().1,
+            facts::RULE_VERSION
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

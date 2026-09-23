@@ -233,6 +233,102 @@ pub struct HistoryItemLocation {
     pub offset: u64,
 }
 
+/// 自动事实只陈述结构化来源条目记录的操作；结果未知仍是未知。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFact {
+    pub id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub kind: FactKind,
+    pub subject: String,
+    pub operation: String,
+    pub outcome: FactOutcome,
+    pub evidence_id: String,
+    pub content_version: String,
+    pub rule_version: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FactKind {
+    File,
+    Command,
+    Branch,
+    Artifact,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FactOutcome {
+    Succeeded,
+    Failed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EvidenceField {
+    Command,
+    Output,
+    ChangePath,
+    ChangeDiff,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceEvidence {
+    pub id: String,
+    pub fact_id: String,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub item_id: String,
+    pub field: EvidenceField,
+    pub change_index: Option<u32>,
+    pub excerpt: String,
+    pub content_version: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactPage {
+    pub facts: Vec<SourceFact>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u32,
+    pub coverage: Option<HistoryCoverage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidencePage {
+    pub evidence: Vec<SourceEvidence>,
+    pub total: u64,
+    pub offset: u64,
+    pub limit: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum EvidenceState {
+    Valid,
+    MissingThread,
+    MissingTurn,
+    MissingItem,
+    WrongHierarchy,
+    ExcerptMissing,
+    StaleVersion,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceCheck {
+    pub state: EvidenceState,
+    pub message: String,
+    pub location: Option<HistoryItemLocation>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListScopeStatus {

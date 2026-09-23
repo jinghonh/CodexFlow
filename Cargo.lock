@@ -348,6 +348,7 @@ dependencies = [
  "codexflow-jev",
  "codexflow-store",
  "rusqlite",
+ "sha2",
  "tokio",
  "tokio-util",
 ]

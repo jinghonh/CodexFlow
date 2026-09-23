@@ -72,3 +72,36 @@ test("新版本无法读取时旧条目保留但当前内容显示不可用", as
   expect(screen.getByText("旧缓存")).toBeTruthy();
   expect(screen.getByText("来源当前不可用；已保存的历史仍可浏览。")).toBeTruthy();
 });
+
+test("事实证据检查后跳到对应来源条目，过期证据保留说明", async () => {
+  const fact = { id: "fact-1", turnId: "turn-25", itemId: "item-target", kind: "command",
+    subject: "cargo test", operation: "executed", outcome: "succeeded", evidenceId: "evidence-1",
+    contentVersion: "abcdef1234567890", ruleVersion: "structured-facts-v1" };
+  let stale = false;
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "get_history_turns") {
+      const offset = (args as { offset: number }).offset;
+      return { coverage, turns: offset === 0 ? [turn("turn-1", 0)] : [turn("turn-25", 24)], total: 25, offset, limit: 20 };
+    }
+    if (command === "get_history_items") {
+      const { turnId } = args as { turnId: string };
+      return { coverage, items: turnId === "turn-25" ? [item("item-target", turnId)] : [],
+        total: turnId === "turn-25" ? 1 : 0, offset: 0, limit: 20 };
+    }
+    if (command === "get_source_facts") return { facts: [fact], total: 1, offset: 0, limit: 20, coverage };
+    if (command === "get_source_evidence") return { evidence: [{ id: "evidence-1", excerpt: "cargo test", field: "command", contentVersion: fact.contentVersion }], total: 1, offset: 0, limit: 20 };
+    if (command === "validate_source_evidence") return stale
+      ? { state: "staleVersion", message: "证据内容版本已失效；请重新读取来源历史。", location: null }
+      : { state: "valid", message: "证据有效。", location: { turnId: "turn-25", turnOffset: 24, offset: 0 } };
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ThreadHistoryView threadId="thread-h" updatedAt={200} connected />);
+  await screen.findAllByText("cargo test");
+  fireEvent.click(screen.getByRole("button", { name: "检查证据并定位条目" }));
+  expect(await screen.findByText("已定位到回合 turn-25 的来源条目。")).toBeTruthy();
+  expect(await screen.findByText("目标正文")).toBeTruthy();
+  stale = true;
+  fireEvent.click(screen.getByRole("button", { name: "检查证据并定位条目" }));
+  expect((await screen.findAllByText("证据内容版本已失效；请重新读取来源历史。")).length).toBeGreaterThan(0);
+  expect(screen.getByText("证据过期")).toBeTruthy();
+});

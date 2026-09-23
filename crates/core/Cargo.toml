@@ -10,6 +10,7 @@ codexflow-store = { path = "../store" }
 codexflow-jev = { path = "../jev" }
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
