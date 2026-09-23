@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 import json
+import os
 import pathlib
 import sys
+import time
 
 mode = pathlib.Path(__file__).stem
 if sys.argv[1:] == ["--version"]:
+    if mode.endswith("slow-aux"):
+        with (pathlib.Path(__file__).parent / "auxiliary-pids.txt").open("a") as marker:
+            marker.write(f"version {os.getpid()}\n")
+        time.sleep(60)
     print("codex-cli test")
     raise SystemExit(0)
 if sys.argv[1:4] == ["app-server", "generate-json-schema", "--experimental"]:
+    if mode.endswith("slow-aux"):
+        with (pathlib.Path(__file__).parent / "auxiliary-pids.txt").open("a") as marker:
+            marker.write(f"schema {os.getpid()}\n")
+        time.sleep(60)
     out = pathlib.Path(sys.argv[-1]) / "v2"
     out.mkdir(parents=True)
     (out / "ThreadStartParams.json").write_text(json.dumps({"properties": {"ephemeral": {"type": "boolean"}}}))

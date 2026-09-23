@@ -332,6 +332,7 @@ name = "codexflow-codex"
 version = "0.1.0"
 dependencies = [
  "codexflow-domain",
+ "libc",
  "serde_json",
  "tokio",
 ]

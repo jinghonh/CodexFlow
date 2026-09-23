@@ -1,5 +1,7 @@
 use codexflow_domain::{AppError, Capability, ErrorCode, SourceCapabilities};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -8,7 +10,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
     time::timeout,
 };
@@ -95,9 +97,17 @@ fn is_executable(path: &Path) -> bool {
 }
 
 pub async fn diagnose(choice: Option<&str>) -> Result<Diagnosis, AppError> {
+    diagnose_with_timeouts(choice, Duration::from_secs(3), Duration::from_secs(8)).await
+}
+
+async fn diagnose_with_timeouts(
+    choice: Option<&str>,
+    version_timeout: Duration,
+    schema_timeout: Duration,
+) -> Result<Diagnosis, AppError> {
     let binary = resolve_binary(choice)?;
     let resolved_binary = binary.to_string_lossy().into_owned();
-    let version = read_version(&binary).await;
+    let version = read_version(&binary, version_timeout).await;
     let (mut session, experimental) = match Session::start(&binary).await {
         Ok(mut first) => match first.initialize(true).await {
             Ok(()) => (first, true),
@@ -205,7 +215,7 @@ pub async fn diagnose(choice: Option<&str>) -> Result<Diagnosis, AppError> {
         Capability::unavailable("所选二进制不接受实验接口初始化选项。")
     };
 
-    let analysis = inspect_analysis_schema(&binary).await;
+    let analysis = inspect_analysis_schema(&binary, schema_timeout).await;
     capabilities.codex_summary = analysis.clone();
     capabilities.codex_naming = analysis;
     if session.exited()? {
@@ -223,7 +233,7 @@ pub async fn diagnose(choice: Option<&str>) -> Result<Diagnosis, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, os::unix::fs::PermissionsExt};
+    use std::{io::Write, os::unix::fs::PermissionsExt, process::Command as StdCommand};
 
     fn fake_binary(mode: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -317,27 +327,100 @@ mod tests {
         assert!(matches!(error.code, ErrorCode::BinaryUnavailable));
         assert!(error.retryable);
     }
+
+    #[tokio::test]
+    async fn timed_out_auxiliary_processes_are_reaped_across_retries() {
+        let path = fake_binary("slow-aux");
+        for _ in 0..2 {
+            let mut diagnosis = diagnose_with_timeouts(
+                Some(path.to_str().unwrap()),
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+            )
+            .await
+            .unwrap();
+            assert!(diagnosis.version.is_none());
+            assert!(matches!(
+                diagnosis.capabilities.codex_summary.state,
+                codexflow_domain::CapabilityState::NotVerified
+            ));
+            diagnosis.session.close().await;
+        }
+
+        let marker = fs::read_to_string(path.parent().unwrap().join("auxiliary-pids.txt")).unwrap();
+        let pids: Vec<&str> = marker
+            .lines()
+            .map(|line| line.split_once(' ').unwrap().1)
+            .collect();
+        assert_eq!(
+            pids.len(),
+            4,
+            "two retries must launch both auxiliary probes"
+        );
+        let mut lingering = Vec::new();
+        for pid in pids {
+            let alive = StdCommand::new("/bin/kill")
+                .args(["-0", pid])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if alive {
+                lingering.push(pid);
+                let _ = StdCommand::new("/bin/kill").args(["-9", pid]).status();
+            }
+        }
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+        assert!(
+            lingering.is_empty(),
+            "auxiliary processes still running: {lingering:?}"
+        );
+    }
 }
 
-async fn read_version(binary: &Path) -> Option<String> {
-    let output = timeout(
-        Duration::from_secs(3),
-        Command::new(binary)
-            .arg("--version")
-            .stderr(Stdio::null())
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !output.status.success() {
+async fn read_version(binary: &Path, limit: Duration) -> Option<String> {
+    let mut command = Command::new(binary);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    AuxiliaryGroup::configure(&mut command);
+    let mut child = command.spawn().ok()?;
+    let mut group = AuxiliaryGroup::for_child(&child);
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut bytes = Vec::new();
+    let result = timeout(limit, async {
+        let mut limited_stdout = stdout.take(4096);
+        let (exit, read) = tokio::join!(child.wait(), limited_stdout.read_to_end(&mut bytes));
+        (exit, read)
+    })
+    .await;
+    let (exit, read) = match result {
+        Ok(result) => result,
+        Err(_) => {
+            terminate_and_reap(&mut child, &mut group).await;
+            return None;
+        }
+    };
+    let exit = match exit {
+        Ok(status) => status,
+        Err(_) => {
+            terminate_and_reap(&mut child, &mut group).await;
+            return None;
+        }
+    };
+    group.kill();
+    if !exit.success() || read.is_err() {
         return None;
     }
-    let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let version = String::from_utf8_lossy(&bytes).trim().to_owned();
     (!version.is_empty()).then_some(version)
 }
 
-async fn inspect_analysis_schema(binary: &Path) -> Capability {
+async fn inspect_analysis_schema(binary: &Path, limit: Duration) -> Capability {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -347,22 +430,40 @@ async fn inspect_analysis_schema(binary: &Path) -> Capability {
         std::process::id(),
         NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
     ));
-    let output = timeout(
-        Duration::from_secs(8),
-        Command::new(binary)
-            .args([
-                "app-server",
-                "generate-json-schema",
-                "--experimental",
-                "--out",
-            ])
-            .arg(&dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status(),
-    )
-    .await;
-    let available = if matches!(output, Ok(Ok(status)) if status.success()) {
+    let mut command = Command::new(binary);
+    command
+        .args([
+            "app-server",
+            "generate-json-schema",
+            "--experimental",
+            "--out",
+        ])
+        .arg(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    AuxiliaryGroup::configure(&mut command);
+    let output = command.spawn();
+    let succeeded = if let Ok(mut child) = output {
+        let mut group = AuxiliaryGroup::for_child(&child);
+        let succeeded = match timeout(limit, child.wait()).await {
+            Ok(Ok(status)) => status.success(),
+            Ok(Err(_)) => {
+                terminate_and_reap(&mut child, &mut group).await;
+                false
+            }
+            Err(_) => {
+                terminate_and_reap(&mut child, &mut group).await;
+                false
+            }
+        };
+        group.kill();
+        succeeded
+    } else {
+        false
+    };
+    let available = if succeeded {
         let start = fs::read_to_string(dir.join("v2/ThreadStartParams.json")).ok();
         let turn = fs::read_to_string(dir.join("v2/TurnStartParams.json")).ok();
         match (start, turn) {
@@ -389,6 +490,53 @@ async fn inspect_analysis_schema(binary: &Path) -> Capability {
     } else {
         Capability::unverified("无法从所选二进制确认临时会话与结构化输出；未调用模型。")
     }
+}
+
+struct AuxiliaryGroup {
+    #[cfg(unix)]
+    pgid: Option<i32>,
+}
+
+impl AuxiliaryGroup {
+    fn configure(command: &mut Command) {
+        #[cfg(unix)]
+        command.as_std_mut().process_group(0);
+        #[cfg(not(unix))]
+        let _ = command;
+    }
+
+    fn for_child(child: &Child) -> Self {
+        #[cfg(unix)]
+        {
+            Self {
+                pgid: child.id().map(|pid| pid as i32),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child;
+            Self {}
+        }
+    }
+
+    fn kill(&mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid.take() {
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+impl Drop for AuxiliaryGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+async fn terminate_and_reap(child: &mut Child, group: &mut AuxiliaryGroup) {
+    group.kill();
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 fn initialize_error(error: ProbeError) -> AppError {
