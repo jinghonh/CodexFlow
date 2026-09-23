@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -23,6 +23,15 @@ type SourceStatus = {
   checkedAtUnixMs: number | null;
 };
 type Settings = { theme: Theme; source: SourceStatus };
+type JevStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean; credentialError: AppError | null };
+type JevConnectionResult = { models: string[]; requestedModel: string };
+type JevInferenceResult = {
+  requestedModel: string;
+  actualModel: string;
+  answer: { choice: "resolved" | "unresolved"; confidence: number; probabilities: { resolved: number; unresolved: number } };
+  inputTokens: number;
+  outputTokens: number;
+};
 type Thread = {
   id: string; sessionId: string; title: string | null; preview: string; cwd: string;
   projectId: string | null; sourceKind: string; sourceDetail: string | null;
@@ -63,6 +72,17 @@ function App() {
   const [projectPath, setProjectPath] = useState("");
   const [projectError, setProjectError] = useState("");
   const [showUnassigned, setShowUnassigned] = useState(false);
+  const [jevStatus, setJevStatus] = useState<JevStatus | null>(null);
+  const [jevBaseUrl, setJevBaseUrl] = useState("https://api.typesafe.ai");
+  const [jevModel, setJevModel] = useState("jev-latest");
+  const [jevKey, setJevKey] = useState("");
+  const [jevSaving, setJevSaving] = useState(false);
+  const [jevRequestBusy, setJevRequestBusy] = useState(false);
+  const [jevDeleting, setJevDeleting] = useState(false);
+  const [jevError, setJevError] = useState("");
+  const [jevConnection, setJevConnection] = useState<JevConnectionResult | null>(null);
+  const [jevInference, setJevInference] = useState<JevInferenceResult | null>(null);
+  const jevEpoch = useRef(0);
   const [listError, setListError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [query, setQuery] = useState("");
@@ -114,6 +134,14 @@ function App() {
       invoke<SourceStatus>("get_source_status").then((next) => { if (active) setSource(next); }).catch(() => {});
     }, 4000);
     return () => { active = false; window.clearInterval(timer); };
+  }, []);
+
+  useEffect(() => {
+    invoke<JevStatus>("get_jev_status").then((status) => {
+      setJevStatus(status);
+      setJevBaseUrl(status.config.baseUrl);
+      setJevModel(status.config.model);
+    }).catch((error) => setJevError(errorText(error)));
   }, []);
 
   useEffect(() => {
@@ -188,9 +216,77 @@ function App() {
     } catch (error) { setProjectError(errorText(error)); }
   }
 
+  async function saveJev() {
+    jevEpoch.current += 1;
+    setJevSaving(true);
+    setJevError("");
+    try {
+      const next = await invoke<JevStatus>("save_jev_settings", {
+        baseUrl: jevBaseUrl, model: jevModel, apiKey: jevKey || null,
+      });
+      setJevStatus(next);
+      setJevBaseUrl(next.config.baseUrl);
+      setJevModel(next.config.model);
+      setJevKey("");
+      setJevConnection(null);
+      setJevInference(null);
+    } catch (error) { setJevError(errorText(error)); }
+    finally { setJevSaving(false); }
+  }
+
+  async function refreshJevStatus() {
+    try {
+      setJevStatus(await invoke<JevStatus>("get_jev_status"));
+      setJevError("");
+    } catch (error) { setJevError(errorText(error)); }
+  }
+
+  async function deleteJev() {
+    if (!window.confirm("删除钥匙串中的 Jev API Key？已有本地结果会保留。")) return;
+    jevEpoch.current += 1;
+    setJevDeleting(true);
+    setJevError("");
+    try {
+      setJevStatus(await invoke<JevStatus>("delete_jev_credential"));
+      setJevKey("");
+      setJevConnection(null);
+      setJevInference(null);
+    } catch (error) { setJevError(errorText(error)); }
+    finally { setJevDeleting(false); }
+  }
+
+  async function runJev(kind: "connection" | "inference") {
+    const epoch = jevEpoch.current;
+    setJevRequestBusy(true);
+    setJevError("");
+    if (kind === "connection") setJevConnection(null);
+    else setJevInference(null);
+    try {
+      if (kind === "connection") {
+        const result = await invoke<JevConnectionResult>("check_jev_connection");
+        if (epoch === jevEpoch.current) setJevConnection(result);
+      } else {
+        const result = await invoke<JevInferenceResult>("test_jev_inference");
+        if (epoch === jevEpoch.current) setJevInference(result);
+      }
+    } catch (error) { if (epoch === jevEpoch.current) setJevError(errorText(error)); }
+    finally { setJevRequestBusy(false); }
+  }
+
+  async function cancelJev() {
+    const epoch = ++jevEpoch.current;
+    try {
+      await invoke("cancel_jev_request");
+      if (epoch === jevEpoch.current) setJevError("Jev 本地请求已取消；远端计算或计费可能仍在进行。");
+    } catch (error) { if (epoch === jevEpoch.current) setJevError(errorText(error)); }
+  }
+
   const connected = source?.connection === "connected";
   const failed = source?.connection === "failed";
   const checkedAt = source?.checkedAtUnixMs ? new Date(source.checkedAtUnixMs).toLocaleString("zh-CN") : "尚未检查";
+  const jevBusy = jevSaving || jevRequestBusy || jevDeleting;
+  const jevUnsaved = !jevStatus || jevBaseUrl !== jevStatus.config.baseUrl ||
+    jevModel !== jevStatus.config.model || jevKey.length > 0;
   const scopes = projectSessions?.scopes ?? projectCatalog?.scopes ?? [];
   const attempted = scopes.some((scope) => scope.attemptedAtUnixMs !== null);
   const complete = scopes.length === 2 && scopes.every((scope) => scope.complete);
@@ -207,13 +303,13 @@ function App() {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">C<span>F</span></span><div><strong>CodexFlow</strong><small>本地工作过程</small></div></div>
-      <div className="side-group"><span className="side-caption">工作空间</span><div className="side-link active"><span className="side-dot" />来源连接 <span className="side-index">01</span></div><a className="side-link" href="#projects"><span className="side-dot" />本地项目 <span className="side-index">02</span></a><a className="side-link" href="#sessions"><span className="side-dot" />项目会话 <span className="side-index">03</span></a></div>
+      <div className="side-group"><span className="side-caption">工作空间</span><div className="side-link active"><span className="side-dot" />来源与分析连接 <span className="side-index">01</span></div><a className="side-link" href="#projects"><span className="side-dot" />本地项目 <span className="side-index">02</span></a><a className="side-link" href="#sessions"><span className="side-dot" />项目会话 <span className="side-index">03</span></a></div>
       <div className="side-note"><span className="side-note-line" />同一仓库的主工作区与 worktree 合并展示。会话的实际工作区和归属依据仍可逐条查看。</div>
       <div className="sidebar-bottom"><span className="sidebar-bottom-symbol">↗</span><div>本机运行<br /><strong>数据留在你的设备</strong></div></div>
     </aside>
 
     <main className="content">
-      <header className="topbar"><span>设置 / 来源连接</span><div className="topbar-right"><span className="topbar-pulse" />本地桌面应用</div></header>
+      <header className="topbar"><span>设置 / 连接</span><div className="topbar-right"><span className="topbar-pulse" />本地桌面应用</div></header>
       <div className="page-body">
         <div className="eyebrow">SOURCE / 01 <span /></div>
         <div className="page-heading"><div><h1>连接 Codex 数据源<span className="accent">.</span></h1><p>确认应用实际使用的二进制，以及可以安全读取的能力。</p></div><div className="heading-badge">本机连接诊断<br /><strong>不会启动模型</strong></div></div>
@@ -250,6 +346,31 @@ function App() {
           </section>
         </div>
 
+        <section className="panel jev-panel">
+          <div className="panel-kicker">03 / 关系分析服务</div>
+          <h2>Jev 连接设置</h2>
+          <p className="panel-intro">连接检查只查询模型列表。固定合成推理单独运行，不读取项目历史。</p>
+          <div className="jev-fields">
+            <label htmlFor="jev-url">服务根地址<input id="jev-url" spellCheck={false} value={jevBaseUrl} onChange={(event) => setJevBaseUrl(event.target.value)} placeholder="https://api.typesafe.ai" /></label>
+            <label htmlFor="jev-model">模型 ID<input id="jev-model" spellCheck={false} value={jevModel} onChange={(event) => setJevModel(event.target.value)} placeholder="jev-latest" /></label>
+            <label htmlFor="jev-key">API Key<input id="jev-key" type="password" autoComplete="off" spellCheck={false} value={jevKey} onChange={(event) => setJevKey(event.target.value)} placeholder={jevStatus?.credentialError ? "钥匙串不可用；请先解锁" : jevStatus?.credentialConfigured ? "已保存；留空则保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
+          </div>
+          <p className="jev-key-state">钥匙串状态：{jevStatus?.credentialError ? "暂时无法读取" : jevStatus?.credentialConfigured ? "已保存地址已配置密钥" : "已保存地址未配置密钥"}。更换服务地址时需填写新密钥。{jevUnsaved ? "请先保存修改，再运行验证。" : ""}</p>
+          {jevStatus?.credentialError && <div className="page-error" role="alert">{jevStatus.credentialError.message} 已保存的服务地址与模型仍可查看；解锁后重新检查钥匙串。</div>}
+          {jevError && <div className="page-error" role="alert">{jevError}</div>}
+          <div className="jev-actions">
+            <button className="primary-button" disabled={jevBusy} onClick={saveJev}>保存设置</button>
+            {jevStatus?.credentialError && <button className="browse-button" disabled={jevBusy} onClick={refreshJevStatus}>重查钥匙串</button>}
+            <button className="browse-button" disabled={jevBusy || jevUnsaved || !jevStatus?.credentialConfigured} onClick={() => runJev("connection")}>验证连接</button>
+            <button className="browse-button" disabled={jevBusy || jevUnsaved || !jevStatus?.credentialConfigured} onClick={() => runJev("inference")}>测试固定合成推理</button>
+            {jevRequestBusy && <button className="plain-button" onClick={cancelJev}>取消请求</button>}
+            <button className="plain-button" disabled={jevSaving || jevDeleting || !jevStatus?.credentialConfigured} onClick={deleteJev}>删除密钥</button>
+          </div>
+          <p className="jev-cost-note">测试推理会向所填服务发送固定合成材料，并消耗一次推理调用。取消仅确认本地请求结束，远端计算或计费可能继续。</p>
+          {!jevUnsaved && jevConnection && <div className="jev-result" role="status"><strong>连接已验证</strong><span>可用名称：{jevConnection.models.join("、") || "列表为空"}。所填版本化模型 ID 仍可单独测试。</span></div>}
+          {!jevUnsaved && jevInference && <div className="jev-result" role="status"><strong>合成推理已验证</strong><span>判定：{jevInference.answer.choice === "resolved" ? "已处理" : "尚未处理"}；置信度 {(jevInference.answer.confidence * 100).toFixed(1)}%；选项概率：已处理 {(jevInference.answer.probabilities.resolved * 100).toFixed(1)}%、尚未处理 {(jevInference.answer.probabilities.unresolved * 100).toFixed(1)}%。实际模型：{jevInference.actualModel}；输入 {jevInference.inputTokens}，输出 {jevInference.outputTokens} 个令牌。</span></div>}
+        </section>
+
         <section className="footer-panel"><div><div className="panel-kicker">显示偏好</div><h3>界面外观</h3></div><div className="theme-picker" role="group" aria-label="界面外观">{(["system", "light", "dark"] as const).map((value) => <button key={value} className={theme === value ? "selected" : ""} onClick={() => changeTheme(value)}>{value === "system" ? "跟随系统" : value === "light" ? "浅色" : "深色"}</button>)}</div><small>保存于应用管理的本机用户数据目录</small></section>
         <section id="projects" className="panel project-panel">
           <div className="panel-kicker">02 / 本地项目</div><h2>选择项目</h2>
@@ -268,7 +389,7 @@ function App() {
           <label className="session-search">查找会话<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="标题、预览、Thread ID 或工作目录" /></label>
           <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{query ? "没有匹配的会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : visibleThreads.map(({ thread, attribution }) => <article className="thread-row" key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
         </section>
-        <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。历史内容完整性由后续采集流程验证。</p>
+        <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。Jev 连接检查不运行推理；只有点击“测试固定合成推理”才会发起该次模型调用。</p>
       </div>
     </main>
   </div>;

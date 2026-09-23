@@ -1,6 +1,7 @@
 use codexflow_core::SourceService;
 use codexflow_domain::{
-    AppError, DisplayTheme, ProjectCatalog, ProjectSessions, SessionList, SourceStatus,
+    AppError, DisplayTheme, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
+    ProjectSessions, SessionList, SourceStatus,
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -45,6 +46,46 @@ async fn set_display_theme(
     theme: DisplayTheme,
 ) -> Result<DisplayTheme, AppError> {
     service(&state)?.set_theme(theme).await
+}
+
+#[tauri::command]
+async fn get_jev_status(state: tauri::State<'_, AppState>) -> Result<JevStatus, AppError> {
+    service(&state)?.jev_status().await
+}
+
+#[tauri::command]
+async fn save_jev_settings(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<JevStatus, AppError> {
+    service(&state)?.save_jev(base_url, model, api_key).await
+}
+
+#[tauri::command]
+async fn delete_jev_credential(state: tauri::State<'_, AppState>) -> Result<JevStatus, AppError> {
+    service(&state)?.delete_jev_credential().await
+}
+
+#[tauri::command]
+async fn check_jev_connection(
+    state: tauri::State<'_, AppState>,
+) -> Result<JevConnectionResult, AppError> {
+    service(&state)?.check_jev_connection().await
+}
+
+#[tauri::command]
+async fn test_jev_inference(
+    state: tauri::State<'_, AppState>,
+) -> Result<JevInferenceResult, AppError> {
+    service(&state)?.test_jev_inference().await
+}
+
+#[tauri::command]
+async fn cancel_jev_request(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    service(&state)?.cancel_jev().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -101,6 +142,12 @@ fn main() {
             get_source_status,
             connect_source,
             set_display_theme,
+            get_jev_status,
+            save_jev_settings,
+            delete_jev_credential,
+            check_jev_connection,
+            test_jev_inference,
+            cancel_jev_request,
             get_session_list,
             refresh_session_list,
             get_project_catalog,

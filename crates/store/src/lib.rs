@@ -482,6 +482,7 @@ mod tests {
             .save(&Preferences {
                 selected_binary: Some("/tmp/codex".into()),
                 theme: DisplayTheme::Dark,
+                jev: Default::default(),
             })
             .unwrap();
         let loaded = PreferenceStore::new(dir.clone()).load().unwrap();

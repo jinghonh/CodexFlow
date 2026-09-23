@@ -11,6 +11,15 @@ pub struct AppError {
 }
 
 impl AppError {
+    pub fn jev(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+            cache_preserved: true,
+            backend: "jev".into(),
+        }
+    }
     pub fn codex(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
         Self {
             code,
@@ -62,6 +71,19 @@ pub enum ErrorCode {
     ProcessExited,
     SourceReadFailed,
     StorageFailed,
+    JevInvalidAddress,
+    JevNotConfigured,
+    JevConnectionFailed,
+    JevAuthenticationFailed,
+    JevModelUnsupported,
+    JevProtocolInvalid,
+    JevRateLimited,
+    JevOverloaded,
+    JevQuotaExceeded,
+    JevInvalidRequest,
+    JevTimeout,
+    JevCancelled,
+    JevCredentialFailed,
     MigrationFailed,
     ProjectResolutionFailed,
 }
@@ -268,6 +290,57 @@ pub enum DisplayTheme {
 pub struct Preferences {
     pub selected_binary: Option<String>,
     pub theme: DisplayTheme,
+    #[serde(default)]
+    pub jev: JevConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevConfig {
+    pub base_url: String,
+    pub model: String,
+}
+
+impl Default for JevConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.typesafe.ai".into(),
+            model: "jev-latest".into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevStatus {
+    pub config: JevConfig,
+    pub credential_configured: bool,
+    pub credential_error: Option<AppError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevConnectionResult {
+    pub models: Vec<String>,
+    pub requested_model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevInferenceResult {
+    pub requested_model: String,
+    pub actual_model: String,
+    pub answer: JevChoiceAnswer,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevChoiceAnswer {
+    pub choice: String,
+    pub confidence: f64,
+    pub probabilities: std::collections::BTreeMap<String, f64>,
 }
 
 impl Default for Preferences {
@@ -275,6 +348,7 @@ impl Default for Preferences {
         Self {
             selected_binary: None,
             theme: DisplayTheme::System,
+            jev: JevConfig::default(),
         }
     }
 }
