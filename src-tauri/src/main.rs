@@ -1,7 +1,7 @@
 use codexflow_core::SourceService;
 use codexflow_domain::{
     AppError, DisplayTheme, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
-    ProjectSessions, SessionList, SourceStatus,
+    ProjectGraph, ProjectSessions, SessionList, SourceStatus,
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -112,6 +112,14 @@ fn get_project_sessions(
 }
 
 #[tauri::command]
+fn get_project_graph(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectGraph, AppError> {
+    service(&state)?.project_graph(&project_id)
+}
+
+#[tauri::command]
 fn choose_project(
     state: tauri::State<'_, AppState>,
     path: String,
@@ -152,6 +160,7 @@ fn main() {
             refresh_session_list,
             get_project_catalog,
             get_project_sessions,
+            get_project_graph,
             choose_project,
             choose_existing_project
         ])

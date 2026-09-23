@@ -145,3 +145,26 @@ button:disabled { cursor: wait; opacity: .6; }
 @media (max-width: 1050px) { .thread-row { grid-template-columns: 1fr; gap: 11px; } }
 @media (max-width: 1050px) { .sidebar { width: 198px; } .page-body { padding: 35px 27px; } .topbar { padding: 0 27px; } .columns { gap: 12px; } .panel { padding: 23px 20px; } .footer-panel { flex-wrap: wrap; } }
 @media (max-width: 1050px) { .jev-fields { grid-template-columns: 1fr 1fr; } }
+.graph-panel { margin-top: 20px; scroll-margin-top: 24px; }
+.graph-panel .panel-intro { min-height: 0; margin-bottom: 14px; }
+.graph-summary { display: flex; gap: 20px; border-top: 1px solid var(--line); padding: 13px 0; color: var(--muted); font-size: 11px; }
+.graph-summary strong { color: var(--ink); }
+.graph-layout-warning { padding: 8px 11px; color: var(--red); background: var(--red-soft); font-size: 11px; margin-bottom: 9px; }
+.graph-canvas { height: 520px; border: 1px solid var(--line); background: var(--page); }
+.graph-node { position: relative; width: 224px; height: 82px; padding: 13px 15px; background: var(--paper); border: 1px solid var(--green); border-radius: 6px; box-shadow: 0 4px 12px #00000013; overflow: visible; }
+.graph-node-reference { border-style: dashed; border-color: var(--muted); color: var(--muted); }
+.graph-node strong, .graph-node small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.graph-node strong { font-size: 12px; }
+.graph-node small { margin-top: 11px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 9px; }
+.graph-node .react-flow__handle { width: 7px; height: 7px; background: var(--green); border: 1px solid var(--paper); }
+.graph-node-reference .react-flow__handle { background: var(--muted); }
+.graph-details { margin-top: 13px; min-height: 75px; padding: 14px; background: var(--page); border: 1px solid var(--line); font-size: 11px; overflow-wrap: anywhere; }
+.graph-details > p { margin: 0; color: var(--muted); }
+.graph-details h3 { font-size: 12px; margin: 0 0 9px; }
+.graph-details strong, .graph-details > code { display: block; margin: 7px 0; }
+.graph-details dl { display: grid; grid-template-columns: 72px 1fr; gap: 8px 12px; margin: 12px 0 0; }
+.graph-details dt { color: var(--muted); }
+.graph-details dd { margin: 0; }
+.graph-diagnostics { border-left: 3px solid var(--red); padding: 11px 14px; margin-top: 13px; background: var(--red-soft); color: var(--ink); font-size: 11px; overflow-wrap: anywhere; }
+.graph-diagnostics strong { color: var(--red); }
+.graph-diagnostics p { margin: 9px 0 0; }

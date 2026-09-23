@@ -184,6 +184,71 @@ pub struct ProjectSessions {
     pub scopes: Vec<ListScopeStatus>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ObservedRelationKind {
+    ForkedFrom,
+    SubagentOf,
+}
+
+impl ObservedRelationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ForkedFrom => "FORKED_FROM",
+            Self::SubagentOf => "SUBAGENT_OF",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ParentEndpoint {
+    InProject,
+    Missing,
+    OutsideProject,
+    Unassigned,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservedRelation {
+    pub id: String,
+    pub project_id: String,
+    pub from_thread_id: String,
+    pub to_thread_id: String,
+    pub kind: ObservedRelationKind,
+    pub source: String,
+    pub source_field: String,
+    pub confidence: f64,
+    pub parent_endpoint: ParentEndpoint,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    pub id: String,
+    pub title: Option<String>,
+    pub reference_only: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphDiagnostic {
+    pub thread_id: String,
+    pub source_field: String,
+    pub referenced_thread_id: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGraph {
+    pub project: LocalProject,
+    pub nodes: Vec<GraphNode>,
+    pub relations: Vec<ObservedRelation>,
+    pub diagnostics: Vec<GraphDiagnostic>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ConnectionState {

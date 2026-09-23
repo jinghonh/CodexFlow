@@ -1,10 +1,11 @@
 mod projects;
+mod relations;
 
 use codexflow_codex::{diagnose, Session};
 use codexflow_domain::{
     AppError, ConnectionState, DisplayTheme, ErrorCode, JevConfig, JevConnectionResult,
-    JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectSessions, SessionList,
-    SourceStatus,
+    JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph, ProjectSessions,
+    SessionList, SourceStatus,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -305,8 +306,12 @@ impl SourceService {
             if self.reconciliation_revision.load(Ordering::Relaxed) != revision {
                 continue;
             }
-            self.sessions
-                .save_projects_and_attributions(&projects, &attributions)?;
+            let relations = relations::observe(&threads, &attributions);
+            self.sessions.save_projects_and_attributions(
+                &projects,
+                &attributions,
+                Some(&relations),
+            )?;
             self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
@@ -326,12 +331,18 @@ impl SourceService {
         self.sessions.project_sessions(project_id)
     }
 
+    pub fn project_graph(&self, project_id: &str) -> Result<ProjectGraph, AppError> {
+        let sessions = self.sessions.project_sessions(project_id)?;
+        let relations = self.sessions.observed_relations(project_id)?;
+        Ok(relations::project_graph(sessions, relations))
+    }
+
     pub fn choose_project(&self, path: &str) -> Result<ProjectCatalog, AppError> {
         let project = projects::selected_project(path).map_err(AppError::project)?;
         {
             let _updates = self.lock_project_updates();
             self.sessions
-                .save_projects_and_attributions(&[project.clone()], &[])?;
+                .save_projects_and_attributions(&[project.clone()], &[], None)?;
             self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
             self.sessions.select_project(&project.id)?;
         }
@@ -1305,6 +1316,161 @@ mod tests {
         assert_eq!(sessions.threads.len(), 1);
         assert_eq!(sessions.threads[0].thread.id, "inside");
         assert_eq!(reopened.project_catalog().unwrap().unassigned.len(), 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_graph_preserves_observed_structure_and_diagnostics_across_reconciliation() {
+        use codexflow_domain::{ObservedRelationKind, ParentEndpoint, ThreadMetadata};
+
+        let root = temp_data_dir();
+        let first = root.join("first");
+        let second = root.join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let service = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(MemoryCredentials::default()),
+        )
+        .unwrap();
+        let thread = |id: &str, cwd: &std::path::Path, fork: Option<&str>, parent: Option<&str>| {
+            ThreadMetadata {
+                id: id.into(),
+                session_id: "shared-session-id".into(),
+                title: Some(format!("会话 {id}")),
+                preview: String::new(),
+                cwd: cwd.to_string_lossy().into_owned(),
+                project_id: None,
+                source_kind: "cli".into(),
+                source_detail: None,
+                thread_source: None,
+                parent_thread_id: parent.map(str::to_owned),
+                forked_from_id: fork.map(str::to_owned),
+                git: None,
+                created_at: 1,
+                updated_at: 2,
+                archived: false,
+                metadata_complete: true,
+                content_complete: false,
+                read_error: None,
+                observed_at_unix_ms: 3,
+            }
+        };
+        let threads = vec![
+            thread("root", &first, None, None),
+            thread("fork", &first, Some("root"), None),
+            thread("subagent", &first, None, Some("root")),
+            thread("both", &first, Some("root"), Some("root")),
+            thread("missing", &first, Some("not-cached"), None),
+            thread("cross", &first, None, Some("external")),
+            thread("self", &first, None, Some("self")),
+            thread("cycle-a", &first, None, Some("cycle-b")),
+            thread("cycle-b", &first, None, Some("cycle-a")),
+            thread("unassigned", &first, None, Some("unknown-owner")),
+            thread("unknown-owner", &root.join("gone"), None, None),
+            thread("external", &second, None, None),
+        ];
+        service.sessions.save_collection(&threads, &[]).unwrap();
+        let first_id = service
+            .choose_project(first.to_str().unwrap())
+            .unwrap()
+            .selected_project_id
+            .unwrap();
+        service.choose_project(second.to_str().unwrap()).unwrap();
+
+        let graph = service.project_graph(&first_id).unwrap();
+        assert_eq!(graph.relations.len(), 9);
+        assert!(graph.relations.iter().all(|relation| {
+            relation.source == "observed"
+                && relation.confidence == 1.0
+                && relation.to_thread_id != relation.from_thread_id
+        }));
+        let edge = |child: &str, kind| {
+            graph
+                .relations
+                .iter()
+                .find(|relation| relation.to_thread_id == child && relation.kind == kind)
+                .unwrap()
+        };
+        assert_eq!(
+            edge("fork", ObservedRelationKind::ForkedFrom).from_thread_id,
+            "root"
+        );
+        assert_eq!(
+            edge("fork", ObservedRelationKind::ForkedFrom).source_field,
+            "forkedFromId"
+        );
+        assert_eq!(
+            edge("subagent", ObservedRelationKind::SubagentOf).from_thread_id,
+            "root"
+        );
+        assert_eq!(
+            edge("subagent", ObservedRelationKind::SubagentOf).source_field,
+            "parentThreadId"
+        );
+        assert_ne!(
+            edge("both", ObservedRelationKind::ForkedFrom).id,
+            edge("both", ObservedRelationKind::SubagentOf).id
+        );
+        assert_eq!(
+            edge("missing", ObservedRelationKind::ForkedFrom).parent_endpoint,
+            ParentEndpoint::Missing
+        );
+        assert_eq!(
+            edge("cross", ObservedRelationKind::SubagentOf).parent_endpoint,
+            ParentEndpoint::OutsideProject
+        );
+        assert_eq!(
+            edge("unassigned", ObservedRelationKind::SubagentOf).parent_endpoint,
+            ParentEndpoint::Unassigned
+        );
+        assert_eq!(
+            edge("cycle-a", ObservedRelationKind::SubagentOf).from_thread_id,
+            "cycle-b"
+        );
+        assert_eq!(
+            edge("cycle-b", ObservedRelationKind::SubagentOf).from_thread_id,
+            "cycle-a"
+        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "not-cached" && node.reference_only && node.title.is_none()));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.id == "external" && node.reference_only && node.title.is_none()));
+        assert!(graph
+            .diagnostics
+            .iter()
+            .any(|item| item.thread_id == "self" && item.source_field == "parentThreadId"));
+
+        let identities: Vec<_> = graph
+            .relations
+            .iter()
+            .map(|relation| relation.id.clone())
+            .collect();
+        service.sessions.save_collection(&threads, &[]).unwrap();
+        service.reconcile_projects().unwrap();
+        let refreshed = service.project_graph(&first_id).unwrap();
+        assert_eq!(
+            refreshed
+                .relations
+                .iter()
+                .map(|relation| relation.id.clone())
+                .collect::<Vec<_>>(),
+            identities
+        );
+        drop(service);
+        let reopened = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(MemoryCredentials::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.project_graph(&first_id).unwrap().relations.len(),
+            9
+        );
         let _ = fs::remove_dir_all(root);
     }
 }
