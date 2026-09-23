@@ -94,6 +94,11 @@ pub enum ErrorCode {
     ProjectResolutionFailed,
     RefreshAlreadyRunning,
     RefreshNotFound,
+    AnalysisUnavailable,
+    AnalysisAlreadyRunning,
+    AnalysisNotFound,
+    AnalysisInvalidResult,
+    AnalysisCancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -296,6 +301,77 @@ pub struct SourceEvidence {
     pub change_index: Option<u32>,
     pub excerpt: String,
     pub content_version: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+pub struct ThreadSummaryContent {
+    pub goal: String,
+    pub activity: String,
+    pub outcome: String,
+    pub decisions: String,
+    pub issues: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadSummary {
+    pub thread_id: String,
+    pub content: ThreadSummaryContent,
+    #[serde(default)]
+    pub evidence_ids: Vec<String>,
+    pub model: String,
+    #[serde(default)]
+    pub binary_version: Option<String>,
+    pub input_digest: String,
+    pub source_updated_at: i64,
+    pub created_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryPreview {
+    pub thread_id: String,
+    pub model: String,
+    pub character_limit: usize,
+    pub character_count: usize,
+    pub total_facts: usize,
+    pub included_facts: usize,
+    pub total_messages: usize,
+    pub included_messages: usize,
+    pub truncated: bool,
+    pub turns_complete: bool,
+    pub items_complete: bool,
+    pub source_current: bool,
+    pub content_available: bool,
+    pub cached_summary: Option<ThreadSummary>,
+    pub cache_current: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SummaryRunState {
+    Running,
+    Cancelling,
+    Complete,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryRun {
+    pub id: String,
+    pub thread_id: String,
+    pub state: SummaryRunState,
+    pub model: String,
+    pub started_at_unix_ms: i64,
+    pub finished_at_unix_ms: Option<i64>,
+    pub temporary_thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub reused_cache: bool,
+    pub error: Option<AppError>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

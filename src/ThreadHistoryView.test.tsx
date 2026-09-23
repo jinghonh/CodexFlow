@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ThreadHistoryView } from "./ThreadHistoryView";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("./ThreadSummaryView", () => ({ ThreadSummaryView: () => null }));
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
 const coverage = { threadId: "thread-h", sourceUpdatedAt: 200, attemptedAtUnixMs: 300_000,

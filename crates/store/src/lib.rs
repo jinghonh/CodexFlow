@@ -2,7 +2,8 @@ use codexflow_domain::{
     AppError, AttributedThread, EvidencePage, FactPage, HistoryCoverage, HistoryItem,
     HistoryItemLocation, HistoryItemPage, HistorySnapshot, HistoryTurn, HistoryTurnPage, IndexRun,
     IndexRunState, ListScopeStatus, LocalProject, ObservedRelation, Preferences, ProjectCatalog,
-    ProjectSessions, SessionList, SourceEvidence, SourceFact, ThreadAttribution, ThreadMetadata,
+    ProjectSessions, SessionList, SourceEvidence, SourceFact, SummaryRun, SummaryRunState,
+    ThreadAttribution, ThreadMetadata, ThreadSummary,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use std::{
@@ -111,7 +112,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 7 {
+        if version > 8 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -306,13 +307,170 @@ impl SessionStore {
                 .commit()
                 .map_err(|_| AppError::migration("提交事实与证据数据库迁移失败，原数据已保留。"))?;
         }
+        if version < 8 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始总结数据库迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS thread_summaries (
+                    thread_id TEXT PRIMARY KEY NOT NULL, summary_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS summary_runs (
+                    id TEXT PRIMARY KEY NOT NULL, thread_id TEXT NOT NULL,
+                    started_at INTEGER NOT NULL, run_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS summary_runs_thread ON summary_runs(thread_id, started_at DESC);
+                PRAGMA user_version = 8;",
+                )
+                .map_err(|_| AppError::migration("迁移总结数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交总结数据库迁移失败，原数据已保留。"))?;
+        }
         store.recover_interrupted_runs()?;
+        store.recover_interrupted_summary_runs()?;
         Ok(store)
     }
 
     fn connection(&self) -> Result<Connection, AppError> {
         Connection::open(&self.path)
             .map_err(|_| AppError::store("打开会话数据库失败，请检查应用数据目录。"))
+    }
+
+    pub fn summary(&self, thread_id: &str) -> Result<Option<ThreadSummary>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT summary_json FROM thread_summaries WHERE thread_id=?1",
+                [thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取会话总结失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("会话总结缓存损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn save_summary_if_current(
+        &self,
+        summary: &ThreadSummary,
+        expected_generation: i64,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始保存会话总结失败。"))?;
+        let metadata: Option<String> = tx
+            .query_row(
+                "SELECT metadata_json FROM threads WHERE id=?1",
+                [&summary.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查会话来源版本失败。"))?;
+        let generation: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM history_revisions WHERE thread_id=?1",
+                [&summary.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查历史版本失败。"))?;
+        let current = metadata
+            .and_then(|value| serde_json::from_str::<ThreadMetadata>(&value).ok())
+            .is_some_and(|thread| thread.updated_at == summary.source_updated_at)
+            && generation.unwrap_or(0) == expected_generation;
+        if !current {
+            return Ok(false);
+        }
+        let json =
+            serde_json::to_string(summary).map_err(|_| AppError::store("序列化会话总结失败。"))?;
+        tx.execute(
+            "INSERT INTO thread_summaries(thread_id,summary_json) VALUES (?1,?2)
+            ON CONFLICT(thread_id) DO UPDATE SET summary_json=excluded.summary_json",
+            params![summary.thread_id, json],
+        )
+        .map_err(|_| AppError::store("保存会话总结失败，旧总结已保留。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交会话总结失败，旧总结已保留。"))?;
+        Ok(true)
+    }
+
+    pub fn save_summary_run(&self, run: &SummaryRun) -> Result<(), AppError> {
+        let json =
+            serde_json::to_string(run).map_err(|_| AppError::store("序列化总结运行失败。"))?;
+        self.connection()?
+            .execute(
+                "INSERT INTO summary_runs(id,thread_id,started_at,run_json) VALUES (?1,?2,?3,?4)
+            ON CONFLICT(id) DO UPDATE SET run_json=excluded.run_json",
+                params![run.id, run.thread_id, run.started_at_unix_ms, json],
+            )
+            .map_err(|_| AppError::store("保存总结运行状态失败。"))?;
+        Ok(())
+    }
+
+    pub fn summary_run(&self, id: &str) -> Result<Option<SummaryRun>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT run_json FROM summary_runs WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取总结运行状态失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("总结运行状态损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn latest_summary_run(&self, thread_id: &str) -> Result<Option<SummaryRun>, AppError> {
+        let json: Option<String> = self.connection()?.query_row(
+            "SELECT run_json FROM summary_runs WHERE thread_id=?1 ORDER BY started_at DESC,id DESC LIMIT 1", [thread_id], |row| row.get(0)
+        ).optional().map_err(|_| AppError::store("读取最近总结运行失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("总结运行状态损坏。"))
+        })
+        .transpose()
+    }
+
+    fn recover_interrupted_summary_runs(&self) -> Result<(), AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT run_json FROM summary_runs")
+            .map_err(|_| AppError::store("读取待恢复总结运行失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询待恢复总结运行失败。"))?;
+        let mut interrupted = Vec::new();
+        for row in rows {
+            let json = row.map_err(|_| AppError::store("读取待恢复总结运行失败。"))?;
+            let mut run: SummaryRun =
+                serde_json::from_str(&json).map_err(|_| AppError::store("总结运行状态损坏。"))?;
+            if matches!(
+                run.state,
+                SummaryRunState::Running | SummaryRunState::Cancelling
+            ) {
+                run.state = SummaryRunState::Failed;
+                run.finished_at_unix_ms = Some(now_ms() as i64);
+                run.error = Some(AppError::codex(
+                    codexflow_domain::ErrorCode::AnalysisUnavailable,
+                    "上次总结运行因应用退出而中断；旧总结已保留。",
+                    true,
+                ));
+                interrupted.push(run);
+            }
+        }
+        drop(query);
+        drop(connection);
+        for run in interrupted {
+            self.save_summary_run(&run)?;
+        }
+        Ok(())
     }
 
     pub fn thread(&self, thread_id: &str) -> Result<Option<ThreadMetadata>, AppError> {
@@ -1467,7 +1625,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 8;")
+            .execute_batch("PRAGMA user_version = 9;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -1478,7 +1636,37 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unfinished_summary_run_is_recovered_after_restart() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-summary-recovery-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let run = SummaryRun {
+            id: "summary-run".into(),
+            thread_id: "thread-h".into(),
+            state: SummaryRunState::Cancelling,
+            model: "model".into(),
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: None,
+            temporary_thread_id: Some("temporary".into()),
+            turn_id: Some("turn".into()),
+            reused_cache: false,
+            error: None,
+        };
+        store.save_summary_run(&run).unwrap();
+        drop(store);
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        let recovered = reopened.summary_run("summary-run").unwrap().unwrap();
+        assert_eq!(recovered.state, SummaryRunState::Failed);
+        assert!(recovered.finished_at_unix_ms.is_some());
+        assert!(recovered.error.is_some());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1716,7 +1904,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1777,7 +1965,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -1938,7 +2126,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (7, 1));
+        assert_eq!((version, count), (8, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -1971,7 +2159,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2074,7 +2262,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 7);
+            assert_eq!(version, 8);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

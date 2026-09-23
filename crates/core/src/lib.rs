@@ -1,6 +1,7 @@
 mod facts;
 mod projects;
 mod relations;
+mod summary;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
 use codexflow_domain::{
@@ -22,6 +23,7 @@ use std::{
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+pub use summary::SummaryAnalyzer;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -39,6 +41,8 @@ pub struct SourceService {
     jev_gate: RwLock<()>,
     jev_cancel: Mutex<CancellationToken>,
     refresh_active: std::sync::Mutex<Option<(String, CancellationToken)>>,
+    summary_active:
+        std::sync::Mutex<std::collections::HashMap<String, (String, CancellationToken)>>,
 }
 
 struct State {
@@ -73,6 +77,7 @@ impl SourceService {
             jev_gate: RwLock::new(()),
             jev_cancel: Mutex::new(CancellationToken::new()),
             refresh_active: std::sync::Mutex::new(None),
+            summary_active: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         service.reconcile_projects()?;
         Ok(service)
@@ -234,6 +239,9 @@ impl SourceService {
     }
 
     pub async fn connect(&self, selected_binary: Option<String>) -> Result<SourceStatus, AppError> {
+        for (_, token) in self.summary_active.lock().unwrap().values() {
+            token.cancel();
+        }
         let mut state = self.state.lock().await;
         let choice = selected_binary
             .map(|path| path.trim().to_owned())
@@ -272,6 +280,9 @@ impl SourceService {
 
     pub async fn shutdown(&self) {
         self.cancel_jev().await;
+        for (_, token) in self.summary_active.lock().unwrap().values() {
+            token.cancel();
+        }
         if let Some((_, token)) = self.refresh_active.lock().unwrap().as_ref() {
             token.cancel();
         }

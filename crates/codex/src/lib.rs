@@ -1,13 +1,16 @@
+mod analysis;
 mod history;
+pub use analysis::{analyze_summary, AnalysisEvent, AnalysisOutput};
 
 use codexflow_domain::{
     AppError, Capability, ErrorCode, GitMetadata, ListScopeStatus, SourceCapabilities,
     ThreadMetadata,
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -36,6 +39,15 @@ const SOURCES: [&str; 10] = [
     "unknown",
 ];
 static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+static ANALYSIS_THREADS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+fn analysis_threads() -> &'static StdMutex<HashSet<String>> {
+    ANALYSIS_THREADS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn exclude_analysis_thread(id: &str) {
+    analysis_threads().lock().unwrap().insert(id.to_owned());
+}
 
 pub struct Diagnosis {
     pub resolved_binary: String,
@@ -112,6 +124,13 @@ impl Session {
                         break;
                     }
                     if value.get("ephemeral").and_then(Value::as_bool) == Some(true) {
+                        continue;
+                    }
+                    if value
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| analysis_threads().lock().unwrap().contains(id))
+                    {
                         continue;
                     }
                     let Some(mut thread) = parse_thread(value, archived, observed_at_unix_ms)
@@ -488,6 +507,173 @@ mod tests {
         let mut session = diagnosis.session;
         session.close().await;
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_summary_requires_schema_and_completed_turn() {
+        let path = fake_binary("analysis-ok");
+        let mut events = Vec::new();
+        let output = analyze_summary(
+            Some(path.to_str().unwrap()),
+            "受控摘要".into(),
+            CancellationToken::new(),
+            |event| {
+                events.push(event);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(output.model, "test-model");
+        assert!(output.text.contains("实现测试"));
+        assert!(events.iter().any(
+            |event| matches!(event, AnalysisEvent::Thread(id) if id == "temporary-analysis-thread")
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, AnalysisEvent::Turn(id) if id == "temporary-analysis-turn")
+        ));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn interrupt_uses_temporary_ids_and_rejects_late_completion() {
+        for mode in ["analysis-cancel", "analysis-late"] {
+            let path = fake_binary(mode);
+            let token = CancellationToken::new();
+            let trigger = token.clone();
+            let result = analyze_summary(
+                Some(path.to_str().unwrap()),
+                "受控摘要".into(),
+                token,
+                |event| {
+                    if matches!(event, AnalysisEvent::Turn(_)) {
+                        trigger.cancel();
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(AppError {
+                    code: ErrorCode::AnalysisCancelled,
+                    ..
+                })
+            ));
+            let _ = fs::remove_dir_all(path.parent().unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_activity_fails_closed() {
+        let path = fake_binary("analysis-tool");
+        let result = analyze_summary(
+            Some(path.to_str().unwrap()),
+            "受控摘要".into(),
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError {
+                code: ErrorCode::AnalysisUnavailable,
+                ..
+            })
+        ));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn temporary_id_is_excluded_even_if_a_source_lists_it_as_regular() {
+        let path = fake_binary("analysis-list-pollution");
+        analyze_summary(
+            Some(path.to_str().unwrap()),
+            "受控摘要".into(),
+            CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+        let mut session = Session::start(&path).await.unwrap();
+        session.initialize(false).await.unwrap();
+        let collection = session.collect_threads(300_000).await;
+        assert_eq!(collection.threads.len(), 1);
+        assert_eq!(collection.threads[0].id, "thread-h");
+        session.close().await;
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "手动受控真实 Codex 冒烟，会调用模型"]
+    async fn real_ephemeral_summary_does_not_enter_regular_history() {
+        let token = CancellationToken::new();
+        let stop = token.clone();
+        let mut temporary_id = None;
+        let output = tokio::time::timeout(Duration::from_secs(180), analyze_summary(
+            None,
+            "仅使用此合成材料填写五个总结字段，evidenceIds 填空数组：目标是检查摘要接口；活动是阅读本句；结果是完成检查；决定和问题均为未知。禁止使用工具。".into(),
+            token,
+            |event| { if let AnalysisEvent::Thread(id) = event { temporary_id = Some(id); } Ok(()) },
+        )).await;
+        if output.is_err() {
+            stop.cancel();
+        }
+        let output = output.expect("真实分析超时").expect("真实临时分析失败");
+        let parsed: serde_json::Value = serde_json::from_str(&output.text).unwrap();
+        assert!(parsed["goal"].is_string());
+        let id = temporary_id.expect("临时会话标识");
+        let binary = resolve_binary(None).unwrap();
+        let mut regular = Session::start(&binary).await.unwrap();
+        regular.initialize(false).await.unwrap();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = json!({"limit":100,"sourceKinds":SOURCES,"archived":false});
+            if let Some(value) = &cursor {
+                params["cursor"] = json!(value);
+            }
+            let page = regular.request("thread/list", params).await.unwrap();
+            assert!(!page["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value["id"] == id));
+            cursor = page["nextCursor"].as_str().map(str::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        regular.close().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "手动受控真实 Codex 中断冒烟，会启动模型回合"]
+    async fn real_ephemeral_interrupt_reaches_terminal_state() {
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let mut terminal = None;
+        let result = analyze_summary(
+            None,
+            "这是一条合成的中断验证材料。请仅根据这句话填写总结字段。".into(),
+            cancel,
+            |event| {
+                match event {
+                    AnalysisEvent::Turn(_) => trigger.cancel(),
+                    AnalysisEvent::Terminal(status) => terminal = Some(status),
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError {
+                code: ErrorCode::AnalysisCancelled,
+                ..
+            })
+        ));
+        assert_eq!(terminal.as_deref(), Some("interrupted"));
     }
 
     #[tokio::test]
@@ -918,36 +1104,49 @@ impl ProbeError {
 
 pub struct Session {
     child: Child,
+    group: AuxiliaryGroup,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     // Keep read_until's partial bytes when its request future is cancelled.
     pending_line: Vec<u8>,
+    pending_events: VecDeque<Value>,
     next_id: u64,
 }
 
 impl Session {
     async fn start(binary: &Path) -> Result<Self, AppError> {
-        let mut child = Command::new(binary)
+        Self::start_with_home(binary, None).await
+    }
+
+    async fn start_with_home(binary: &Path, home: Option<&Path>) -> Result<Self, AppError> {
+        let mut command = Command::new(binary);
+        command
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|_| {
-                AppError::codex(
-                    ErrorCode::SpawnFailed,
-                    "启动 Codex app-server 失败。请检查二进制执行权限。",
-                    true,
-                )
-            })?;
+            .kill_on_drop(true);
+        if let Some(home) = home {
+            command.current_dir(home).env("CODEX_HOME", home);
+        }
+        AuxiliaryGroup::configure(&mut command);
+        let mut child = command.spawn().map_err(|_| {
+            AppError::codex(
+                ErrorCode::SpawnFailed,
+                "启动 Codex app-server 失败。请检查二进制执行权限。",
+                true,
+            )
+        })?;
+        let group = AuxiliaryGroup::for_child(&child);
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = BufReader::new(child.stdout.take().expect("piped stdout"));
         Ok(Self {
             child,
+            group,
             stdin,
             stdout,
             pending_line: Vec::new(),
+            pending_events: VecDeque::new(),
             next_id: 1,
         })
     }
@@ -997,6 +1196,16 @@ impl Session {
             let response: Value =
                 serde_json::from_str(line).map_err(|_| ProbeError::InvalidResponse)?;
             if response.get("id").and_then(Value::as_u64) != Some(id) {
+                if response.get("method").is_some() && response.get("id").is_some() {
+                    self.write(&json!({"id":response["id"],"error":{"code":-32000,"message":"CodexFlow does not approve server requests"}})).await?;
+                    return Err(ProbeError::InvalidResponse);
+                }
+                if response.get("method").is_some() {
+                    if self.pending_events.len() >= 512 {
+                        self.pending_events.pop_front();
+                    }
+                    self.pending_events.push_back(response);
+                }
                 continue;
             }
             if let Some(error) = response.get("error") {
@@ -1022,6 +1231,7 @@ impl Session {
     }
 
     pub async fn close(&mut self) {
+        self.group.kill();
         let _ = self.child.start_kill();
         let _ = timeout(Duration::from_secs(3), self.child.wait()).await;
     }

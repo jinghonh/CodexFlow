@@ -28,6 +28,8 @@ if sys.argv[1:] != ["app-server"]:
 
 initialized = False
 list_requests = 0
+analysis_thread = "temporary-analysis-thread"
+analysis_turn = "temporary-analysis-turn"
 
 def thread(thread_id, source, archived=False):
     return {
@@ -89,6 +91,13 @@ for line in sys.stdin:
             sys.stdout.write(encoded[split:] + "\n")
             sys.stdout.flush()
             continue
+        if mode.startswith("fake-analysis-"):
+            data = [thread("thread-h", "cli")]
+            if mode.endswith("list-pollution"):
+                data.append(thread(analysis_thread, "appServer"))
+            response = {"id": request["id"], "result": {"data": data if not request["params"]["archived"] else [], "nextCursor": None}}
+            print(json.dumps(response), flush=True)
+            continue
         if mode.endswith("cancel-partial"):
             response = {"id": request["id"], "result": {"marker": f"request-{list_requests}", "data": [], "nextCursor": None}}
             print(json.dumps(response), flush=True)
@@ -129,7 +138,7 @@ for line in sys.stdin:
             response = {"id": request["id"], "result": {"data": data, "nextCursor": next_cursor}}
         else:
             response = {"id": request["id"], "result": {"data": [], "nextCursor": None}}
-    elif mode.startswith("fake-history-") and method in ("thread/read", "thread/turns/list", "thread/items/list") and request["params"]["threadId"] != "00000000-0000-4000-8000-000000000000":
+    elif (mode.startswith("fake-history-") or mode.startswith("fake-analysis-")) and method in ("thread/read", "thread/turns/list", "thread/items/list") and request["params"]["threadId"] != "00000000-0000-4000-8000-000000000000":
         params = request["params"]
         thread_id = params["threadId"]
         if method == "thread/read" and params.get("includeTurns") is False:
@@ -171,6 +180,36 @@ for line in sys.stdin:
                                    history_turn("turn-2", [history_item("item-1" if mode.endswith("duplicate-legacy") else "item-2")])]
             assert params["includeTurns"] is True
             response = {"id": request["id"], "result": {"thread": legacy}}
+    elif mode.startswith("fake-analysis-") and method == "thread/start":
+        assert request["params"]["ephemeral"] is True
+        assert request["params"]["sandbox"] == "read-only"
+        assert request["params"]["approvalPolicy"] == "never"
+        assert pathlib.Path(os.environ["CODEX_HOME"]) != pathlib.Path.home() / ".codex"
+        response = {"id": request["id"], "result": {"thread": {"id": analysis_thread, "ephemeral": True}, "sandbox": {"type":"readOnly","networkAccess":False}, "approvalPolicy": "never", "model": "test-model"}}
+    elif mode.startswith("fake-analysis-") and method == "turn/start":
+        assert request["params"]["threadId"] == analysis_thread
+        assert request["params"]["outputSchema"]["required"] == ["goal", "activity", "outcome", "decisions", "issues", "evidenceIds"]
+        response = {"id": request["id"], "result": {"turn": {"id": analysis_turn, "status": "inProgress", "items": []}}}
+        print(json.dumps(response), flush=True)
+        if mode.endswith(("cancel", "late")):
+            continue
+        if mode.endswith("tool"):
+            print(json.dumps({"method":"item/started","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"commandExecution","id":"cmd-1"}}}), flush=True)
+            continue
+        content = "{}" if mode.endswith("invalid") else json.dumps({"goal":"实现测试", "activity":"运行检查", "outcome":"通过", "decisions":"采用临时会话", "issues":"未知", "evidenceIds":["hallucinated" if mode.endswith("bad-evidence") else "item:turn-1:item-1"]}, ensure_ascii=False)
+        print(json.dumps({"method":"item/completed","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"agentMessage","id":"msg-1","phase":"final_answer","text":content}}}), flush=True)
+        print(json.dumps({"method":"turn/completed","params":{"threadId":analysis_thread,"turn":{"id":analysis_turn,"status":"completed","items":[]}}}), flush=True)
+        continue
+    elif mode.startswith("fake-analysis-") and method == "turn/interrupt":
+        assert request["params"] == {"threadId":analysis_thread,"turnId":analysis_turn}
+        print(json.dumps({"id":request["id"],"result":{}}), flush=True)
+        if mode.endswith("late"):
+            print(json.dumps({"method":"item/completed","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"agentMessage","id":"late","phase":"final_answer","text":json.dumps({"goal":"迟到","activity":"迟到","outcome":"迟到","decisions":"迟到","issues":"迟到","evidenceIds":["item:turn-1:item-1"]},ensure_ascii=False)}}}), flush=True)
+            state = "completed"
+        else:
+            state = "interrupted"
+        print(json.dumps({"method":"turn/completed","params":{"threadId":analysis_thread,"turn":{"id":analysis_turn,"status":state,"items":[]}}}), flush=True)
+        continue
     elif method in ("thread/read", "thread/turns/list", "thread/items/list"):
         thread_id = request["params"]["threadId"]
         if thread_id == "thread-b":

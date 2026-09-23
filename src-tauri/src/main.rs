@@ -3,7 +3,7 @@ use codexflow_domain::{
     AppError, DisplayTheme, EvidenceCheck, EvidencePage, FactPage, HistoryCoverage,
     HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, JevConnectionResult,
     JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph, ProjectSessions, ProjectTimeline,
-    SessionList, SourceStatus,
+    SessionList, SourceStatus, SummaryPreview, SummaryRun,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -102,6 +102,49 @@ async fn load_thread_history(
     thread_id: String,
 ) -> Result<HistoryCoverage, AppError> {
     service(&state)?.load_thread_history(&thread_id).await
+}
+
+#[tauri::command]
+async fn get_summary_preview(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+) -> Result<SummaryPreview, AppError> {
+    service(&state)?.summary_preview(&thread_id).await
+}
+
+#[tauri::command]
+async fn start_thread_summary(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+) -> Result<SummaryRun, AppError> {
+    service(&state)?
+        .clone()
+        .start_thread_summary(thread_id)
+        .await
+}
+
+#[tauri::command]
+fn get_latest_summary_run(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+) -> Result<Option<SummaryRun>, AppError> {
+    service(&state)?.latest_summary_run(&thread_id)
+}
+
+#[tauri::command]
+fn get_summary_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<Option<SummaryRun>, AppError> {
+    service(&state)?.summary_run(&run_id)
+}
+
+#[tauri::command]
+fn cancel_summary_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<SummaryRun, AppError> {
+    service(&state)?.cancel_summary_run(&run_id)
 }
 
 #[tauri::command]
@@ -262,6 +305,11 @@ fn main() {
             cancel_jev_request,
             get_session_list,
             load_thread_history,
+            get_summary_preview,
+            start_thread_summary,
+            get_latest_summary_run,
+            get_summary_run,
+            cancel_summary_run,
             get_history_turns,
             get_history_items,
             locate_history_item,

@@ -268,3 +268,11 @@ button:disabled { cursor: wait; opacity: .6; }
 .timeline-open { padding: 7px 10px; margin-top: 10px; }
 .timeline-note { margin: 12px 0 0; line-height: 1.7; color: var(--muted); font-size: 10px; }
 @media (max-width: 1000px) { .timeline-heading { flex-direction: column; gap: 2px; } .timeline-controls { margin-bottom: 12px; } }
+.thread-summary { margin: 1.2rem 0; padding: 1rem; border: 1px solid var(--line, #ddd); border-radius: 12px; }
+.thread-summary .history-heading { align-items: flex-start; gap: 1rem; }
+.summary-actions { display: flex; gap: .5rem; flex-wrap: wrap; }
+.summary-coverage { display: flex; gap: .4rem 1rem; flex-wrap: wrap; margin: .8rem 0; font-size: .88rem; }
+.summary-coverage em { color: #aa5b16; font-style: normal; }
+.summary-fields { display: grid; gap: .8rem; margin-top: 1rem; }
+.summary-fields > div { border-top: 1px solid var(--line, #ddd); padding-top: .6rem; }
+.summary-fields p { margin: .25rem 0 0; white-space: pre-wrap; }
