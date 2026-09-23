@@ -62,6 +62,38 @@ function snapshotWithTimeline(base: DashboardSnapshot = snapshot): DashboardSnap
 }
 
 describe("Dashboard conversation list", () => {
+  it("opens the system directory picker and remembers the selected project", async () => {
+    const user = userEvent.setup();
+    const api = apiDouble({ pickProjectDirectory: vi.fn().mockResolvedValue({ path: "/projects/codexflow" }) });
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "选择目录…" }));
+    await waitFor(() => expect(api.selectProject).toHaveBeenCalledWith("/projects/codexflow"));
+    expect(await screen.findByRole("table", { name: "任务列表" })).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("codexflow.recent-projects.v1")!)).toEqual(["/projects/codexflow"]);
+    expect(screen.getByLabelText("最近项目")).toHaveTextContent("/projects/codexflow");
+  });
+
+  it("opens the directory picker from Load Project when no path is entered", async () => {
+    const user = userEvent.setup();
+    const api = apiDouble({ pickProjectDirectory: vi.fn().mockResolvedValue({ path: "/projects/codexflow" }) });
+    render(<App api={api} />);
+
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await waitFor(() => expect(api.pickProjectDirectory).toHaveBeenCalledOnce());
+    await waitFor(() => expect(api.selectProject).toHaveBeenCalledWith("/projects/codexflow"));
+  });
+
+  it("automatically restores the last project on a new visit", async () => {
+    localStorage.setItem("codexflow.recent-projects.v1", JSON.stringify(["/projects/codexflow"]));
+    const api = apiDouble();
+    render(<App api={api} />);
+
+    await waitFor(() => expect(api.selectProject).toHaveBeenCalledWith("/projects/codexflow"));
+    expect(await screen.findByRole("table", { name: "任务列表" })).toBeInTheDocument();
+    expect(screen.getByLabelText("项目目录")).toHaveValue("/projects/codexflow");
+  });
+
   it("shows loading, then active and archived source metadata after project selection", async () => {
     const user = userEvent.setup();
     let finishSelection: ((value: { project: ProjectView; source: HealthResponse["source"] }) => void) | undefined;
@@ -71,17 +103,17 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ selectProject: vi.fn().mockReturnValue(selectionPending) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    expect(screen.getByRole("status")).toHaveTextContent("Loading conversations");
+    expect(screen.getByRole("status")).toHaveTextContent("正在加载任务");
     finishSelection?.({ project, source: health.source });
-    const conversationList = within(await screen.findByRole("table", { name: "Conversation list" }));
+    const conversationList = within(await screen.findByRole("table", { name: "任务列表" }));
 
     expect(conversationList.getByText("active-id")).toBeInTheDocument();
     expect(conversationList.getByText("archived-id")).toBeInTheDocument();
-    expect(conversationList.getByText("Archived")).toBeInTheDocument();
+    expect(conversationList.getByText("已归档")).toBeInTheDocument();
     expect(conversationList.getByText("vscode")).toBeInTheDocument();
     expect(screen.getAllByText("/projects/codexflow").length).toBeGreaterThan(0);
     expect(api.selectProject).toHaveBeenCalledWith("/projects/codexflow");
@@ -101,12 +133,12 @@ describe("Dashboard conversation list", () => {
     });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
     const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("Source unavailable");
+    expect(alert).toHaveTextContent("来源不可用");
     expect(alert).toHaveTextContent("fixture app-server failed");
   });
 
@@ -115,13 +147,13 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble();
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const conversationList = within(await screen.findByRole("table", { name: "Conversation list" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const conversationList = within(await screen.findByRole("table", { name: "任务列表" }));
     await user.click(conversationList.getByText("Map the local runtime"));
 
-    await waitFor(() => expect(screen.getByRole("region", { name: "Conversation detail" })).toHaveTextContent("active-id"));
+    await waitFor(() => expect(screen.getByRole("region", { name: "任务详情" })).toHaveTextContent("active-id"));
   });
 
   it("keeps the last complete list visible while marking the source stale", async () => {
@@ -142,12 +174,12 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(staleSnapshot) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    expect(await screen.findByText("Source stale")).toBeInTheDocument();
-    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("Map the local runtime")).toBeInTheDocument();
+    expect(await screen.findByText("来源数据已过期")).toBeInTheDocument();
+    expect(within(screen.getByRole("table", { name: "任务列表" })).getByText("Map the local runtime")).toBeInTheDocument();
   });
 
   it("shows a stale marker after a refresh failure while retaining the previous views", async () => {
@@ -169,14 +201,14 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
 
-    expect(await screen.findByText("Source stale")).toBeInTheDocument();
-    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Conversation graph" })).toBeInTheDocument();
+    expect(await screen.findByText("来源数据已过期")).toBeInTheDocument();
+    expect(within(screen.getByRole("table", { name: "任务列表" })).getByText("active-id")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "任务关系图" })).toBeInTheDocument();
     expect(refresh).toHaveBeenCalledWith();
   });
 
@@ -193,18 +225,18 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
 
     const refreshAlert = await screen.findByRole("alert");
-    expect(refreshAlert).toHaveTextContent("Refresh failed · Error category: source_unavailable. The source could not be reached.");
-    expect(refreshAlert).toHaveTextContent("The last complete snapshot is preserved.");
-    expect(refreshAlert).toHaveTextContent("Retryable: yes.");
-    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Conversation graph" })).toBeInTheDocument();
-    expect(screen.getByRole("region", { name: "Conversation timeline" })).toBeInTheDocument();
+    expect(refreshAlert).toHaveTextContent("刷新失败 · 错误类别： source_unavailable. The source could not be reached.");
+    expect(refreshAlert).toHaveTextContent("已保留上次完整快照。");
+    expect(refreshAlert).toHaveTextContent("可重试：是。");
+    expect(within(screen.getByRole("table", { name: "任务列表" })).getByText("active-id")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "任务关系图" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "任务时间线" })).toBeInTheDocument();
   });
 
   it("can retry the source from a selected Project after the initial load is unavailable", async () => {
@@ -221,15 +253,15 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ snapshot: snapshotRequest, refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    expect(await screen.findByText("Source unavailable")).toBeInTheDocument();
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    expect(await screen.findByText("来源不可用")).toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
 
     await waitFor(() => expect(refresh).toHaveBeenCalledWith());
-    expect(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
+    expect(within(await screen.findByRole("table", { name: "任务列表" })).getByText("active-id")).toBeInTheDocument();
   });
 
   it("keeps a conversation with an invalid observation range visible with a warning", async () => {
@@ -249,15 +281,15 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(invalidSnapshot) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    expect(await screen.findByText("Invalid observation range")).toBeInTheDocument();
+    expect(await screen.findByText("无效的观测区间")).toBeInTheDocument();
     expect(screen.getByText("Needs time review")).toBeInTheDocument();
   });
 
-  it("explains source conversations excluded by the selected Project boundary", async () => {
+  it("keeps excluded source conversations out of the workspace without showing a boundary panel", async () => {
     const user = userEvent.setup();
     const excludedSnapshot: DashboardSnapshot = {
       ...snapshot,
@@ -275,16 +307,13 @@ describe("Dashboard conversation list", () => {
     const api = httpApiDouble(excludedSnapshot);
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const membership = await screen.findByRole("region", { name: "Project membership" });
-    expect(membership).toHaveTextContent("1 conversation excluded");
-    expect(membership).toHaveTextContent("/projects/other");
-    expect(membership).toHaveTextContent("Outside the selected Project");
-    expect(membership).toHaveTextContent("nested Git repositories are excluded");
-    expect(membership).not.toHaveTextContent("its Git worktree");
+    expect(await screen.findByRole("table", { name: "任务列表" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "项目归属" })).not.toBeInTheDocument();
+    expect(screen.queryByText("/projects/other")).not.toBeInTheDocument();
   });
 
   it("refreshes the source while preserving selection and filters and discovers new conversations", async () => {
@@ -315,23 +344,24 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(initialSnapshot), refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const list = within(await screen.findByRole("table", { name: "Conversation list" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const list = within(await screen.findByRole("table", { name: "任务列表" }));
     await user.click(list.getByText("Archive the first pass"));
-    const filters = screen.getByRole("region", { name: "Conversation filters" });
-    await user.selectOptions(within(filters).getByLabelText("Filter by archived"), "archived");
+    const filters = screen.getByRole("region", { name: "任务筛选" });
+    expect(within(screen.getByRole("region", { name: "任务列表" })).getByRole("region", { name: "任务筛选" })).toBe(filters);
+    await user.selectOptions(within(filters).getByLabelText("归档状态"), "archived");
 
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
 
     await waitFor(() => expect(refresh).toHaveBeenCalledWith({ granularity: "day", timezone: "UTC" }));
-    expect(within(screen.getByRole("region", { name: "Conversation filters" })).getByLabelText("Filter by archived")).toHaveValue("archived");
-    const refreshedList = within(screen.getByRole("table", { name: "Conversation list" }));
+    expect(within(screen.getByRole("region", { name: "任务筛选" })).getByLabelText("归档状态")).toHaveValue("archived");
+    const refreshedList = within(screen.getByRole("table", { name: "任务列表" }));
     expect(refreshedList.getByText("new-archived-id")).toBeInTheDocument();
     expect(refreshedList.queryByText("active-id")).not.toBeInTheDocument();
     expect(refreshedList.getByText("archived-id").closest("tr")).toHaveAttribute("aria-selected", "true");
-    expect(screen.getByRole("region", { name: "Relationship editor" })).toHaveTextContent("No artificial relationships yet.");
+    expect(screen.getByRole("region", { name: "关系编辑器" })).toHaveTextContent("还没有人工关系，可从选中任务开始建立。");
   });
 
   it("requires a decision for a dirty detail draft and keeps cancel non-destructive", async () => {
@@ -340,20 +370,20 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    const titleInput = within(detail).getByLabelText("Custom title");
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    const titleInput = within(detail).getByLabelText("自定义标题");
     await user.type(titleInput, "Draft title");
 
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
-    const dialog = await screen.findByRole("dialog", { name: "Save your Graph changes first?" });
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
+    const dialog = await screen.findByRole("dialog", { name: "如何处理未保存的修改？" });
     expect(refresh).not.toHaveBeenCalled();
-    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await user.click(within(dialog).getByRole("button", { name: "取消" }));
 
-    expect(screen.queryByRole("dialog", { name: "Save your Graph changes first?" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "如何处理未保存的修改？" })).not.toBeInTheDocument();
     expect(titleInput).toHaveValue("Draft title");
     expect(refresh).not.toHaveBeenCalled();
   });
@@ -365,20 +395,20 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ refresh, updateNode });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    await user.type(within(detail).getByLabelText("Custom title"), "Discard me");
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    await user.type(within(detail).getByLabelText("自定义标题"), "Discard me");
 
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
-    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Discard changes & refresh" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "丢弃修改并刷新" }));
 
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
     expect(updateNode).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(within(await screen.findByRole("region", { name: "Conversation detail" })).getByLabelText("Custom title")).toHaveValue("");
+    expect(within(await screen.findByRole("region", { name: "任务详情" })).getByLabelText("自定义标题")).toHaveValue("");
   });
 
   it("keeps the dirty draft and decision dialog open when saving before refresh fails", async () => {
@@ -395,22 +425,22 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ updateNode, refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    const titleInput = within(detail).getByLabelText("Custom title");
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    const titleInput = within(detail).getByLabelText("自定义标题");
     await user.type(titleInput, "Keep this draft");
 
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
-    const dialog = await screen.findByRole("dialog", { name: "Save your Graph changes first?" });
-    await user.click(within(dialog).getByRole("button", { name: "Save changes & refresh" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
+    const dialog = await screen.findByRole("dialog", { name: "如何处理未保存的修改？" });
+    await user.click(within(dialog).getByRole("button", { name: "保存并刷新" }));
 
-    await waitFor(() => expect(within(dialog).getByRole("alert")).toHaveTextContent("Your draft is still dirty."));
+    await waitFor(() => expect(within(dialog).getByRole("alert")).toHaveTextContent("修改仍保留，尚未保存。"));
     expect(refresh).not.toHaveBeenCalled();
     expect(titleInput).toHaveValue("Keep this draft");
-    expect(screen.getByRole("button", { name: "Refresh source" })).toHaveTextContent("Refresh source");
+    expect(screen.getByRole("button", { name: "刷新来源" })).toHaveTextContent("刷新来源");
   });
 
   it("saves the dirty draft before refreshing and clears the dirty state", async () => {
@@ -433,15 +463,15 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ updateNode, refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    await user.type(within(detail).getByLabelText("Custom title"), "Saved title");
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    await user.type(within(detail).getByLabelText("自定义标题"), "Saved title");
 
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
-    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "Save changes & refresh" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: "保存并刷新" }));
 
     await waitFor(() => expect(updateNode).toHaveBeenCalledWith(
       "active-id",
@@ -456,7 +486,7 @@ describe("Dashboard conversation list", () => {
     ));
     await waitFor(() => expect(refresh).toHaveBeenCalledWith());
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
-    expect(screen.getByText("Source sync ready")).toBeInTheDocument();
+    expect(screen.getByText("来源同步就绪")).toBeInTheDocument();
   });
 
   it("protects an unsaved relationship draft during refresh", async () => {
@@ -466,21 +496,21 @@ describe("Dashboard conversation list", () => {
     const api = apiDouble({ refresh, createEdge });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const editor = await screen.findByRole("region", { name: "Relationship editor" });
-    const sourceInput = within(editor).getByLabelText("Source");
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const editor = await screen.findByRole("region", { name: "关系编辑器" });
+    const sourceInput = within(editor).getByLabelText("来源");
     await user.type(sourceInput, "active-id");
 
-    await user.click(screen.getByRole("button", { name: "Refresh source" }));
+    await user.click(screen.getByRole("button", { name: "刷新来源" }));
     const dialog = await screen.findByRole("dialog");
-    expect(dialog).toHaveTextContent("One unsaved Graph draft is open");
-    await user.click(within(dialog).getByRole("button", { name: "Discard changes & refresh" }));
+    expect(dialog).toHaveTextContent("共 1 项未保存修改");
+    await user.click(within(dialog).getByRole("button", { name: "丢弃修改并刷新" }));
 
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
     expect(createEdge).not.toHaveBeenCalled();
-    expect(within(await screen.findByRole("region", { name: "Relationship editor" })).getByLabelText("Source")).toHaveValue("");
+    expect(within(await screen.findByRole("region", { name: "关系编辑器" })).getByLabelText("来源")).toHaveValue("");
   });
 });
 
@@ -519,20 +549,20 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ updateNode });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
 
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    await user.clear(within(detail).getByLabelText("Custom title"));
-    await user.type(within(detail).getByLabelText("Custom title"), "Local title");
-    await user.clear(within(detail).getByLabelText("Tags"));
-    await user.type(within(detail).getByLabelText("Tags"), "alpha, beta");
-    await user.selectOptions(within(detail).getByLabelText("User status"), "done");
-    await user.type(within(detail).getByLabelText("Note"), "Need this context");
-    await user.click(within(detail).getByLabelText("Hidden from Graph"));
-    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    await user.clear(within(detail).getByLabelText("自定义标题"));
+    await user.type(within(detail).getByLabelText("自定义标题"), "Local title");
+    await user.clear(within(detail).getByLabelText("标签"));
+    await user.type(within(detail).getByLabelText("标签"), "alpha, beta");
+    await user.selectOptions(within(detail).getByLabelText("任务状态"), "done");
+    await user.type(within(detail).getByLabelText("备注"), "Need this context");
+    await user.click(within(detail).getByLabelText("在关系图中隐藏"));
+    await user.click(within(detail).getByRole("button", { name: "保存修改" }));
 
     expect(updateNode).toHaveBeenCalledWith(
       "active-id",
@@ -545,11 +575,11 @@ describe("Dashboard graph", () => {
       },
       "absent",
     );
-    await waitFor(() => expect(screen.getByText("Changes saved")).toBeInTheDocument());
-    expect(within(detail).getByLabelText("Custom title")).toHaveValue("Local title");
-    expect(within(detail).getByLabelText("Tags")).toHaveValue("alpha, beta");
-    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
-    expect(within(screen.getByRole("region", { name: "Conversation graph" })).queryByRole("button", { name: /Map the local runtime/ })).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByText("修改已保存")).toBeInTheDocument());
+    expect(within(detail).getByLabelText("自定义标题")).toHaveValue("Local title");
+    expect(within(detail).getByLabelText("标签")).toHaveValue("alpha, beta");
+    expect(within(screen.getByRole("table", { name: "任务列表" })).getByText("active-id")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "任务关系图" })).queryByRole("button", { name: /Map the local runtime/ })).not.toBeInTheDocument();
   });
 
   it("keeps unsaved form values and explains a failed metadata update", async () => {
@@ -565,20 +595,20 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ updateNode });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
 
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    const titleInput = within(detail).getByLabelText("Custom title");
-    const noteInput = within(detail).getByLabelText("Note");
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    const titleInput = within(detail).getByLabelText("自定义标题");
+    const noteInput = within(detail).getByLabelText("备注");
     await user.type(titleInput, "Draft title");
     await user.type(noteInput, "Draft note");
-    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+    await user.click(within(detail).getByRole("button", { name: "保存修改" }));
 
     const alert = await within(detail).findByRole("alert");
-    expect(alert).toHaveTextContent("Could not save changes");
+    expect(alert).toHaveTextContent("无法保存修改");
     expect(alert).toHaveTextContent("The Graph changed elsewhere; reload before saving.");
     expect(titleInput).toHaveValue("Draft title");
     expect(noteInput).toHaveValue("Draft note");
@@ -602,30 +632,30 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ updateNode, refresh, saveCopy });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
 
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    await user.type(within(detail).getByLabelText("Custom title"), "Draft title");
-    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    await user.type(within(detail).getByLabelText("自定义标题"), "Draft title");
+    await user.click(within(detail).getByRole("button", { name: "保存修改" }));
 
-    const conflict = await screen.findByRole("alert", { name: "Graph conflict" });
+    const conflict = await screen.findByRole("alert", { name: "关系数据冲突" });
     expect(conflict).toHaveTextContent("The Graph changed elsewhere; reload before saving.");
     expect(conflict).toHaveTextContent("draft-etag");
     expect(conflict).toHaveTextContent("external-etag");
-    expect(within(detail).getByLabelText("Custom title")).toHaveValue("Draft title");
-    expect(within(conflict).getByRole("button", { name: "Discard all drafts & reload Graph" })).toBeInTheDocument();
-    expect(within(conflict).getByRole("button", { name: "Save a copy" })).toBeInTheDocument();
-    expect(within(conflict).getByRole("button", { name: "Overwrite explicitly" })).toBeInTheDocument();
+    expect(within(detail).getByLabelText("自定义标题")).toHaveValue("Draft title");
+    expect(within(conflict).getByRole("button", { name: "丢弃全部修改并重新加载" })).toBeInTheDocument();
+    expect(within(conflict).getByRole("button", { name: "保存副本" })).toBeInTheDocument();
+    expect(within(conflict).getByRole("button", { name: "覆盖保存" })).toBeInTheDocument();
 
-    await user.click(within(conflict).getByRole("button", { name: "Save a copy" }));
+    await user.click(within(conflict).getByRole("button", { name: "保存副本" }));
     await waitFor(() => expect(saveCopy).toHaveBeenCalled());
     expect(saveCopy.mock.calls[0][0].nodes["active-id"].title).toBe("Draft title");
     expect(conflict).toHaveTextContent("graph.yaml.copy.fixture");
 
-    await user.click(within(conflict).getByRole("button", { name: "Overwrite explicitly" }));
+    await user.click(within(conflict).getByRole("button", { name: "覆盖保存" }));
     await waitFor(() => expect(updateNode).toHaveBeenCalledTimes(2));
     expect(updateNode.mock.calls[1][2]).toBe("*");
     expect(updateNode.mock.calls[1][3]).toBe(true);
@@ -641,15 +671,15 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(futureSnapshot) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const notice = await screen.findByRole("status", { name: "Graph overlay status" });
-    expect(notice).toHaveTextContent("read-only");
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const notice = await screen.findByRole("status", { name: "关系数据状态" });
+    expect(notice).toHaveTextContent("只读");
 
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    expect(within(detail).getByRole("button", { name: "Save changes" })).toBeDisabled();
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    expect(within(detail).getByRole("button", { name: "保存修改" })).toBeDisabled();
   });
 
   it("keeps a structured disk-full error visible in the detail editor", async () => {
@@ -665,18 +695,18 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ updateNode });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    await user.type(within(detail).getByLabelText("Custom title"), "Draft title");
-    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    await user.type(within(detail).getByLabelText("自定义标题"), "Draft title");
+    await user.click(within(detail).getByRole("button", { name: "保存修改" }));
 
     const alert = await within(detail).findByRole("alert");
     expect(alert).toHaveTextContent("graph_write_error");
     expect(alert).toHaveTextContent("disk full");
-    expect(within(detail).getByLabelText("Custom title")).toHaveValue("Draft title");
+    expect(within(detail).getByLabelText("自定义标题")).toHaveValue("Draft title");
   });
 
   it("offers an explicit migration action for a legacy Graph version", async () => {
@@ -696,11 +726,11 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(legacySnapshot), migrateGraph });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const notice = await screen.findByRole("status", { name: "Graph overlay status" });
-    await user.click(within(notice).getByRole("button", { name: "Migrate with backup" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const notice = await screen.findByRole("status", { name: "关系数据状态" });
+    await user.click(within(notice).getByRole("button", { name: "备份并迁移" }));
 
     await waitFor(() => expect(migrateGraph).toHaveBeenCalledWith("absent"));
     expect(await screen.findByText(/graph.yaml.bak.fixture/)).toBeInTheDocument();
@@ -733,20 +763,20 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ updateNode, refresh });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    await user.click(within(await screen.findByRole("table", { name: "Conversation list" })).getByText("Map the local runtime"));
-    const detail = await screen.findByRole("region", { name: "Conversation detail" });
-    await user.type(within(detail).getByLabelText("Custom title"), "Local draft");
-    await user.click(within(detail).getByRole("button", { name: "Save changes" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    await user.click(within(await screen.findByRole("table", { name: "任务列表" })).getByText("Map the local runtime"));
+    const detail = await screen.findByRole("region", { name: "任务详情" });
+    await user.type(within(detail).getByLabelText("自定义标题"), "Local draft");
+    await user.click(within(detail).getByRole("button", { name: "保存修改" }));
 
-    const conflict = await screen.findByRole("alert", { name: "Graph conflict" });
-    await user.click(within(conflict).getByRole("button", { name: "Discard all drafts & reload Graph" }));
+    const conflict = await screen.findByRole("alert", { name: "关系数据冲突" });
+    await user.click(within(conflict).getByRole("button", { name: "丢弃全部修改并重新加载" }));
 
     await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
-    expect(screen.queryByRole("alert", { name: "Graph conflict" })).not.toBeInTheDocument();
-    expect(within(await screen.findByRole("region", { name: "Conversation detail" })).getByLabelText("Custom title")).toHaveValue("External title");
+    expect(screen.queryByRole("alert", { name: "关系数据冲突" })).not.toBeInTheDocument();
+    expect(within(await screen.findByRole("region", { name: "任务详情" })).getByLabelText("自定义标题")).toHaveValue("External title");
   });
 
   it("routes a migration conflict through the same explicit resolution actions", async () => {
@@ -776,16 +806,16 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(legacySnapshot), migrateGraph });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const notice = await screen.findByRole("status", { name: "Graph overlay status" });
-    await user.click(within(notice).getByRole("button", { name: "Migrate with backup" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const notice = await screen.findByRole("status", { name: "关系数据状态" });
+    await user.click(within(notice).getByRole("button", { name: "备份并迁移" }));
 
-    const conflict = await screen.findByRole("alert", { name: "Graph conflict" });
+    const conflict = await screen.findByRole("alert", { name: "关系数据冲突" });
     expect(conflict).toHaveTextContent("legacy-etag");
     expect(conflict).toHaveTextContent("external-etag");
-    await user.click(within(conflict).getByRole("button", { name: "Overwrite explicitly" }));
+    await user.click(within(conflict).getByRole("button", { name: "覆盖保存" }));
 
     await waitFor(() => expect(migrateGraph).toHaveBeenCalledWith("*", true));
     expect(await screen.findByText(/graph.yaml.bak.fixture/)).toBeInTheDocument();
@@ -797,17 +827,18 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ updateNode });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const graph = await screen.findByRole("region", { name: "Conversation graph" });
-    const canvas = within(graph).getByRole("application", { name: "Graph canvas" });
+    const graph = await screen.findByRole("region", { name: "任务关系图" });
+    const canvas = within(graph).getByRole("application", { name: "关系画布" });
     const node = within(graph).getByRole("button", { name: /Map the local runtime/ });
-    fireEvent.mouseDown(node, { clientX: 50, clientY: 50, button: 0 });
-    fireEvent.mouseMove(canvas, { clientX: 90, clientY: 70 });
+    await user.click(screen.getByRole("button", { name: "手动布局" }));
+    fireEvent.pointerDown(node, { clientX: 50, clientY: 50, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 90, clientY: 70 });
     expect(updateNode).not.toHaveBeenCalled();
-    fireEvent.mouseUp(canvas, { clientX: 90, clientY: 70 });
+    fireEvent.pointerUp(canvas, { clientX: 90, clientY: 70 });
 
     await waitFor(() => {
       expect(updateNode).toHaveBeenCalledWith(
@@ -824,16 +855,17 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ updateNode });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const graph = await screen.findByRole("region", { name: "Conversation graph" });
-    const canvas = within(graph).getByRole("application", { name: "Graph canvas" });
+    const graph = await screen.findByRole("region", { name: "任务关系图" });
+    const canvas = within(graph).getByRole("application", { name: "关系画布" });
     const node = within(graph).getByRole("button", { name: /Map the local runtime/ });
-    fireEvent.mouseDown(node, { clientX: 50, clientY: 50, button: 0 });
-    fireEvent.mouseMove(canvas, { clientX: 90, clientY: 70 });
-    fireEvent.mouseUp(canvas, { clientX: 90, clientY: 70 });
+    await user.click(screen.getByRole("button", { name: "手动布局" }));
+    fireEvent.pointerDown(node, { clientX: 50, clientY: 50, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 90, clientY: 70 });
+    fireEvent.pointerUp(canvas, { clientX: 90, clientY: 70 });
 
     expect(await within(graph).findByRole("alert")).toHaveTextContent("Graph is read-only.");
     expect(node).toHaveStyle({ left: "72px", top: "54px" });
@@ -891,30 +923,30 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(graphSnapshot) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const graph = await screen.findByRole("region", { name: "Conversation graph" });
-    const canvas = within(graph).getByRole("application", { name: "Graph canvas" });
+    const graph = await screen.findByRole("region", { name: "任务关系图" });
+    const canvas = within(graph).getByRole("application", { name: "关系画布" });
     expect(within(graph).getByRole("button", { name: /Map the local runtime/ })).toBeInTheDocument();
-    expect(within(graph).getByRole("button", { name: /Orphaned work/ })).toHaveTextContent("Missing source");
+    expect(within(graph).getByRole("button", { name: /Orphaned work/ })).toHaveTextContent("来源缺失");
     expect(canvas).toHaveAttribute("data-zoom", "1");
 
-    await user.click(within(graph).getByRole("button", { name: "Zoom in" }));
+    await user.click(within(graph).getByRole("button", { name: "放大" }));
     expect(canvas).toHaveAttribute("data-zoom", "1.1");
-    fireEvent.mouseDown(canvas, { clientX: 40, clientY: 40, button: 0 });
-    fireEvent.mouseMove(canvas, { clientX: 90, clientY: 70 });
-    fireEvent.mouseUp(canvas, { clientX: 90, clientY: 70 });
+    fireEvent.pointerDown(canvas, { clientX: 40, clientY: 40, button: 0 });
+    fireEvent.pointerMove(canvas, { clientX: 90, clientY: 70 });
+    fireEvent.pointerUp(canvas, { clientX: 90, clientY: 70 });
     expect(canvas).toHaveAttribute("data-pan-x", "50");
     expect(canvas).toHaveAttribute("data-pan-y", "30");
-    const edgeLines = graph.querySelectorAll("line");
+    const edgeLines = graph.querySelectorAll("path.graph-edge");
     expect(edgeLines[0]).toHaveAttribute("marker-end", "url(#graph-arrow)");
     expect(edgeLines[1]).not.toHaveAttribute("marker-end");
 
     await user.click(within(graph).getByRole("button", { name: /Orphaned work/ }));
     await waitFor(() => {
-      expect(screen.getByRole("region", { name: "Conversation detail" })).toHaveTextContent("missing-id");
+      expect(screen.getByRole("region", { name: "任务详情" })).toHaveTextContent("missing-id");
     });
   });
 
@@ -940,17 +972,17 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ createEdge });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const editor = await screen.findByRole("region", { name: "Relationship editor" });
-    await user.type(within(editor).getByLabelText("Source"), "active-id");
-    await user.type(within(editor).getByLabelText("Target"), "archived-id");
-    await user.selectOptions(within(editor).getByLabelText("Relationship type"), "__custom__");
-    await user.type(within(editor).getByLabelText("Custom type"), "informs");
-    await user.type(within(editor).getByLabelText(/Label/), "context handoff");
-    await user.click(within(editor).getByRole("button", { name: "Add relationship" }));
+    const editor = await screen.findByRole("region", { name: "关系编辑器" });
+    await user.type(within(editor).getByLabelText("来源"), "active-id");
+    await user.type(within(editor).getByLabelText("目标"), "archived-id");
+    await user.selectOptions(within(editor).getByLabelText("关系类型"), "__custom__");
+    await user.type(within(editor).getByLabelText("自定义类型"), "informs");
+    await user.type(within(editor).getByLabelText(/说明/), "context handoff");
+    await user.click(within(editor).getByRole("button", { name: "添加关系" }));
 
     expect(createEdge).toHaveBeenCalledWith(
       {
@@ -961,9 +993,9 @@ describe("Dashboard graph", () => {
       },
       "absent",
     );
-    expect(await within(editor).findByText("Relationship saved")).toBeInTheDocument();
+    expect(await within(editor).findByText("关系已保存")).toBeInTheDocument();
     const relationship = within(editor).getByRole("listitem", {
-      name: "Relationship active-id informs archived-id",
+      name: "关系 active-id informs archived-id",
     });
     expect(relationship).toHaveTextContent("Map the local runtime");
     expect(relationship).toHaveTextContent("Archive the first pass");
@@ -1014,19 +1046,19 @@ describe("Dashboard graph", () => {
     });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const editor = await screen.findByRole("region", { name: "Relationship editor" });
+    const editor = await screen.findByRole("region", { name: "关系编辑器" });
     const relationship = within(editor).getByRole("listitem", {
-      name: "Relationship active-id continues missing-id",
+      name: "关系 active-id continues missing-id",
     });
-    await user.click(within(relationship).getByRole("button", { name: "Edit relationship edge-1" }));
-    await user.selectOptions(within(editor).getByLabelText("Relationship type"), "fixes");
-    await user.clear(within(editor).getByLabelText(/Label/));
-    await user.type(within(editor).getByLabelText(/Label/), "repaired history");
-    await user.click(within(editor).getByRole("button", { name: "Save relationship" }));
+    await user.click(within(relationship).getByRole("button", { name: "编辑关系 edge-1" }));
+    await user.selectOptions(within(editor).getByLabelText("关系类型"), "fixes");
+    await user.clear(within(editor).getByLabelText(/说明/));
+    await user.type(within(editor).getByLabelText(/说明/), "repaired history");
+    await user.click(within(editor).getByRole("button", { name: "保存关系" }));
 
     expect(updateEdge).toHaveBeenCalledWith(
       "edge-1",
@@ -1039,16 +1071,16 @@ describe("Dashboard graph", () => {
       "edge-etag",
     );
     const updatedRelationship = await within(editor).findByRole("listitem", {
-      name: "Relationship active-id fixes missing-id",
+      name: "关系 active-id fixes missing-id",
     });
     expect(updatedRelationship).toHaveTextContent("edge-1");
     expect(updatedRelationship).toHaveTextContent("Orphaned work");
 
-    await user.click(within(updatedRelationship).getByRole("button", { name: "Delete relationship edge-1" }));
+    await user.click(within(updatedRelationship).getByRole("button", { name: "删除关系 edge-1" }));
     expect(deleteEdge).toHaveBeenCalledWith("edge-1", "updated-edge-etag");
-    expect(await within(editor).findByText("No artificial relationships yet.")).toBeInTheDocument();
-    expect(within(screen.getByRole("table", { name: "Conversation list" })).getByText("active-id")).toBeInTheDocument();
-    expect(within(screen.getByRole("region", { name: "Conversation graph" })).getByRole("button", { name: /Orphaned work/ })).toBeInTheDocument();
+    expect(await within(editor).findByText("还没有人工关系，可从选中任务开始建立。")).toBeInTheDocument();
+    expect(within(screen.getByRole("table", { name: "任务列表" })).getByText("active-id")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "任务关系图" })).getByRole("button", { name: /Orphaned work/ })).toBeInTheDocument();
   });
 
   it("keeps relationship form values and explains a duplicate relationship error", async () => {
@@ -1064,16 +1096,16 @@ describe("Dashboard graph", () => {
     const api = apiDouble({ createEdge });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const editor = await screen.findByRole("region", { name: "Relationship editor" });
-    const sourceInput = within(editor).getByLabelText("Source");
-    const targetInput = within(editor).getByLabelText("Target");
+    const editor = await screen.findByRole("region", { name: "关系编辑器" });
+    const sourceInput = within(editor).getByLabelText("来源");
+    const targetInput = within(editor).getByLabelText("目标");
     await user.type(sourceInput, "active-id");
     await user.type(targetInput, "archived-id");
-    await user.click(within(editor).getByRole("button", { name: "Add relationship" }));
+    await user.click(within(editor).getByRole("button", { name: "添加关系" }));
 
     const alert = await within(editor).findByRole("alert");
     expect(alert).toHaveTextContent("duplicate_edge");
@@ -1153,24 +1185,24 @@ describe("Dashboard timeline", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(timelineSnapshot) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const timeline = await screen.findByRole("region", { name: "Conversation timeline" });
-    expect(timeline).toHaveTextContent("Timeline");
+    const timeline = await screen.findByRole("region", { name: "任务时间线" });
+    expect(timeline).toHaveTextContent("时间线");
     expect(timeline).toHaveTextContent("2024-01-01");
     expect(timeline).toHaveTextContent("2024-01-02");
-    expect(timeline).toHaveTextContent("Overlap count");
-    expect(timeline).toHaveTextContent("Invalid observation range");
-    expect(timeline).toHaveTextContent("Point");
+    expect(timeline).toHaveTextContent("相交任务数");
+    expect(timeline).toHaveTextContent("无效的观测区间");
+    expect(timeline).toHaveTextContent("时间点");
 
     const pointControls = within(timeline).getAllByRole("button", {
-      name: /Archive the first pass.*point/i,
+      name: /Archive the first pass.*时间点/i,
     });
     await user.click(pointControls[pointControls.length - 1]);
     await waitFor(() => {
-      expect(screen.getByRole("region", { name: "Conversation detail" })).toHaveTextContent(
+      expect(screen.getByRole("region", { name: "任务详情" })).toHaveTextContent(
         "archived-id",
       );
     });
@@ -1192,12 +1224,12 @@ describe("Dashboard timeline", () => {
     const api = apiDouble({ snapshot: snapshotRequest });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const timeline = await screen.findByRole("region", { name: "Conversation timeline" });
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const timeline = await screen.findByRole("region", { name: "任务时间线" });
 
-    await user.click(within(timeline).getByRole("button", { name: "Week" }));
+    await user.click(within(timeline).getByRole("button", { name: "周" }));
     await waitFor(() => {
       expect(snapshotRequest).toHaveBeenLastCalledWith({
         granularity: "week",
@@ -1205,10 +1237,10 @@ describe("Dashboard timeline", () => {
       });
     });
 
-    const timezone = within(timeline).getByLabelText("Time zone");
+    const timezone = within(timeline).getByLabelText("时区");
     await user.clear(timezone);
     await user.type(timezone, "Asia/Shanghai");
-    await user.click(within(timeline).getByRole("button", { name: "Apply" }));
+    await user.click(within(timeline).getByRole("button", { name: "应用" }));
     await waitFor(() => {
       expect(snapshotRequest).toHaveBeenLastCalledWith({
         granularity: "week",
@@ -1224,13 +1256,13 @@ describe("Dashboard selection and filters", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(snapshotWithTimeline()) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
 
-    const list = within(await screen.findByRole("table", { name: "Conversation list" }));
-    const graph = within(screen.getByRole("region", { name: "Conversation graph" }));
-    const timeline = within(screen.getByRole("region", { name: "Conversation timeline" }));
+    const list = within(await screen.findByRole("table", { name: "任务列表" }));
+    const graph = within(screen.getByRole("region", { name: "任务关系图" }));
+    const timeline = within(screen.getByRole("region", { name: "任务时间线" }));
     const activeRow = list.getByText("active-id").closest("tr");
     const activeGraphNode = graph.getByRole("button", { name: /Map the local runtime/ });
     const activeTimelineRow = timeline.getAllByRole("button", { name: /Map the local runtime/ })[0];
@@ -1259,22 +1291,22 @@ describe("Dashboard selection and filters", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(snapshotWithTimeline()) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const filters = await screen.findByRole("region", { name: "Conversation filters" });
-    await user.type(within(filters).getByRole("searchbox", { name: "Search conversations" }), "archive");
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const filters = await screen.findByRole("region", { name: "任务筛选" });
+    await user.type(within(filters).getByRole("searchbox", { name: "搜索任务" }), "archive");
 
-    const list = within(screen.getByRole("table", { name: "Conversation list" }));
-    const graph = within(screen.getByRole("region", { name: "Conversation graph" }));
-    const timeline = within(screen.getByRole("region", { name: "Conversation timeline" }));
+    const list = within(screen.getByRole("table", { name: "任务列表" }));
+    const graph = within(screen.getByRole("region", { name: "任务关系图" }));
+    const timeline = within(screen.getByRole("region", { name: "任务时间线" }));
     expect(list.getByText("archived-id")).toBeInTheDocument();
     expect(list.queryByText("active-id")).not.toBeInTheDocument();
     expect(graph.getByRole("button", { name: /Archive the first pass/ })).toBeInTheDocument();
     expect(graph.queryByRole("button", { name: /Map the local runtime/ })).not.toBeInTheDocument();
     expect(timeline.getAllByRole("button", { name: /Archive the first pass/ }).length).toBeGreaterThan(0);
     expect(timeline.queryByRole("button", { name: /Map the local runtime/ })).not.toBeInTheDocument();
-    expect(timeline.getByLabelText(/1 overlapping conversations/)).toBeInTheDocument();
+    expect(timeline.getByLabelText(/1 个相交任务/)).toBeInTheDocument();
   });
 
   it("filters tag, User status, archived, missing, unlinked, and hidden states", async () => {
@@ -1312,41 +1344,41 @@ describe("Dashboard selection and filters", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(filterSnapshot) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const filters = await screen.findByRole("region", { name: "Conversation filters" });
-    const list = () => within(screen.getByRole("table", { name: "Conversation list" }));
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const filters = await screen.findByRole("region", { name: "任务筛选" });
+    const list = () => within(screen.getByRole("table", { name: "任务列表" }));
 
-    await user.selectOptions(within(filters).getByLabelText("Filter by tag"), "focus");
+    await user.selectOptions(within(filters).getByLabelText("标签"), "focus");
     expect(list().getByText("active-id")).toBeInTheDocument();
     expect(list().queryByText("archived-id")).not.toBeInTheDocument();
-    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+    await user.click(within(filters).getByRole("button", { name: "清空筛选" }));
 
-    await user.selectOptions(within(filters).getByLabelText("Filter by User status"), "done");
+    await user.selectOptions(within(filters).getByLabelText("任务状态"), "done");
     expect(list().getByText("active-id")).toBeInTheDocument();
-    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+    await user.click(within(filters).getByRole("button", { name: "清空筛选" }));
 
-    await user.selectOptions(within(filters).getByLabelText("Filter by archived"), "archived");
+    await user.selectOptions(within(filters).getByLabelText("归档状态"), "archived");
     expect(list().getByText("archived-id")).toBeInTheDocument();
     expect(list().queryByText("active-id")).not.toBeInTheDocument();
-    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+    await user.click(within(filters).getByRole("button", { name: "清空筛选" }));
 
-    await user.selectOptions(within(filters).getByLabelText("Filter by missing"), "missing");
+    await user.selectOptions(within(filters).getByLabelText("来源可用性"), "missing");
     expect(list().getByText("missing-id")).toBeInTheDocument();
-    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+    await user.click(within(filters).getByRole("button", { name: "清空筛选" }));
 
-    await user.selectOptions(within(filters).getByLabelText("Filter by unlinked"), "unlinked");
+    await user.selectOptions(within(filters).getByLabelText("关系状态"), "unlinked");
     expect(list().getByText("archived-id")).toBeInTheDocument();
     expect(list().queryByText("missing-id")).not.toBeInTheDocument();
-    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
+    await user.click(within(filters).getByRole("button", { name: "清空筛选" }));
 
-    await user.selectOptions(within(filters).getByLabelText("Filter by hidden"), "hidden");
+    await user.selectOptions(within(filters).getByLabelText("图中可见性"), "hidden");
     expect(list().getByText("active-id")).toBeInTheDocument();
     expect(list().queryByText("archived-id")).not.toBeInTheDocument();
 
-    await user.click(within(filters).getByRole("button", { name: "Clear filters" }));
-    await user.selectOptions(within(filters).getByLabelText("Sort conversations"), "updatedAt");
+    await user.click(within(filters).getByRole("button", { name: "清空筛选" }));
+    await user.selectOptions(within(filters).getByLabelText("排序方式"), "updatedAt");
     const sortedRows = list().getAllByRole("row").slice(1);
     expect(sortedRows[0]).toHaveAttribute("data-conversation-id", "archived-id");
     expect(sortedRows[1]).toHaveAttribute("data-conversation-id", "active-id");
@@ -1371,17 +1403,17 @@ describe("Dashboard selection and filters", () => {
     const api = apiDouble({ snapshot: vi.fn().mockResolvedValue(filteredTimelineSnapshot) });
     render(<App api={api} />);
 
-    await screen.findByText("Local runtime ready");
-    await user.type(screen.getByLabelText("Project root"), "/projects/codexflow");
-    await user.click(screen.getByRole("button", { name: "Load Project" }));
-    const timeline = await screen.findByRole("region", { name: "Conversation timeline" });
-    expect(within(timeline).getByRole("alert", { name: "Timeline warnings" })).toBeInTheDocument();
-    expect(within(timeline).getByLabelText(/2 overlapping conversations/)).toBeInTheDocument();
+    await screen.findByText("本地服务已就绪");
+    await user.type(screen.getByLabelText("项目目录"), "/projects/codexflow");
+    await user.click(screen.getByRole("button", { name: "加载项目" }));
+    const timeline = await screen.findByRole("region", { name: "任务时间线" });
+    expect(within(timeline).getByRole("alert", { name: "时间线提示" })).toBeInTheDocument();
+    expect(within(timeline).getByLabelText(/2 个相交任务/)).toBeInTheDocument();
 
-    const filters = screen.getByRole("region", { name: "Conversation filters" });
-    await user.type(within(filters).getByRole("searchbox", { name: "Search conversations" }), "archive");
+    const filters = screen.getByRole("region", { name: "任务筛选" });
+    await user.type(within(filters).getByRole("searchbox", { name: "搜索任务" }), "archive");
 
-    expect(within(timeline).queryByRole("alert", { name: "Timeline warnings" })).not.toBeInTheDocument();
-    expect(within(timeline).getByLabelText(/1 overlapping conversations/)).toBeInTheDocument();
+    expect(within(timeline).queryByRole("alert", { name: "时间线提示" })).not.toBeInTheDocument();
+    expect(within(timeline).getByLabelText(/1 个相交任务/)).toBeInTheDocument();
   });
 });

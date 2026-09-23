@@ -11,6 +11,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictBool, StrictStr, field_validator
 
+from .directory_picker import DirectoryPickerUnavailableError, pick_directory
 from .graph import GraphOverlayError
 from .models import DashboardSnapshot, ProjectView
 from .project import (
@@ -25,6 +26,10 @@ from .timeline import TimelineInputError
 
 class ProjectSelectRequest(BaseModel):
     path: str
+
+
+class ProjectPickRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 class GraphNodeLayoutRequest(BaseModel):
@@ -172,6 +177,13 @@ def create_app(*, source: object | None = None) -> FastAPI:
             "project": service.project_view().to_dict(),
             "source": _source_summary(codex_source),
         }
+
+    @app.post("/api/project/pick-directory")
+    def choose_project_directory(_: ProjectPickRequest) -> dict[str, str | None]:
+        try:
+            return {"path": pick_directory()}
+        except DirectoryPickerUnavailableError as exc:
+            raise ApiFailure(503, "directory_picker_unavailable", str(exc)) from exc
 
     @app.get("/api/project")
     def get_project() -> dict[str, Any]:

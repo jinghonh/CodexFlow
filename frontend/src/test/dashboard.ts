@@ -96,6 +96,7 @@ export const snapshot: DashboardSnapshot = {
 export function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
   const defaults: DashboardApi = {
     health: vi.fn().mockResolvedValue(health),
+    pickProjectDirectory: vi.fn().mockResolvedValue({ path: null }),
     selectProject: vi.fn().mockResolvedValue({ project, source: health.source }),
     snapshot: vi.fn().mockResolvedValue(snapshot),
     refresh: vi.fn().mockResolvedValue(snapshot),
@@ -108,6 +109,7 @@ export function apiDouble(overrides: Partial<DashboardApi> = {}): DashboardApi {
   };
   return {
     health: overrides.health ?? defaults.health,
+    pickProjectDirectory: overrides.pickProjectDirectory ?? defaults.pickProjectDirectory,
     selectProject: overrides.selectProject ?? defaults.selectProject,
     snapshot: overrides.snapshot ?? defaults.snapshot,
     refresh: overrides.refresh ?? defaults.refresh,

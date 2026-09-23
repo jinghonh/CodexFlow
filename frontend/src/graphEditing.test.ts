@@ -113,7 +113,7 @@ describe("Graph editing through its public interface", () => {
     response.resolve(nodeSnapshot("active-id", { title: "Submitted" }, "v1"));
     await saving;
     expect(api.refresh).not.toHaveBeenCalled();
-    expect(editing.getState().decisionError).toContain("New changes remain unsaved");
+    expect(editing.getState().decisionError).toContain("仍有新修改未保存");
     expect(editing.conversation("active-id").value.title).toBe("Later");
   });
 
@@ -295,7 +295,7 @@ describe("Graph editing through its public interface", () => {
     await editing.saveConversation("active-id");
     await editing.saveConflictCopy();
     expect(api.saveCopy).not.toHaveBeenCalled();
-    expect(editing.getState().conflictError).toContain("required");
+    expect(editing.getState().conflictError).toContain("请填写");
     expect(editing.getState().dirtyDrafts).toHaveLength(2);
   });
 
@@ -303,7 +303,7 @@ describe("Graph editing through its public interface", () => {
     const { editing, api } = await load();
     title(editing, "active-id", "Local");
     vi.mocked(api.snapshot).mockResolvedValueOnce(nodeSnapshot("active-id", { title: "External" }, "external"));
-    await expect(editing.changeTimeline({ granularity: "week", timezone: "UTC" })).rejects.toThrow("Graph changed");
+    await expect(editing.changeTimeline({ granularity: "week", timezone: "UTC" })).rejects.toThrow("关系数据发生变化");
     expect(editing.getState().snapshot?.graph.etag).toBe("absent");
     expect(editing.conversation("active-id").value.title).toBe("Local");
     expect(editing.getState().conflict).not.toBeNull();

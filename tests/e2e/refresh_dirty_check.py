@@ -21,9 +21,9 @@ def prepare_project() -> Path:
 
 def load_project(page: Page, project: Path) -> None:
     page.goto("http://127.0.0.1:5173", wait_until="networkidle")
-    page.get_by_label("Project root").fill(str(project))
-    page.get_by_role("button", name="Load Project").click()
-    page.get_by_role("table", name="Conversation list").get_by_text(
+    page.get_by_label("项目目录").fill(str(project))
+    page.get_by_role("button", name="加载项目").click()
+    page.get_by_role("table", name="任务列表").get_by_text(
         "Fixture active conversation"
     ).wait_for()
 
@@ -35,52 +35,53 @@ def main() -> None:
         page = browser.new_page(viewport={"width": 1440, "height": 1100})
         load_project(page, project)
 
-        page.get_by_role("table", name="Conversation list").get_by_text(
+        page.get_by_role("table", name="任务列表").get_by_text(
             "Fixture active conversation"
         ).click()
-        detail = page.get_by_role("region", name="Conversation detail")
-        title = detail.get_by_label("Custom title")
+        detail = page.get_by_role("region", name="任务详情")
+        title = detail.get_by_label("自定义标题")
         title.fill("Keep this draft")
 
-        page.get_by_role("button", name="Refresh source").click()
-        dialog = page.get_by_role("dialog", name="Save your Graph changes first?")
-        expect(dialog).to_contain_text("One unsaved Graph draft is open")
-        dialog.get_by_role("button", name="Cancel").click()
+        page.get_by_role("button", name="刷新来源").click()
+        dialog = page.get_by_role("dialog", name="如何处理未保存的修改？")
+        expect(dialog).to_contain_text("共 1 项未保存修改")
+        dialog.get_by_role("button", name="取消").click()
         expect(title).to_have_value("Keep this draft")
 
-        conversations = page.get_by_role("table", name="Conversation list")
+        conversations = page.get_by_role("table", name="任务列表")
         conversations.get_by_text("fixture-archived-thread", exact=True).click()
-        detail.get_by_label("Custom title").fill("Keep another draft")
+        detail.get_by_label("自定义标题").fill("Keep another draft")
         conversations.get_by_text("fixture-active-thread", exact=True).click()
-        expect(detail.get_by_label("Custom title")).to_have_value("Keep this draft")
+        expect(detail.get_by_label("自定义标题")).to_have_value("Keep this draft")
 
-        page.get_by_role("button", name="Refresh source").click()
-        expect(dialog).to_contain_text("2 unsaved Graph drafts are open")
-        expect(dialog.get_by_role("list", name="Unsaved Graph drafts").get_by_role("listitem")).to_have_count(2)
-        refresh_button = page.get_by_role("button", name="Refresh source")
+        page.get_by_role("button", name="刷新来源").click()
+        expect(dialog).to_contain_text("共 2 项未保存修改")
+        expect(dialog.get_by_role("list", name="未保存修改").get_by_role("listitem")).to_have_count(2)
+        refresh_button = page.get_by_role("button", name="刷新来源")
         with page.expect_response(lambda response: response.url.split("?", 1)[0].endswith("/api/refresh")):
-            page.get_by_role("dialog", name="Save your Graph changes first?").get_by_role(
-                "button", name="Discard changes & refresh"
+            page.get_by_role("dialog", name="如何处理未保存的修改？").get_by_role(
+                "button", name="丢弃修改并刷新"
             ).click()
         expect(refresh_button).to_be_enabled()
-        detail = page.get_by_role("region", name="Conversation detail")
-        title = detail.get_by_label("Custom title")
+        detail = page.get_by_role("region", name="任务详情")
+        title = detail.get_by_label("自定义标题")
         expect(title).to_have_value("")
 
         title.fill("Saved by refresh gate")
         refresh_button.click()
-        page.get_by_role("dialog", name="Save your Graph changes first?").get_by_role(
-            "button", name="Save changes & refresh"
+        page.get_by_role("dialog", name="如何处理未保存的修改？").get_by_role(
+            "button", name="保存并刷新"
         ).click()
         expect(page.get_by_text("Saved by refresh gate").first).to_be_visible()
-        expect(page.get_by_role("dialog", name="Save your Graph changes first?")).not_to_be_visible()
+        expect(page.get_by_role("dialog", name="如何处理未保存的修改？")).not_to_be_visible()
 
-        graph = page.get_by_role("region", name="Conversation graph")
-        graph.get_by_role("button", name="Zoom in").click()
-        canvas = graph.get_by_role("application", name="Graph canvas")
+        graph = page.get_by_role("region", name="任务关系图")
+        graph.get_by_role("button", name="放大").click()
+        canvas = graph.get_by_role("application", name="关系画布")
+        zoom = canvas.get_attribute("data-zoom")
         refresh_button.click()
         expect(refresh_button).to_be_enabled()
-        expect(canvas).to_have_attribute("data-zoom", "1.1")
+        expect(canvas).to_have_attribute("data-zoom", zoom)
 
         print("browser refresh and dirty-draft acceptance test passed")
         browser.close()

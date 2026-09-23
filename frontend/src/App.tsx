@@ -7,13 +7,14 @@ import {
   filterConversations,
   isDefaultConversationFilters,
 } from "./filters";
+import { Workspace } from "./Workspace";
+import { automaticPositions, edgeGeometry, relationNames, statusNames } from "./graphGeometry";
 import { TimelineView } from "./Timeline";
 import { useGraphEditing } from "./graphEditing";
 import type { ConversationDraft, GraphConflict, GraphEditing, GraphEditingState } from "./graphEditing";
 import type {
   Conversation,
   ConversationFilters,
-  ExcludedConversation,
   GraphEdge,
   GraphNode,
   HealthResponse,
@@ -24,12 +25,29 @@ interface AppProps {
   api?: DashboardApi;
 }
 
+const RECENT_PROJECTS_KEY = "codexflow.recent-projects.v1";
+
+function readRecentProjects(): string[] {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(RECENT_PROJECTS_KEY) ?? "[]");
+    return Array.isArray(value)
+      ? value.filter((path): path is string => typeof path === "string" && path.startsWith("/")).slice(0, 5)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 export function App({ api }: AppProps) {
   const apiClient = useMemo(() => api ?? createApi(), [api]);
   const [state, editing] = useGraphEditing(apiClient);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [healthError, setHealthError] = useState<Error | null>(null);
   const [projectPath, setProjectPath] = useState("");
+  const [recentProjects, setRecentProjects] = useState(readRecentProjects);
+  const [pickingDirectory, setPickingDirectory] = useState(false);
+  const [pickerError, setPickerError] = useState<string | null>(null);
+  const restoredProject = useRef(false);
   const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
   const [filters, setFilters] = useState<ConversationFilters>(DEFAULT_CONVERSATION_FILTERS);
   const { project, snapshot, loadState, timelineLoading, timelineError } = state;
@@ -41,10 +59,31 @@ export function App({ api }: AppProps) {
     void apiClient.health().then((response) => {
       if (active) setHealth(response);
     }).catch((reason: unknown) => {
-      if (active) setHealthError(reason instanceof Error ? reason : new Error("Unexpected local runtime error."));
+      if (active) setHealthError(reason instanceof Error ? reason : new Error("本地服务发生意外错误。"));
     });
     return () => { active = false; };
   }, [apiClient]);
+
+  useEffect(() => {
+    if (!health || restoredProject.current) return;
+    restoredProject.current = true;
+    if (project) return;
+    const path = recentProjects[0] ?? health.project?.realPath;
+    if (path) {
+      setProjectPath(path);
+      void editing.requestProject(path);
+    }
+  }, [health, editing, project, recentProjects]);
+
+  useEffect(() => {
+    if (!project) return;
+    setProjectPath(project.realPath);
+    setRecentProjects((current) => {
+      const next = [project.realPath, ...current.filter((path) => path !== project.realPath)].slice(0, 5);
+      try { localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(next)); } catch { /* 禁用存储时仍可选择项目。 */ }
+      return next;
+    });
+  }, [project?.realPath]);
 
   useEffect(() => {
     setSelectedConversationId(null);
@@ -58,7 +97,25 @@ export function App({ api }: AppProps) {
 
   function handleProjectSelect(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    void editing.requestProject(projectPath);
+    setPickerError(null);
+    if (projectPath.trim()) void editing.requestProject(projectPath);
+    else void handlePickDirectory();
+  }
+
+  async function handlePickDirectory() {
+    setPickerError(null);
+    setPickingDirectory(true);
+    try {
+      const { path } = await apiClient.pickProjectDirectory();
+      if (path) {
+        setProjectPath(path);
+        void editing.requestProject(path);
+      }
+    } catch (reason) {
+      setPickerError(reason instanceof Error ? reason.message : "无法打开目录选择窗口。");
+    } finally {
+      setPickingDirectory(false);
+    }
   }
 
   const sourceUnavailable =
@@ -68,7 +125,7 @@ export function App({ api }: AppProps) {
   const sourceStale = snapshot?.source.status === "stale";
   const graphFileStatus = snapshot?.graph.fileStatus ?? project?.graphFileStatus;
   const graphReadOnly = editing.readOnly;
-  const runtimeLabel = health ? "Local runtime ready" : error && !project ? "Local runtime unavailable" : "Checking local runtime";
+  const runtimeLabel = health ? "本地服务已就绪" : error && !project ? "本地服务不可用" : "正在检查本地服务";
   const filteredConversations = useMemo(
     () => filterConversations(snapshot?.conversations ?? [], filters),
     [filters, snapshot?.conversations],
@@ -92,8 +149,8 @@ export function App({ api }: AppProps) {
     <main className="app-shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">CODEXFLOW / LOCAL THREAD INDEX</p>
-          <h1>Conversation field notes</h1>
+          <p className="eyebrow">CODEXFLOW / 本地任务索引</p>
+          <h1>任务关系工作台</h1>
         </div>
         <div className={`runtime-chip ${health ? "is-ready" : ""}`}>
           <span className="status-dot" aria-hidden="true" />
@@ -103,16 +160,15 @@ export function App({ api }: AppProps) {
 
       <section className="hero-grid" aria-labelledby="hero-title">
         <div className="hero-copy">
-          <p className="section-kicker">A quiet index for noisy work</p>
-          <h2 id="hero-title">Find the thread<br />behind the work.</h2>
+          <p className="section-kicker">看清任务之间的联系</p>
+          <h2 id="hero-title">连接任务<br />理解进展。</h2>
           <p className="hero-description">
-            Choose one local Project root. CodexFlow reads the app-server source and keeps the
-            original Thread identity intact.
+            选择本地项目，查看任务关系、时间分布与工作记录。
           </p>
         </div>
         <form className="project-card" onSubmit={handleProjectSelect}>
           <div className="card-index">01 <span>/ PROJECT ROOT</span></div>
-          <label htmlFor="project-path">Project root</label>
+          <label htmlFor="project-path">项目目录</label>
           <div className="path-input-row">
             <input
               id="project-path"
@@ -122,36 +178,56 @@ export function App({ api }: AppProps) {
               autoComplete="off"
             />
             <button type="submit" disabled={state.phase !== "idle"}>
-              {loadState === "loading" ? "Loading…" : "Load Project"}
+              {loadState === "loading" ? "加载中…" : "加载项目"}
             </button>
           </div>
-          <p className="card-footnote">The path is checked locally and resolved before reading.</p>
+          <div className="project-shortcuts">
+            <button type="button" className="directory-picker-button" onClick={() => void handlePickDirectory()} disabled={pickingDirectory || state.phase !== "idle"}>
+              {pickingDirectory ? "等待选择…" : "选择目录…"}
+            </button>
+            {recentProjects.length > 0 && (
+              <label className="recent-project-control">
+                <span>最近项目</span>
+                <select value="" onChange={(event) => {
+                  if (!event.target.value) return;
+                  setProjectPath(event.target.value);
+                  setPickerError(null);
+                  void editing.requestProject(event.target.value);
+                }} disabled={state.phase !== "idle"}>
+                  <option value="">选择最近项目</option>
+                  {recentProjects.map((path) => <option key={path} value={path}>{path}</option>)}
+                </select>
+              </label>
+            )}
+          </div>
+          {pickerError && <p className="picker-error" role="alert">{pickerError}</p>}
+          <p className="card-footnote">仅在本机读取项目。</p>
         </form>
       </section>
 
       {project && (
         <div className="project-ribbon">
           <div>
-            <span className="ribbon-label">SELECTED PROJECT</span>
+            <span className="ribbon-label">当前项目</span>
             <strong>{project.realPath}</strong>
             {project.originalPath !== project.realPath && (
-              <span className="project-alias">alias · {project.originalPath}</span>
+              <span className="project-alias">别名 · {project.originalPath}</span>
             )}
           </div>
           <div className="ribbon-facts">
-            <span className="ribbon-meta">{project.isGitProject ? "GIT PROJECT" : "LOCAL DIRECTORY"}</span>
-            {project.gitRoot && <span>Git root · {project.gitRoot}</span>}
-            {project.worktreeRoot && <span>Worktree root · {project.worktreeRoot}</span>}
-            <span>Graph overlay · {snapshot?.project.graphFileStatus ?? project.graphFileStatus}</span>
+            <span className="ribbon-meta">{project.isGitProject ? "版本库项目" : "本地目录"}</span>
+            {project.gitRoot && <span>版本库根目录 · {project.gitRoot}</span>}
+            {project.worktreeRoot && <span>工作树根目录 · {project.worktreeRoot}</span>}
+            <span>关系数据 · {({ absent: "尚未创建", ready: "可用", legacy: "需要迁移", future: "较新版本", corrupt: "文件损坏" } as Record<string, string>)[snapshot?.project.graphFileStatus ?? project.graphFileStatus] ?? "未知状态"}</span>
           </div>
           {project && (
             <div className="ribbon-actions">
               <span className={`draft-status ${dirtyDraftCount > 0 ? "is-dirty" : ""}`}>
                 {dirtyDraftCount > 0
-                  ? "Unsaved Graph changes"
+                  ? "存在未保存修改"
                   : snapshot
-                  ? "Source sync ready"
-                  : "Source load needs retry"}
+                  ? "来源同步就绪"
+                  : "来源加载需要重试"}
               </span>
               <button
                 type="button"
@@ -159,9 +235,9 @@ export function App({ api }: AppProps) {
                 onClick={() => void editing.requestRefresh()}
                 disabled={state.phase !== "idle"}
               >
-                {state.phase === "refreshing" ? "Refreshing…" : "Refresh source"}
+                {state.phase === "refreshing" ? "刷新中…" : "刷新来源"}
               </button>
-              {state.refreshError && <span className="refresh-error" role="alert">Refresh failed · {state.refreshError}</span>}
+              {state.refreshError && <span className="refresh-error" role="alert">刷新失败 · {state.refreshError}</span>}
             </div>
           )}
         </div>
@@ -170,7 +246,7 @@ export function App({ api }: AppProps) {
       {loadState === "loading" && (
         <div className="loading-panel" role="status" aria-live="polite">
           <span className="loading-mark" aria-hidden="true">↗</span>
-          <span>Loading conversations…</span>
+          <span>正在加载任务…</span>
         </div>
       )}
 
@@ -178,9 +254,9 @@ export function App({ api }: AppProps) {
         <div className="source-alert" role="alert">
           <div className="alert-symbol" aria-hidden="true">!</div>
           <div>
-            <strong>Source unavailable</strong>
-            <p>{error?.message ?? snapshot?.source.error?.message ?? "The Codex app-server source is not available yet."}</p>
-            <span className="alert-note">No incomplete list has been presented as a complete snapshot.</span>
+            <strong>来源不可用</strong>
+            <p>{error?.message ?? snapshot?.source.error?.message ?? "Codex 来源服务尚不可用。"}</p>
+            <span className="alert-note">不会将不完整的列表当作完整快照展示。</span>
           </div>
         </div>
       )}
@@ -189,11 +265,11 @@ export function App({ api }: AppProps) {
         <div className="source-stale" role="status" aria-live="polite">
           <span className="stale-mark" aria-hidden="true">↻</span>
           <div>
-            <strong>Source stale</strong>
+            <strong>来源数据已过期</strong>
             <p>
-              {snapshot.source.error?.message ?? "The last complete source snapshot is still shown; refresh could not confirm newer data."}
+              {snapshot.source.error?.message ?? "保留上次完整快照，刷新未能确认最新数据。"}
             </p>
-            <span className="alert-note">The last complete snapshot is preserved; retry the source refresh when available.</span>
+            <span className="alert-note">已保留上次完整快照，可在来源恢复后重试刷新。</span>
           </div>
         </div>
       )}
@@ -233,35 +309,13 @@ export function App({ api }: AppProps) {
         />
       ) : null}
 
-      {snapshot && !sourceUnavailable && snapshot.excludedConversations.length > 0 && (
-        <ProjectMembershipNotice
-          excluded={snapshot.excludedConversations}
-          isGitProject={project?.isGitProject ?? snapshot.project.isGitProject}
-        />
-      )}
-
       {snapshot && !sourceUnavailable && (
         <>
-          <ConversationFilterBar
-            filters={filters}
-            tags={availableTags}
-            visibleCount={filteredConversations.length}
-            totalCount={snapshot.conversations.length}
-            onChange={(changes) => setFilters((current) => ({ ...current, ...changes }))}
-            onReset={() => setFilters(DEFAULT_CONVERSATION_FILTERS)}
-          />
-          <TimelineView
-            timeline={snapshot.timeline}
-            conversations={filteredConversations}
-            selectedId={selectedConversationId}
-            loading={timelineLoading || state.phase !== "idle" || state.pendingSaves > 0}
-            error={timelineError}
-            onSelect={setSelectedConversationId}
-            onOptionsChange={(options) => editing.changeTimeline(options)}
-          />
-          <ConversationGraph
+          <Workspace panels={{
+            graph: (<ConversationGraph
             key={project?.realPath}
             nodes={snapshot.graph.nodes}
+            conversations={snapshot.conversations}
             edges={snapshot.graph.edges}
             visibleIds={filteredConversationIds}
             editing={editing}
@@ -270,28 +324,38 @@ export function App({ api }: AppProps) {
             selectedId={selectedConversationId}
             onSelect={setSelectedConversationId}
             readOnly={graphReadOnly}
-          />
-          <ConversationList
+          />),
+            timeline: (<TimelineView
+            timeline={snapshot.timeline}
             conversations={filteredConversations}
             selectedId={selectedConversationId}
+            loading={timelineLoading || state.phase !== "idle" || state.pendingSaves > 0}
+            error={timelineError}
             onSelect={setSelectedConversationId}
-          />
+            onOptionsChange={(options) => editing.changeTimeline(options)}
+          />),
+            list: (<ConversationList
+            conversations={filteredConversations}
+            filters={filters}
+            tags={availableTags}
+            totalCount={snapshot.conversations.length}
+            onFilterChange={(changes) => setFilters((current) => ({ ...current, ...changes }))}
+            onFilterReset={() => setFilters(DEFAULT_CONVERSATION_FILTERS)}
+            selectedId={selectedConversationId}
+            onSelect={setSelectedConversationId}
+          />),
+          }} detail={selectedConversationId ? <>
+            <button className="detail-close" onClick={() => setSelectedConversationId(null)}>关闭详情 ×</button>
+            <ConversationDetail conversation={snapshot.conversations.find(({ id }) => id === selectedConversationId) ?? null} editing={editing} readOnly={graphReadOnly} />
+          </> : null} />
         </>
-      )}
-
-      {selectedConversationId && snapshot && (
-        <ConversationDetail
-          conversation={snapshot.conversations.find(({ id }) => id === selectedConversationId) ?? null}
-          editing={editing}
-          readOnly={graphReadOnly}
-        />
       )}
 
       {loadState === "error" && !sourceUnavailable && error && (
         <div className="source-alert" role="alert">
           <div className="alert-symbol" aria-hidden="true">!</div>
           <div>
-            <strong>Project could not be loaded</strong>
+            <strong>无法加载项目</strong>
             <p>{error.message}</p>
           </div>
         </div>
@@ -319,28 +383,28 @@ function RefreshDecisionDialog({
 }) {
   const working = action !== "idle";
   const dirtyCount = drafts.length;
-  const nextAction = switchingProject ? "switch Project" : "refresh";
+  const nextAction = switchingProject ? "切换项目" : "刷新";
   return (
     <div className="refresh-dialog-backdrop">
       <section className="refresh-dialog" role="dialog" aria-modal="true" aria-labelledby="refresh-dialog-title">
-        <p className="section-kicker">SOURCE REFRESH / UNSAVED WORK</p>
-        <h2 id="refresh-dialog-title">Save your Graph changes first?</h2>
+        <p className="section-kicker">刷新来源 / 未保存修改</p>
+        <h2 id="refresh-dialog-title">如何处理未保存的修改？</h2>
         <p>
-          {dirtyCount === 1 ? "One" : dirtyCount} unsaved Graph draft{dirtyCount === 1 ? " is" : "s are"} open. Choose what to do before {switchingProject ? "switching Project" : "reading the source again"}.
+          共 {dirtyCount} 项未保存修改。请先选择如何处理，再{nextAction}。
         </p>
-        <ul className="draft-summary" aria-label="Unsaved Graph drafts">
+        <ul className="draft-summary" aria-label="未保存修改">
           {drafts.map((draft) => <li key={draft.key}>{draft.label}</li>)}
         </ul>
-        {error && <p className="refresh-dialog-error" role="alert">Save failed · {error} Your draft is still dirty.</p>}
+        {error && <p className="refresh-dialog-error" role="alert">保存失败 · {error} 修改仍保留，尚未保存。</p>}
         <div className="refresh-dialog-actions">
           <button type="button" className="refresh-dialog-save" onClick={onSave} disabled={working}>
-            {action === "saving" ? "Saving…" : `Save changes & ${nextAction}`}
+            {action === "saving" ? "保存中…" : `保存并${nextAction}`}
           </button>
           <button type="button" className="refresh-dialog-discard" onClick={onDiscard} disabled={working}>
-            {working && action !== "saving" ? "Loading…" : `Discard changes & ${nextAction}`}
+            {working && action !== "saving" ? "加载中…" : `丢弃修改并${nextAction}`}
           </button>
           <button type="button" className="refresh-dialog-cancel" onClick={onCancel} disabled={working}>
-            Cancel
+            取消
           </button>
         </div>
       </section>
@@ -369,32 +433,32 @@ function GraphConflictPanel({
 }) {
   const working = action === "working";
   return (
-    <section className="graph-conflict-panel" role="alert" aria-label="Graph conflict">
+    <section className="graph-conflict-panel" role="alert" aria-label="关系数据冲突">
       <div className="conflict-symbol" aria-hidden="true">!</div>
       <div className="conflict-copy">
-        <p className="section-kicker">PERSISTENCE / EXTERNAL CHANGE</p>
-        <strong>Graph changed elsewhere</strong>
+        <p className="section-kicker">保存冲突 / 外部修改</p>
+        <strong>关系数据已被其他程序修改</strong>
         <p>{conflict.message}</p>
         <span className="conflict-note">
-          All {drafts.length} unsaved Graph drafts are retained. Copy and overwrite include all current drafts; later edits stay unsaved.
+          已保留全部 {drafts.length} 项修改。保存副本和覆盖保存包含当前修改，之后的编辑仍需保存。
         </span>
         {(conflict.expectedEtag || conflict.currentEtag) && (
-          <div className="conflict-version" aria-label="Graph version comparison">
-            <span>Draft base · <code>{conflict.expectedEtag ?? "unknown"}</code></span>
-            <span>File now · <code>{conflict.currentEtag ?? "unknown"}</code></span>
+          <div className="conflict-version" aria-label="版本对比">
+            <span>修改基于版本 · <code>{conflict.expectedEtag ?? "未知"}</code></span>
+            <span>当前文件版本 · <code>{conflict.currentEtag ?? "未知"}</code></span>
           </div>
         )}
-        {copyPath && <span className="conflict-result">Copy saved · {copyPath}</span>}
-        {actionError && <span className="conflict-action-error">Could not complete that action: {actionError}</span>}
+        {copyPath && <span className="conflict-result">副本已保存 · {copyPath}</span>}
+        {actionError && <span className="conflict-action-error">无法完成操作: {actionError}</span>}
         <div className="conflict-actions">
           <button type="button" onClick={() => void onReload()} disabled={working}>
-            Discard all drafts &amp; reload Graph
+            丢弃全部修改并重新加载
           </button>
           <button type="button" onClick={() => void onSaveCopy()} disabled={working}>
-            {action === "saved" ? "Save another copy" : "Save a copy"}
+            {action === "saved" ? "另存一个副本" : "保存副本"}
           </button>
           <button type="button" className="is-danger" onClick={() => void onOverwrite()} disabled={working}>
-            Overwrite explicitly
+            覆盖保存
           </button>
         </div>
       </div>
@@ -418,84 +482,28 @@ function GraphStatusNotice({
   const isFuture = status === "future";
   const isMigrated = status === "ready" && backupPath !== null;
   return (
-    <section className={`graph-status-notice ${isFuture ? "is-future" : isMigrated ? "is-migrated" : "is-legacy"}`} role="status" aria-label="Graph overlay status">
+    <section className={`graph-status-notice ${isFuture ? "is-future" : isMigrated ? "is-migrated" : "is-legacy"}`} role="status" aria-label="关系数据状态">
       <div className="status-symbol" aria-hidden="true">{isFuture ? "↗" : isMigrated ? "✓" : "↻"}</div>
       <div>
-        <p className="section-kicker">GRAPH OVERLAY / {isFuture ? "FUTURE VERSION" : isMigrated ? "MIGRATION COMPLETE" : "MIGRATION AVAILABLE"}</p>
-        <strong>{isFuture ? "Graph overlay is read-only" : isMigrated ? "Graph overlay migrated safely" : "Graph overlay needs migration"}</strong>
+        <p className="section-kicker">关系数据 / {isFuture ? "较新版本" : isMigrated ? "迁移完成" : "可以迁移"}</p>
+        <strong>{isFuture ? "关系数据只读" : isMigrated ? "关系数据已安全迁移" : "关系数据需要迁移"}</strong>
         <p>
           {isFuture
-            ? "This CodexFlow version can display the file but will not save over a newer schema."
+            ? "当前版本可以显示该文件，但不能覆盖较新格式的数据。"
             : isMigrated
-            ? "The original file was backed up before the schema upgrade."
-            : "The file will be backed up before it is upgraded to the current schema."}
+            ? "升级前已备份原始文件。"
+            : "升级数据格式前会先备份文件。"}
         </p>
-        {backupPath && <span className="status-result">Backup created · {backupPath}</span>}
-        {migrationError && <span className="status-error">Migration failed · {migrationError}</span>}
+        {backupPath && <span className="status-result">备份已创建 · {backupPath}</span>}
+        {migrationError && <span className="status-error">迁移失败 · {migrationError}</span>}
         {!isFuture && !isMigrated && (
           <button type="button" onClick={() => void onMigrate()} disabled={migrationState === "working"}>
-            {migrationState === "working" ? "Migrating…" : "Migrate with backup"}
+            {migrationState === "working" ? "正在迁移…" : "备份并迁移"}
           </button>
         )}
       </div>
     </section>
   );
-}
-
-function ProjectMembershipNotice({
-  excluded,
-  isGitProject,
-}: {
-  excluded: ExcludedConversation[];
-  isGitProject: boolean;
-}) {
-  const countLabel = `${excluded.length} conversation${excluded.length === 1 ? "" : "s"} excluded`;
-  const boundaryDescription = isGitProject
-    ? "Only a resolved cwd inside the selected Project and the same Git worktree is included in the List."
-    : "Only a resolved cwd inside the selected Project is included in the List; nested Git repositories are excluded.";
-  return (
-    <section className="membership-panel" aria-label="Project membership">
-      <div className="membership-heading">
-        <div>
-          <p className="section-kicker">PROJECT BOUNDARY / SOURCE FILTER</p>
-          <strong>{countLabel}</strong>
-        </div>
-        <span className="membership-count">{String(excluded.length).padStart(2, "0")}</span>
-      </div>
-      <p className="membership-description">
-        {boundaryDescription}
-      </p>
-      <ul className="excluded-list">
-        {excluded.map((conversation) => (
-          <li key={conversation.id}>
-            <div className="excluded-title">
-              <code>{conversation.id}</code>
-              <strong>{membershipReasonLabel(conversation.reason)}</strong>
-            </div>
-            <span>cwd · {conversation.cwd}</span>
-            {conversation.resolvedCwd && conversation.resolvedCwd !== conversation.cwd && (
-              <span>resolved · {conversation.resolvedCwd}</span>
-            )}
-            {conversation.gitRoot && <span>Git root · {conversation.gitRoot}</span>}
-            {conversation.worktreeRoot && <span>Worktree root · {conversation.worktreeRoot}</span>}
-          </li>
-        ))}
-      </ul>
-    </section>
-  );
-}
-
-function membershipReasonLabel(reason: string): string {
-  const labels: Record<string, string> = {
-    outside_project: "Outside the selected Project",
-    nested_git_repository: "Nested Git repository",
-    different_git_root: "Different Git root or worktree",
-    cwd_not_absolute: "Working directory is not absolute",
-    unresolvable_cwd: "Working directory could not be resolved",
-    cwd_not_directory: "Working directory is not a directory",
-    git_root_unresolvable: "Git root could not be resolved",
-  };
-  return labels[reason] ?? "Outside the selected Project boundary";
 }
 
 function ConversationFilterBar({
@@ -514,100 +522,105 @@ function ConversationFilterBar({
   onReset: () => void;
 }) {
   return (
-    <section className="filter-section" aria-label="Conversation filters">
+    <section className="filter-section" aria-label="任务筛选">
       <div className="filter-heading">
         <div>
-          <p className="section-kicker">One projection / three views</p>
-          <h2>Filter the field</h2>
+          <p className="section-kicker">三个视图 · 同步筛选</p>
+          <h2>筛选任务</h2>
         </div>
         <div className="filter-summary" aria-live="polite">
           <strong>{String(visibleCount).padStart(2, "0")}</strong>
-          <span>of {totalCount} shown</span>
+          <span>/ {totalCount} 个任务</span>
         </div>
       </div>
       <div className="filter-controls">
         <label className="filter-search">
-          <span>Search conversations</span>
+          <span>搜索任务</span>
           <input
             type="search"
             value={filters.search}
             onChange={(event) => onChange({ search: event.target.value })}
-            placeholder="Title, preview, or Conversation ID"
+            placeholder="标题、摘要或任务标识"
             autoComplete="off"
           />
         </label>
         <FilterSelect
-          label="Filter by tag"
+          label="标签"
           value={filters.tag ?? ""}
-          options={[{ value: "", label: "All tags" }, ...tags.map((tag) => ({ value: tag, label: tag }))]}
+          options={[{ value: "", label: "全部标签" }, ...tags.map((tag) => ({ value: tag, label: tag }))]}
           onChange={(value) => onChange({ tag: value || null })}
         />
         <FilterSelect
-          label="Filter by User status"
+          label="任务状态"
           value={filters.userStatus}
           options={[
-            { value: "all", label: "All User status" },
-            { value: "none", label: "None" },
-            { value: "active", label: "Active" },
-            { value: "done", label: "Done" },
-            { value: "blocked", label: "Blocked" },
+            { value: "all", label: "全部任务状态" },
+            { value: "none", label: "未设置" },
+            { value: "active", label: "进行中" },
+            { value: "done", label: "已完成" },
+            { value: "blocked", label: "阻塞" },
           ]}
           onChange={(value) => onChange({ userStatus: value as ConversationFilters["userStatus"] })}
         />
         <FilterSelect
-          label="Filter by archived"
+          label="归档状态"
           value={filters.archived}
           options={[
-            { value: "all", label: "All archive states" },
-            { value: "active", label: "Active only" },
-            { value: "archived", label: "Archived only" },
+            { value: "all", label: "全部归档状态" },
+            { value: "active", label: "仅未归档" },
+            { value: "archived", label: "仅已归档" },
           ]}
           onChange={(value) => onChange({ archived: value as ConversationFilters["archived"] })}
         />
         <FilterSelect
-          label="Filter by missing"
-          value={filters.missing}
-          options={[
-            { value: "all", label: "All source states" },
-            { value: "present", label: "Present only" },
-            { value: "missing", label: "Missing only" },
-          ]}
-          onChange={(value) => onChange({ missing: value as ConversationFilters["missing"] })}
-        />
-        <FilterSelect
-          label="Filter by unlinked"
-          value={filters.unlinked}
-          options={[
-            { value: "all", label: "All link states" },
-            { value: "linked", label: "Linked only" },
-            { value: "unlinked", label: "Unlinked only" },
-          ]}
-          onChange={(value) => onChange({ unlinked: value as ConversationFilters["unlinked"] })}
-        />
-        <FilterSelect
-          label="Filter by hidden"
-          value={filters.hidden}
-          options={[
-            { value: "all", label: "All visibility states" },
-            { value: "visible", label: "Visible only" },
-            { value: "hidden", label: "Hidden only" },
-          ]}
-          onChange={(value) => onChange({ hidden: value as ConversationFilters["hidden"] })}
-        />
-        <FilterSelect
-          label="Sort conversations"
+          label="排序方式"
           value={filters.sortBy}
           options={[
-            { value: "source", label: "Source order" },
-            { value: "updatedAt", label: "Updated · newest first" },
-            { value: "createdAt", label: "Created · newest first" },
+            { value: "source", label: "来源顺序" },
+            { value: "updatedAt", label: "最近更新优先" },
+            { value: "createdAt", label: "最近创建优先" },
           ]}
           onChange={(value) => onChange({ sortBy: value as ConversationFilters["sortBy"] })}
         />
-        <button type="button" className="filter-reset" onClick={onReset}>Clear filters</button>
+        <button type="button" className="filter-reset" onClick={onReset}>清空筛选</button>
       </div>
+      <details className="filter-more">
+        <summary>更多筛选条件{filters.missing !== "all" || filters.unlinked !== "all" || filters.hidden !== "all" ? " · 已启用" : ""}</summary>
+        <div className="filter-extra-controls">
+          <FilterSelect
+            label="来源可用性"
+            value={filters.missing}
+            options={[
+              { value: "all", label: "全部来源状态" },
+              { value: "present", label: "来源存在" },
+              { value: "missing", label: "来源缺失" },
+            ]}
+            onChange={(value) => onChange({ missing: value as ConversationFilters["missing"] })}
+          />
+          <FilterSelect
+            label="关系状态"
+            value={filters.unlinked}
+            options={[
+              { value: "all", label: "全部关系状态" },
+              { value: "linked", label: "已有关系" },
+              { value: "unlinked", label: "没有关系" },
+            ]}
+            onChange={(value) => onChange({ unlinked: value as ConversationFilters["unlinked"] })}
+          />
+          <FilterSelect
+            label="图中可见性"
+            value={filters.hidden}
+            options={[
+              { value: "all", label: "全部可见状态" },
+              { value: "visible", label: "图中可见" },
+              { value: "hidden", label: "图中隐藏" },
+            ]}
+            onChange={(value) => onChange({ hidden: value as ConversationFilters["hidden"] })}
+          />
+        </div>
+      </details>
       <p className="filter-caption">
-        Search and filters keep the source Conversation ID intact. Hidden is a Graph display state; hidden Conversations remain available in List and Timeline.
+        隐藏仅影响关系图，任务仍可在列表和时间线中查看。
       </p>
     </section>
   );
@@ -632,6 +645,7 @@ function FilterSelect({ label, value, options, onChange }: FilterSelectProps) {
 }
 
 interface ConversationGraphProps {
+  conversations: Conversation[];
   nodes: GraphNode[];
   edges: GraphEdge[];
   visibleIds: ReadonlySet<string>;
@@ -663,6 +677,7 @@ interface NodeDragState {
 }
 
 function ConversationGraph({
+  conversations,
   nodes,
   edges,
   visibleIds,
@@ -673,6 +688,10 @@ function ConversationGraph({
   layoutError,
   readOnly,
 }: ConversationGraphProps) {
+  const initiallyFitted = useRef(false);
+  const [manual, setManual] = useState(false);
+  const viewport = useRef<HTMLDivElement>(null);
+  const automatic = useMemo(() => automaticPositions(nodes, edges), [nodes, edges]);
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState<GraphPoint>({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
@@ -687,25 +706,46 @@ function ConversationGraph({
   const visibleNodes = useMemo(() => filteredNodes.filter((node) => !node.hidden), [filteredNodes]);
   const positions = useMemo(
     () => {
-      const next = new Map(visibleNodes.map((node, index) => [node.id, graphPosition(node, index)]));
-      for (const [id, position] of layoutDrafts) {
+      const next = new Map(visibleNodes.map((node, index) => [node.id, manual ? graphPosition(node, nodes.indexOf(node)) : automatic.get(node.id)!]));
+      for (const [id, position] of manual ? layoutDrafts : []) {
         if (next.has(id)) next.set(id, position);
       }
       if (draggedPosition) next.set(draggedPosition.id, draggedPosition.point);
       return next;
     },
-    [draggedPosition, visibleNodes, layoutDrafts],
+    [draggedPosition, visibleNodes, layoutDrafts, manual, automatic, nodes],
   );
   const visibleEdges = edges.filter((edge) => positions.has(edge.source) && positions.has(edge.target));
 
   function adjustZoom(delta: number) {
-    setZoom((current) => Math.max(0.6, Math.min(1.8, Math.round((current + delta) * 10) / 10)));
+    setZoom((current) => Math.max(0.05, Math.min(2.5, Math.round((current + delta) * 10) / 10)));
   }
 
-  function resetView() {
-    setZoom(1);
-    setPan({ x: 0, y: 0 });
+  function fitView(selectedOnly = false) {
+    const points = selectedOnly && selectedId && positions.has(selectedId) ? [positions.get(selectedId)!] : [...positions.values()];
+    if (!points.length || !viewport.current) return;
+    const minX = Math.min(...points.map(p => p.x)), minY = Math.min(...points.map(p => p.y));
+    const width = Math.max(...points.map(p => p.x)) - minX + 220;
+    const height = Math.max(...points.map(p => p.y)) - minY + 116;
+    const box = viewport.current.getBoundingClientRect();
+    const next = Math.max(.05, Math.min(1, (box.width - 64) / width, (box.height - 64) / height));
+    setZoom(next); setPan({ x: (box.width - width * next) / 2 - minX * next, y: (box.height - height * next) / 2 - minY * next });
   }
+  function resetView() { fitView(); }
+  useEffect(() => {
+    if (!initiallyFitted.current && viewport.current && viewport.current.getBoundingClientRect().width > 0 && positions.size) {
+      initiallyFitted.current = true; fitView();
+    }
+  }, [positions]);
+
+  const fitCurrentView = useRef(fitView);
+  fitCurrentView.current = fitView;
+  useEffect(() => {
+    if (!viewport.current || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => { if (viewport.current!.clientWidth > 0) fitCurrentView.current(); });
+    observer.observe(viewport.current);
+    return () => observer.disconnect();
+  }, [manual]);
 
   function beginPan(x: number, y: number) {
     panOrigin.current = { x, y, panX: pan.x, panY: pan.y };
@@ -720,7 +760,7 @@ function ConversationGraph({
         y: drag.origin.y + (y - drag.startY) / zoom,
       };
       drag.current = point;
-      drag.moved = drag.moved || point.x !== drag.origin.x || point.y !== drag.origin.y;
+      drag.moved = drag.moved || Math.hypot(x - drag.startX, y - drag.startY) >= 4;
       setDraggedPosition({ id: drag.id, point });
       return;
     }
@@ -751,42 +791,47 @@ function ConversationGraph({
   }
 
   return (
-    <section className="graph-section" aria-label="Conversation graph">
+    <section className="graph-section" aria-label="任务关系图">
       <div className="graph-heading">
         <div>
-          <p className="section-kicker">Relationship surface / editable nodes</p>
-          <h2>Graph</h2>
+          <p className="section-kicker">关联分组 · 人工关系</p>
+          <h2>关系图</h2>
         </div>
-        <div className="graph-toolbar" role="toolbar" aria-label="Graph controls">
-          <button type="button" aria-label="Zoom out" onClick={() => adjustZoom(-0.1)}>
+        <div className="graph-toolbar" role="toolbar" aria-label="关系图操作">
+          <button aria-pressed={!manual} onClick={() => setManual(false)}>自动布局</button>
+          <button aria-pressed={manual} onClick={() => setManual(true)}>手动布局</button>
+          <button disabled={!selectedId || !positions.has(selectedId)} onClick={() => fitView(true)}>定位选中</button>
+          <button disabled={!selectedId || readOnly} onClick={() => { editing.selectRelationship(null); editing.editRelationship({ source: selectedId!, target: "", type: "related_to", label: "" }); document.getElementById("relationship-target")?.focus(); }}>从选中任务建立关系</button>
+          <button type="button" aria-label="缩小" onClick={() => adjustZoom(-0.1)}>
             −
           </button>
           <span aria-live="polite">{Math.round(zoom * 100)}%</span>
-          <button type="button" aria-label="Zoom in" onClick={() => adjustZoom(0.1)}>
+          <button type="button" aria-label="放大" onClick={() => adjustZoom(0.1)}>
             +
           </button>
-          <button type="button" aria-label="Reset view" onClick={resetView}>
-            Reset
+          <button type="button" aria-label="显示全部" onClick={resetView}>
+            显示全部
           </button>
         </div>
       </div>
       <div
+        ref={viewport}
         className={`graph-viewport ${isPanning ? "is-panning" : ""}`}
         role="application"
-        aria-label="Graph canvas"
+        aria-label="关系画布"
         tabIndex={0}
         data-zoom={zoom}
         data-pan-x={pan.x}
         data-pan-y={pan.y}
-        onMouseDown={(event) => {
-          if (event.button === 0) beginPan(event.clientX, event.clientY);
+        onPointerDown={(event) => {
+          if (event.button === 0) { event.currentTarget.setPointerCapture?.(event.pointerId); beginPan(event.clientX, event.clientY); }
         }}
-        onMouseMove={(event) => movePan(event.clientX, event.clientY)}
-        onMouseUp={endPan}
-        onMouseLeave={endPan}
+        onPointerMove={(event) => movePan(event.clientX, event.clientY)}
+        onPointerUp={endPan}
+        onPointerCancel={endPan}
       >
         {visibleNodes.length === 0 ? (
-          <div className="graph-empty">No visible Conversation nodes in this overlay.</div>
+          <div className="graph-empty">没有可见任务，请调整筛选或隐藏状态。</div>
         ) : (
           <div
             className="graph-stage"
@@ -802,17 +847,13 @@ function ConversationGraph({
                 const source = positions.get(edge.source);
                 const target = positions.get(edge.target);
                 if (!source || !target) return null;
-                return (
-                  <line
-                    key={edge.id}
-                    className="graph-edge"
-                    x1={source.x + 92}
-                    y1={source.y + 48}
-                    x2={target.x + 92}
-                    y2={target.y + 48}
-                    markerEnd={edge.type === "related_to" ? undefined : "url(#graph-arrow)"}
-                  />
-                );
+                const siblings = visibleEdges.filter(item => [edge.source, edge.target].sort().join("|") === [item.source, item.target].sort().join("|"));
+                const offset = (siblings.indexOf(edge) - (siblings.length - 1) / 2) * 90 * (edge.source < edge.target ? 1 : -1);
+                const geometry = edgeGeometry(source, target, offset);
+                return <g key={edge.id}>
+                  <path className={`graph-edge ${edge.type === "related_to" ? "is-related" : ""}`} d={geometry.path} fill="none" markerEnd={edge.type === "related_to" ? undefined : "url(#graph-arrow)"} />
+                  <text className="graph-edge-label" x={geometry.label.x} y={geometry.label.y - 8} textAnchor="middle">{relationNames[edge.type] ?? edge.type}<title>{edge.label || relationNames[edge.type] || edge.type}</title></text>
+                </g>;
               })}
             </svg>
             {visibleNodes.map((node) => {
@@ -825,11 +866,12 @@ function ConversationGraph({
                   className={`graph-node ${node.missing ? "is-missing" : ""} ${node.id === selectedId ? "is-selected" : ""}`}
                   style={{ left: point.x, top: point.y }}
                   data-conversation-id={node.id}
-                  aria-label={`Conversation ${node.displayTitle} (${node.id})`}
+                  aria-label={`任务 ${node.displayTitle} (${node.id})`}
                   aria-pressed={node.id === selectedId}
-                  onMouseDown={(event) => {
+                  onPointerDown={(event) => {
                     event.stopPropagation();
-                    if (readOnly) return;
+                    if (readOnly || !manual || event.button !== 0) return;
+                    event.currentTarget.setPointerCapture?.(event.pointerId);
                     suppressClick.current = false;
                     const point = positions.get(node.id);
                     if (!point) return;
@@ -850,8 +892,9 @@ function ConversationGraph({
                     onSelect(node.id);
                   }}
                 >
-                  <span className="graph-node-kind">{node.missing ? "Missing source" : "Conversation"}</span>
-                  <strong>{node.displayTitle}</strong>
+                  <span className="graph-node-kind">{node.missing ? "来源缺失" : "任务"}</span>
+                  <strong title={node.displayTitle}>{node.displayTitle}</strong>
+                  <span className="node-state">{statusNames[conversations.find(c => c.id === node.id)?.overlay.status ?? "none"]} · {conversations.find(c => c.id === node.id)?.overlay.tags.join(" · ") || "无标签"}</span>
                   <code>{node.id}</code>
                 </button>
               );
@@ -861,11 +904,11 @@ function ConversationGraph({
       </div>
       {layoutError && (
         <p className="graph-error" role="alert">
-          Could not save node layout: {layoutError}
+          无法保存节点位置: {layoutError}
         </p>
       )}
       <p className="graph-caption">
-        {visibleNodes.length} visible node{visibleNodes.length === 1 ? "" : "s"} · drag nodes to save layout · drag the field to pan
+        {visibleNodes.length} 个可见任务 · {manual ? "拖动节点保存位置" : "自动按关联成组，筛选保留位置"} · 拖动空白区域平移
       </p>
       <RelationshipEditor
         nodes={nodes}
@@ -918,40 +961,40 @@ function RelationshipEditor({ nodes, edges, editing, readOnly }: RelationshipEdi
   }
 
   return (
-    <section className="relationship-editor" aria-label="Relationship editor">
+    <section className="relationship-editor" aria-label="关系编辑器">
       <div className="relationship-heading">
         <div>
-          <p className="section-kicker">RELATIONSHIPS / SOURCE → TARGET</p>
-          <h3>Relationships</h3>
+          <p className="section-kicker">人工关系 / 起点 → 终点</p>
+          <h3>任务关系</h3>
         </div>
         <span className="relationship-count">{String(edges.length).padStart(2, "0")}</span>
       </div>
       <div className="relationship-layout">
         <form className="relationship-form" onSubmit={submitRelationship}>
-          <p className="relationship-form-kicker">{editingEdgeId ? "EDIT RELATIONSHIP" : "ADD RELATIONSHIP"}</p>
-          <label htmlFor="relationship-source">Source</label>
+          <p className="relationship-form-kicker">{editingEdgeId ? "编辑关系" : "添加关系"}</p>
+          <label htmlFor="relationship-source">来源</label>
           <input
             id="relationship-source"
             list="conversation-id-options"
           value={source}
           onChange={(event) => editing.editRelationship({ ...value, source: event.target.value })}
-          placeholder="Conversation ID"
+          placeholder="任务标识"
           autoComplete="off"
           disabled={readOnly}
           />
 
-          <label htmlFor="relationship-target">Target</label>
+          <label htmlFor="relationship-target">目标</label>
           <input
             id="relationship-target"
             list="conversation-id-options"
           value={target}
           onChange={(event) => editing.editRelationship({ ...value, target: event.target.value })}
-          placeholder="Conversation ID"
+          placeholder="任务标识"
           autoComplete="off"
           disabled={readOnly}
           />
 
-          <label htmlFor="relationship-type">Relationship type</label>
+          <label htmlFor="relationship-type">关系类型</label>
           <select
             id="relationship-type"
           value={relationType}
@@ -959,60 +1002,60 @@ function RelationshipEditor({ nodes, edges, editing, readOnly }: RelationshipEdi
           disabled={readOnly}
           >
             {BUILT_IN_RELATION_TYPES.map((type) => (
-              <option key={type} value={type}>{type}</option>
+              <option key={type} value={type}>{relationNames[type] ?? type}</option>
             ))}
-            <option value={CUSTOM_RELATION_VALUE}>Custom relationship…</option>
+            <option value={CUSTOM_RELATION_VALUE}>自定义关系…</option>
           </select>
           {relationType === CUSTOM_RELATION_VALUE && (
             <>
-              <label htmlFor="custom-relationship-type">Custom type</label>
+              <label htmlFor="custom-relationship-type">自定义类型</label>
               <input
                 id="custom-relationship-type"
                 value={customType}
                 onChange={(event) => editing.editRelationship({ ...value, type: event.target.value })}
-                placeholder="e.g. informs"
+                placeholder="例如：提供背景"
                 autoComplete="off"
                 disabled={readOnly}
               />
             </>
           )}
 
-          <label htmlFor="relationship-label">Label <span>(optional)</span></label>
+          <label htmlFor="relationship-label">说明 <span>（可选）</span></label>
           <input
             id="relationship-label"
             value={label}
             onChange={(event) => editing.editRelationship({ ...value, label: event.target.value })}
-            placeholder="Explain the relationship"
+            placeholder="描述这条关系"
             disabled={readOnly}
           />
           <div className="relationship-form-actions">
             <button type="submit" className="relationship-save" disabled={readOnly || pendingSave}>
-              {mutationState === "saving" ? "Saving…" : editingEdgeId ? "Save relationship" : "Add relationship"}
+              {mutationState === "saving" ? "保存中…" : editingEdgeId ? "保存关系" : "添加关系"}
             </button>
             {editingEdgeId && (
               <button type="button" className="relationship-cancel" onClick={() => editing.selectRelationship(null)} disabled={readOnly}>
-                New relationship
+                新建关系
               </button>
             )}
             {editingEdgeId && (
               <button type="button" className="relationship-cancel" onClick={() => editing.discardRelationship()} disabled={readOnly || pendingSave}>
-                Cancel edit
+                取消编辑
               </button>
             )}
           </div>
-          {mutationState === "saved" && <span className="relationship-success" role="status">Relationship saved</span>}
+          {mutationState === "saved" && <span className="relationship-success" role="status">关系已保存</span>}
           {mutationState === "error" && mutationError && (
-            <span className="relationship-error" role="alert">Could not save relationship: {mutationError}</span>
+            <span className="relationship-error" role="alert">无法保存关系: {mutationError}</span>
           )}
         </form>
 
         <div className="relationship-list">
           <div className="relationship-list-heading">
-            <span>Saved edges</span>
-            <span>Direction is semantic</span>
+            <span>已保存关系</span>
+            <span>箭头表示关系方向</span>
           </div>
           {edges.length === 0 ? (
-            <p className="relationship-empty">No artificial relationships yet.</p>
+            <p className="relationship-empty">还没有人工关系，可从选中任务开始建立。</p>
           ) : (
             <ul>
               {edges.map((edge) => {
@@ -1020,22 +1063,22 @@ function RelationshipEditor({ nodes, edges, editing, readOnly }: RelationshipEdi
                 const targetNode = nodeById.get(edge.target);
                 const connector = edge.type === "related_to" ? "↔" : "→";
                 return (
-                  <li key={edge.id} aria-label={`Relationship ${edge.source} ${edge.type} ${edge.target}`}>
+                  <li key={edge.id} aria-label={`关系 ${edge.source} ${edge.type} ${edge.target}`}>
                     <div className="relationship-flow">
                       <strong>{sourceNode?.displayTitle ?? edge.source}</strong>
-                      <span aria-label={edge.type === "related_to" ? "undirected" : "directed"}>{connector}</span>
+                      <span aria-label={edge.type === "related_to" ? "无向关系" : "有向关系"}>{connector}</span>
                       <strong>{targetNode?.displayTitle ?? edge.target}</strong>
                     </div>
                     <div className="relationship-meta">
-                      <span>{edge.type}</span>
+                      <span>{relationNames[edge.type] ?? edge.type}</span>
                       {edge.label && <span>· {edge.label}</span>}
                     </div>
                     <code>{edge.source} {connector} {edge.target} · {edge.id}</code>
                     <div className="relationship-actions">
-                      <button type="button" onClick={() => editing.selectRelationship(edge.id)} disabled={readOnly} aria-label={`Edit relationship ${edge.id}`}>
+                      <button type="button" onClick={() => editing.selectRelationship(edge.id)} disabled={readOnly} aria-label={`编辑关系 ${edge.id}`}>
                         Edit
                       </button>
-                      <button type="button" onClick={() => void editing.deleteRelationship(edge.id)} disabled={readOnly || pendingSave} aria-label={`Delete relationship ${edge.id}`}>
+                      <button type="button" onClick={() => void editing.deleteRelationship(edge.id)} disabled={readOnly || pendingSave} aria-label={`删除关系 ${edge.id}`}>
                         Delete
                       </button>
                     </div>
@@ -1055,36 +1098,50 @@ function RelationshipEditor({ nodes, edges, editing, readOnly }: RelationshipEdi
 
 interface ConversationListProps {
   conversations: Conversation[];
+  filters: ConversationFilters;
+  tags: string[];
+  totalCount: number;
+  onFilterChange: (changes: Partial<ConversationFilters>) => void;
+  onFilterReset: () => void;
   selectedId: string | null;
   onSelect: (id: string) => void;
 }
 
-function ConversationList({ conversations, selectedId, onSelect }: ConversationListProps) {
+function ConversationList({ conversations, filters, tags, totalCount, onFilterChange, onFilterReset, selectedId, onSelect }: ConversationListProps) {
   return (
     <section className="list-section" aria-labelledby="conversation-list-title">
       <div className="list-heading">
         <div>
-          <p className="section-kicker">Source snapshot / complete</p>
-          <h2 id="conversation-list-title">Conversation List</h2>
+          <p className="section-kicker">当前来源快照</p>
+          <h2 id="conversation-list-title">任务列表</h2>
         </div>
         <div className="list-count">
           <strong>{String(conversations.length).padStart(2, "0")}</strong>
-          <span>THREADS FOUND</span>
+          <span>个任务</span>
         </div>
       </div>
 
+      <ConversationFilterBar
+        filters={filters}
+        tags={tags}
+        visibleCount={conversations.length}
+        totalCount={totalCount}
+        onChange={onFilterChange}
+        onReset={onFilterReset}
+      />
+
       {conversations.length === 0 ? (
-        <div className="empty-panel">No local conversations belong to this Project yet.</div>
+        <div className="empty-panel">没有匹配的任务，请检查项目或筛选条件。</div>
       ) : (
         <div className="table-wrap">
-          <table aria-label="Conversation list">
+          <table aria-label="任务列表">
             <thead>
               <tr>
-                <th>Conversation</th>
-                <th>Observed</th>
-                <th>Working directory</th>
-                <th>Source</th>
-                <th>State</th>
+                <th>任务</th>
+                <th>观测区间</th>
+                <th>工作目录</th>
+                <th>来源</th>
+                <th>状态</th>
               </tr>
             </thead>
             <tbody>
@@ -1127,15 +1184,15 @@ function ConversationRow({ conversation, selected, onSelect }: ConversationRowPr
       }}
     >
       <td>
-        <div className="conversation-title">{conversation.displayTitle}</div>
+        <div className="conversation-title" title={conversation.displayTitle}>{conversation.displayTitle}</div><span className="task-metadata">{statusNames[conversation.overlay.status]} · {conversation.overlay.tags.join(" · ") || "无标签"}</span>
         <code>{conversation.id}</code>
       </td>
       <td>
           <div className="time-stack">
             <time dateTime={codex.createdAt ?? undefined}>{formatTimestamp(codex.createdAt)}</time>
-            <span>to {formatTimestamp(codex.updatedAt)}</span>
+            <span>至 {formatTimestamp(codex.updatedAt)}</span>
             {!conversation.derived.validObservationRange && (
-              <strong className="time-warning">Invalid observation range</strong>
+              <strong className="time-warning">无效的观测区间</strong>
             )}
           </div>
       </td>
@@ -1143,11 +1200,11 @@ function ConversationRow({ conversation, selected, onSelect }: ConversationRowPr
       <td><span className="source-tag">{codex.source}</span></td>
       <td>
         {conversation.derived.missing ? (
-          <span className="missing-tag">Missing source</span>
+          <span className="missing-tag">来源缺失</span>
         ) : codex.archived ? (
-          <span className="archive-tag">Archived</span>
+          <span className="archive-tag">已归档</span>
         ) : (
-          <span className="active-tag">Active</span>
+          <span className="active-tag">未归档</span>
         )}
       </td>
     </tr>
@@ -1169,51 +1226,51 @@ function ConversationDetail({ conversation, editing, readOnly }: {
   }
 
   return (
-    <form className="detail-panel" role="region" aria-label="Conversation detail" onSubmit={saveChanges}>
-      <span className="ribbon-label">SELECTED CONVERSATION</span>
+    <form className="detail-panel" role="region" aria-label="任务详情" onSubmit={saveChanges}>
+      <span className="ribbon-label">任务详情</span>
       <strong>{conversation.displayTitle}</strong>
       <code>{conversation.id}</code>
-      {conversation.derived.missing && <span className="missing-detail">Source record is no longer available.</span>}
-      <span className="detail-source">{conversation.codex.cwd || "No source working directory"}</span>
+      {conversation.derived.missing && <span className="missing-detail">来源记录已不可用。</span>}
+      <span className="detail-source">{conversation.codex.cwd || "没有来源工作目录"}</span>
 
-      <label htmlFor="conversation-title">Custom title</label>
+      <label htmlFor="conversation-title">自定义标题</label>
       <input
         id="conversation-title"
         value={draft.title}
         onChange={(event) => updateDraft({ ...draft, title: event.target.value })}
-        placeholder={conversation.codex.title ?? "Uses the Codex title"}
+        placeholder={conversation.codex.title ?? "默认使用来源标题"}
         disabled={readOnly}
       />
 
-      <label htmlFor="conversation-tags">Tags</label>
+      <label htmlFor="conversation-tags">标签</label>
       <input
         id="conversation-tags"
         value={draft.tags}
         onChange={(event) => updateDraft({ ...draft, tags: event.target.value })}
-        placeholder="design, release, research"
+        placeholder="设计, 发布, 调研"
         disabled={readOnly}
       />
 
-      <label htmlFor="conversation-status">User status</label>
+      <label htmlFor="conversation-status">任务状态</label>
       <select
         id="conversation-status"
         value={draft.status}
         onChange={(event) => updateDraft({ ...draft, status: event.target.value as UserStatus })}
         disabled={readOnly}
       >
-        <option value="none">None</option>
-        <option value="active">Active</option>
-        <option value="done">Done</option>
-        <option value="blocked">Blocked</option>
+        <option value="none">未设置</option>
+        <option value="active">进行中</option>
+        <option value="done">已完成</option>
+        <option value="blocked">阻塞</option>
       </select>
 
-      <label htmlFor="conversation-note">Note</label>
+      <label htmlFor="conversation-note">备注</label>
       <textarea
         id="conversation-note"
         value={draft.note}
         onChange={(event) => updateDraft({ ...draft, note: event.target.value })}
         rows={4}
-        placeholder="Add context only you own."
+        placeholder="记录补充说明。"
         disabled={readOnly}
       />
 
@@ -1225,20 +1282,20 @@ function ConversationDetail({ conversation, editing, readOnly }: {
           onChange={(event) => updateDraft({ ...draft, hidden: event.target.checked })}
           disabled={readOnly}
         />
-        <span>Hidden from Graph</span>
+        <span>在关系图中隐藏</span>
       </label>
 
       {conversation.overlay.layout && (
         <span className="detail-layout">
-          Layout · x {formatLayoutValue(conversation.overlay.layout.x)} / y {formatLayoutValue(conversation.overlay.layout.y)}
+          位置 · x {formatLayoutValue(conversation.overlay.layout.x)} / y {formatLayoutValue(conversation.overlay.layout.y)}
         </span>
       )}
-      {saveState === "saved" && <span className="detail-success" role="status">Changes saved</span>}
+      {saveState === "saved" && <span className="detail-success" role="status">修改已保存</span>}
       {saveState === "error" && saveError && (
-        <span className="detail-error" role="alert">Could not save changes: {saveError}</span>
+        <span className="detail-error" role="alert">无法保存修改: {saveError}</span>
       )}
       <button type="submit" className="detail-save" disabled={readOnly || editing.getState().pendingSaves > 0}>
-        {saveState === "saving" ? "Saving…" : "Save changes"}
+        {saveState === "saving" ? "保存中…" : "保存修改"}
       </button>
     </form>
   );

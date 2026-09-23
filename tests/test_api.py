@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from codexflow.app import create_app
+from codexflow.directory_picker import DirectoryPickerUnavailableError
 from codexflow.source import CodexThread, SourceFailure, SourceReadResult
 
 
@@ -44,6 +45,31 @@ def ready(*threads: CodexThread) -> SourceReadResult:
         generated_at="2024-01-01T02:00:00Z",
         user_agent="Codex Desktop/0.150.1 fixture",
     )
+
+
+@pytest.mark.asyncio
+async def test_project_directory_picker_returns_a_path_or_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    app = create_app(source=ApiSource(ready()))
+    monkeypatch.setattr("codexflow.app.pick_directory", lambda: "/projects/chosen")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        chosen = await client.post("/api/project/pick-directory", json={})
+        assert chosen.json() == {"path": "/projects/chosen"}
+        monkeypatch.setattr("codexflow.app.pick_directory", lambda: None)
+        cancelled = await client.post("/api/project/pick-directory", json={})
+        assert cancelled.json() == {"path": None}
+
+
+@pytest.mark.asyncio
+async def test_project_directory_picker_reports_unavailable_ui(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable() -> None:
+        raise DirectoryPickerUnavailableError("无法打开目录选择窗口")
+
+    app = create_app(source=ApiSource(ready()))
+    monkeypatch.setattr("codexflow.app.pick_directory", unavailable)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post("/api/project/pick-directory", json={})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "directory_picker_unavailable"
 
 
 @pytest.mark.asyncio

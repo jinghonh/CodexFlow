@@ -183,7 +183,7 @@ export class GraphEditing {
   async requestProject(path: string): Promise<void> {
     if (this.state.phase !== "idle") return;
     if (!path.trim()) {
-      this.publish({ error: new Error("Choose a Project root first.") });
+      this.publish({ error: new Error("请先选择项目目录。") });
       return;
     }
     await this.requestIntent({ kind: "project", path: path.trim() });
@@ -206,7 +206,7 @@ export class GraphEditing {
       const failure = await this.saveBatch([...this.drafts.values()]);
       if (epoch !== this.epoch) return;
       if (failure || this.drafts.size > 0) {
-        this.publish({ phase: "idle", decisionError: failure?.message ?? "New changes remain unsaved. Choose what to do before continuing." });
+        this.publish({ phase: "idle", decisionError: failure?.message ?? "仍有新修改未保存，请选择如何处理。" });
         return;
       }
     }
@@ -224,7 +224,7 @@ export class GraphEditing {
         if (epoch !== this.epoch) return;
         if (this.drafts.size && this.state.snapshot && snapshot.graph.etag !== this.state.snapshot.graph.etag) {
           const conflict = new ApiError(412, {
-            code: "graph_conflict", message: "The Graph changed while drafts were open. Resolve the conflict before loading new views.",
+            code: "graph_conflict", message: "编辑期间关系数据发生变化，请先解决冲突。",
             details: { expectedEtag: this.state.snapshot.graph.etag, currentEtag: snapshot.graph.etag }, retryable: true,
           });
           this.rememberConflict(conflict, "drafts");
@@ -338,7 +338,7 @@ export class GraphEditing {
       for (const draft of drafts) {
         if ((this.confirmed.get(draft.generation) ?? 0) >= draft.revision) continue;
         try {
-          if (this.state.conflict && !force) throw new Error("Resolve the Graph conflict before saving more changes.");
+          if (this.state.conflict && !force) throw new Error("请先解决关系数据冲突再继续保存。");
           await this.commit(draft, force, epoch);
           force = false;
         } catch (reason) {
@@ -371,7 +371,7 @@ export class GraphEditing {
 
   private async commit(draft: Draft, overwrite: boolean, epoch: number): Promise<void> {
     const base = this.state.snapshot;
-    if (!base) throw new Error("Load a Project before saving Graph changes.");
+    if (!base) throw new Error("请先加载项目再保存修改。");
     const change = this.resolveChange(draft);
     const etag = overwrite ? "*" : base.graph.etag;
     const force: [boolean] | [] = overwrite ? [true] : [];
@@ -404,7 +404,7 @@ export class GraphEditing {
           if (this.state.relationshipId === null) this.publish({ relationshipId: created.id });
         }
       } else if (current && current.revision !== draft.revision) {
-        throw new Error("The saved relationship identity was not returned. Reload the Graph before retrying this draft.");
+        throw new Error("保存后未返回关系标识，请重新加载再重试。");
       }
     }
     this.confirmed.set(draft.generation, draft.revision);
@@ -528,9 +528,9 @@ export class GraphEditing {
       const error = this.feedback.get(key)?.error ?? null;
       let label: string;
       if (change.kind === "node" || change.kind === "layout") {
-        label = `${this.findConversation(change.id)?.displayTitle ?? change.id} · ${change.kind === "node" ? "metadata" : "layout"}`;
+        label = `${this.findConversation(change.id)?.displayTitle ?? change.id} · ${change.kind === "node" ? "任务信息" : "节点位置"}`;
         if (change.kind === "layout") { layoutDrafts.set(change.id, change.value); layoutError ??= error; }
-      } else label = change.kind === "delete-edge" ? `Delete relationship ${change.id}` : `Relationship ${change.value.source || "…"} → ${change.value.target || "…"}`;
+      } else label = change.kind === "delete-edge" ? `删除关系 ${change.id}` : `关系 ${change.value.source || "…"} → ${change.value.target || "…"}`;
       return { key, label, error };
     });
     this.state = { ...this.state, ...changes, dirtyDrafts, layoutDrafts, layoutError };
@@ -580,8 +580,8 @@ function edgeChanges(value: RelationshipDraft): GraphEdgeCreate {
   const source = value.source.trim();
   const target = value.target.trim();
   const type = value.type.trim();
-  if (!source || !target || !type) throw new Error("Source, target, and relationship type are required.");
-  if (source === target) throw new Error("A relationship cannot connect a Conversation to itself.");
+  if (!source || !target || !type) throw new Error("请填写起点、目标和关系类型。");
+  if (source === target) throw new Error("任务不能与自身建立关系。");
   return { source, target, type, label: value.label.trim() || null };
 }
 
@@ -624,19 +624,19 @@ function sparseNode(overlay: ConversationOverlayUpdate): GraphDocumentNode {
 function equal(left: unknown, right: unknown): boolean { return JSON.stringify(left) === JSON.stringify(right); }
 
 function asError(reason: unknown): Error {
-  return reason instanceof Error ? reason : new Error("Unexpected local runtime error.");
+  return reason instanceof Error ? reason : new Error("本地服务发生意外错误。");
 }
 
 function describeMutationError(reason: unknown): string {
   const error = asError(reason);
   if (error instanceof ApiError) {
-    return `Error category: ${error.payload.code}. ${error.message} Your current edits remain here. Retryable: ${error.payload.retryable ? "yes" : "no"}. ${error.payload.retryable ? "Retry the save or resolve the Graph conflict." : "Review the field values before trying again."}`;
+    return `错误类别： ${error.payload.code}. ${error.message} 当前修改已保留。 可重试：${error.payload.retryable ? "是" : "否"}。 ${error.payload.retryable ? "请重试保存或解决数据冲突。" : "请检查字段后重试。"}`;
   }
-  return `Error category: local_error. ${error.message} Your current edits remain here. Retry the save when ready.`;
+  return `错误类别： local_error. ${error.message} 当前修改已保留。 可稍后重试保存。`;
 }
 
 function describeRefreshError(error: Error, hasSnapshot: boolean): string {
   const category = error instanceof ApiError ? error.payload.code : "local_error";
   const retryable = error instanceof ApiError ? error.payload.retryable : true;
-  return `Error category: ${category}. ${error.message} ${hasSnapshot ? "The last complete snapshot is preserved." : "No complete source snapshot is available yet."} Retryable: ${retryable ? "yes" : "no"}. ${retryable ? "Retry the source refresh when it is available." : "Review the error details before trying again."}`;
+  return `错误类别： ${category}. ${error.message} ${hasSnapshot ? "已保留上次完整快照。" : "尚无完整来源快照。"} 可重试：${retryable ? "是" : "否"}。 ${retryable ? "来源恢复后可重试刷新。" : "请检查错误详情后重试。"}`;
 }

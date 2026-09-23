@@ -34,6 +34,8 @@ export function TimelineView({
   );
   const [timezone, setTimezone] = useState(timeline?.timezone ?? "UTC");
   const [draftTimezone, setDraftTimezone] = useState(timezone);
+  const [windowStart, setWindowStart] = useState(0);
+  const [windowSize, setWindowSize] = useState(7);
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -42,6 +44,21 @@ export function TimelineView({
     setTimezone(timeline.timezone);
     setDraftTimezone(timeline.timezone);
   }, [timeline?.granularity, timeline?.timezone]);
+
+  useEffect(() => {
+    if (!timeline) return;
+    setWindowStart(Math.max(0, timeline.buckets.length - windowSize));
+  }, [timeline?.granularity, timeline?.buckets.length, timeline?.buckets.at(-1)?.start]);
+
+  useEffect(() => {
+    if (!timeline || !selectedId) return;
+    const range = timeline.ranges.find((item) => item.conversationId === selectedId);
+    if (!range) return;
+    const last = lastIntersectingBucketIndex(range, timeline);
+    if (last >= 0) {
+      setWindowStart(Math.max(0, Math.min(timeline.buckets.length - windowSize, last - Math.floor(windowSize / 2))));
+    }
+  }, [selectedId, timeline?.granularity, timeline?.buckets.length, timeline?.buckets.at(-1)?.start]);
 
   const conversationById = useMemo(
     () => new Map(conversations.map((conversation) => [conversation.id, conversation])),
@@ -63,7 +80,7 @@ export function TimelineView({
     event.preventDefault();
     const nextTimezone = draftTimezone.trim();
     if (!nextTimezone) {
-      setLocalError("Enter an IANA time zone, such as UTC or Asia/Shanghai.");
+      setLocalError("请输入有效时区，例如 UTC 或 Asia/Shanghai。");
       return;
     }
     setLocalError(null);
@@ -79,18 +96,21 @@ export function TimelineView({
 
   if (!timeline) {
     return (
-      <section className="timeline-section" aria-label="Conversation timeline">
+      <section className="timeline-section" aria-label="任务时间线">
         <div className="timeline-heading">
           <div>
-            <p className="section-kicker">Observation range / source time</p>
-            <h2 id="timeline-title">Timeline</h2>
+            <p className="section-kicker">创建至最近更新</p>
+            <h2 id="timeline-title">时间线</h2>
           </div>
         </div>
-        <div className="timeline-empty">Timeline data is not available in this source snapshot.</div>
+        <div className="timeline-empty">当前来源快照没有时间线数据。</div>
       </section>
     );
   }
 
+  const maxWindowStart = Math.max(0, timeline.buckets.length - windowSize);
+  const offset = Math.min(windowStart, maxWindowStart);
+  const displayed = { ...timeline, buckets: timeline.buckets.slice(offset, offset + windowSize) };
   const validRanges = timeline.ranges.filter((range) => {
     const conversation = conversationById.get(range.conversationId);
     return range.valid && conversation !== undefined && !conversation.derived.missing;
@@ -98,23 +118,23 @@ export function TimelineView({
   const visibleWarnings = timeline.warnings.filter((warning) =>
     conversationById.has(warning.conversationId),
   );
-  const visibleBuckets = timeline.buckets.map((bucket) => ({
+  const visibleBuckets = displayed.buckets.map((bucket) => ({
     ...bucket,
     overlapCount: countVisibleOverlaps(bucket, timeline.ranges, conversationById),
   }));
-  const gridTemplateColumns = `minmax(210px, 0.42fr) repeat(${timeline.buckets.length}, minmax(132px, 1fr))`;
-  const trackTemplateColumns = `repeat(${timeline.buckets.length}, minmax(132px, 1fr))`;
+  const gridTemplateColumns = `230px repeat(${displayed.buckets.length}, minmax(100px, 1fr))`;
+  const trackTemplateColumns = `repeat(${displayed.buckets.length}, minmax(100px, 1fr))`;
 
   return (
-    <section className="timeline-section" aria-label="Conversation timeline">
+    <section className="timeline-section" aria-label="任务时间线">
       <div className="timeline-heading">
         <div>
-          <p className="section-kicker">Observation range / source time</p>
-          <h2 id="timeline-title">Timeline</h2>
+          <p className="section-kicker">创建至最近更新</p>
+          <h2 id="timeline-title">时间线</h2>
         </div>
         <div className="timeline-controls">
-          <div className="timeline-scale" role="group" aria-label="Time bucket">
-            <span className="timeline-control-label">Scale</span>
+          <div className="timeline-scale" role="group" aria-label="时间粒度">
+            <span className="timeline-control-label">粒度</span>
             {GRANULARITIES.map((value) => (
               <button
                 key={value}
@@ -124,12 +144,12 @@ export function TimelineView({
                 disabled={loading}
                 onClick={() => void changeGranularity(value)}
               >
-                {capitalize(value)}
+                {{ day: "日", week: "周", month: "月" }[value]}
               </button>
             ))}
           </div>
           <form className="timeline-timezone" onSubmit={submitTimezone}>
-            <label htmlFor="timeline-timezone">Time zone</label>
+            <label htmlFor="timeline-timezone">时区</label>
             <div className="timeline-timezone-input">
               <input
                 id="timeline-timezone"
@@ -139,7 +159,7 @@ export function TimelineView({
                 list="timeline-timezone-options"
                 autoComplete="off"
               />
-              <button type="submit" disabled={loading}>Apply</button>
+              <button type="submit" disabled={loading}>应用</button>
             </div>
             <datalist id="timeline-timezone-options">
               <option value="UTC" />
@@ -152,12 +172,31 @@ export function TimelineView({
         </div>
       </div>
 
+      <div className="timeline-navigation">
+        <button type="button" disabled={offset === 0} onClick={() => setWindowStart(Math.max(0, offset - windowSize))}>← 上一段</button>
+        <button type="button" disabled={offset === maxWindowStart} onClick={() => setWindowStart(Math.min(maxWindowStart, offset + windowSize))}>下一段 →</button>
+        <button type="button" disabled={offset === maxWindowStart} onClick={() => setWindowStart(maxWindowStart)}>回到最近</button>
+        <button type="button" disabled={!selectedId} onClick={() => {
+          const range = timeline.ranges.find((item) => item.conversationId === selectedId);
+          const last = range ? lastIntersectingBucketIndex(range, timeline) : -1;
+          if (last >= 0) setWindowStart(Math.max(0, Math.min(maxWindowStart, last - Math.floor(windowSize / 2))));
+        }}>定位选中任务</button>
+        <label>显示范围 <select aria-label="显示时间桶数量" value={windowSize} onChange={(event) => {
+          const nextSize = Number(event.target.value);
+          setWindowStart(Math.max(0, Math.min(timeline.buckets.length - nextSize, offset + windowSize - nextSize)));
+          setWindowSize(nextSize);
+        }}><option value={7}>7 个时间桶</option><option value={14}>14 个时间桶</option><option value={30}>30 个时间桶</option></select></label>
+        <label className="timeline-position">浏览时间
+          <input type="range" min={0} max={maxWindowStart} value={offset} disabled={maxWindowStart === 0} onChange={(event) => setWindowStart(Number(event.target.value))} aria-label="时间线位置" />
+        </label>
+        <span className="timeline-visible-range" aria-live="polite">{displayed.buckets[0]?.label} — {displayed.buckets.at(-1)?.label} · {offset + 1}–{Math.min(offset + windowSize, timeline.buckets.length)} / {timeline.buckets.length}</span>
+      </div>
       <div className="timeline-meta" aria-live="polite">
         <span>{timeline.timezone}</span>
-        <span>{capitalize(timeline.granularity)} buckets</span>
-        <span>Overlap count</span>
-        <span>Source times · read-only</span>
-        {loading && <span className="timeline-loading">Updating…</span>}
+        <span>{{ day: "日", week: "周", month: "月" }[timeline.granularity]}时间桶</span>
+        <span>相交任务数</span>
+        <span>来源时间 · 只读</span>
+        {loading && <span className="timeline-loading">更新中…</span>}
       </div>
 
       {activeError && (
@@ -167,10 +206,10 @@ export function TimelineView({
       )}
 
       {visibleWarnings.length > 0 && (
-        <div className="timeline-warning" role="alert" aria-label="Timeline warnings">
+        <div className="timeline-warning" role="alert" aria-label="时间线提示">
           <div>
-            <strong>Invalid observation range</strong>
-            <span>{visibleWarnings.length} source record{visibleWarnings.length === 1 ? "" : "s"} will not be drawn or counted.</span>
+            <strong>无效的观测区间</strong>
+            <span>{visibleWarnings.length} 条来源记录不会绘制或计数。</span>
           </div>
           <ul>
             {visibleWarnings.map((warning) => {
@@ -189,16 +228,16 @@ export function TimelineView({
       )}
 
       {timeline.buckets.length === 0 ? (
-        <div className="timeline-empty">No valid Observation range is available to draw.</div>
+        <div className="timeline-empty">没有有效的观测区间。</div>
       ) : (
-        <div className="timeline-scroll" aria-label="Timeline buckets">
+        <div className="timeline-scroll" aria-label="时间线时间桶">
           <div className="timeline-grid" style={{ gridTemplateColumns }}>
-            <div className="timeline-axis-label">Conversation / range</div>
+            <div className="timeline-axis-label">任务 / 观测区间</div>
             {visibleBuckets.map((bucket) => (
               <div
                 key={bucket.start}
                 className="timeline-bucket"
-                aria-label={`${bucket.label}, ${bucket.overlapCount} overlapping conversations`}
+                aria-label={`${bucket.label}, ${bucket.overlapCount} 个相交任务`}
                 title={`${formatTimelineTime(bucket.start, timeline.timezone)} → ${formatTimelineTime(bucket.end, timeline.timezone)}`}
               >
                 <span>{bucket.label}</span>
@@ -208,9 +247,9 @@ export function TimelineView({
 
             {validRanges.map((range) => {
               const conversation = conversationById.get(range.conversationId);
-              const columns = rangeColumns(range, timeline);
+              const columns = rangeColumns(range, displayed);
               if (!conversation || !columns) return null;
-              const rangeLabel = range.isPoint ? "point" : "range";
+              const rangeLabel = range.isPoint ? "时间点" : "区间";
               return (
                 <div
                   key={range.conversationId}
@@ -224,10 +263,10 @@ export function TimelineView({
                     data-conversation-id={conversation.id}
                     onClick={() => onSelect(conversation.id)}
                   >
-                    <strong>{conversation.displayTitle}</strong>
+                    <strong title={conversation.displayTitle}>{conversation.displayTitle}</strong>
                     <span>
-                      {conversation.overlay.hidden ? "Hidden · " : ""}
-                      {conversation.codex.archived ? "Archived" : "Active"} · {capitalize(rangeLabel)}
+                      {conversation.overlay.hidden ? "已隐藏 · " : ""}
+                      {conversation.codex.archived ? "已归档" : "未归档"} · {capitalize(rangeLabel)}
                     </span>
                     <code>{conversation.id}</code>
                   </button>
@@ -235,19 +274,19 @@ export function TimelineView({
                     className="timeline-track"
                     style={{ gridColumn: "2 / -1", gridTemplateColumns: trackTemplateColumns }}
                   >
-                    {timeline.buckets.map((bucket) => (
+                    {displayed.buckets.map((bucket) => (
                       <span key={bucket.start} className="timeline-track-cell" aria-hidden="true" />
                     ))}
                     <button
                       type="button"
                       className={`timeline-bar ${range.isPoint ? "is-point" : ""} ${conversation.id === selectedId ? "is-selected" : ""}`}
-                      style={{ gridColumn: `${columns.start} / ${columns.end}` }}
+                      style={rangeStyle(range, displayed)}
                       data-conversation-id={conversation.id}
-                      aria-label={`${conversation.displayTitle} observation ${rangeLabel}`}
+                      aria-label={`${conversation.displayTitle}观测${rangeLabel}`}
                       title={`${formatTimelineTime(range.start, timeline.timezone)} → ${formatTimelineTime(range.end, timeline.timezone)}`}
                       onClick={() => onSelect(conversation.id)}
                     >
-                      {range.isPoint ? <span className="timeline-point-mark">Point</span> : <span>Observation range</span>}
+                      {range.isPoint ? <span className="timeline-point-mark" /> : <span>观测区间</span>}
                     </button>
                   </div>
                 </div>
@@ -257,10 +296,24 @@ export function TimelineView({
         </div>
       )}
       <p className="timeline-caption">
-        Counts are distinct Conversations whose Observation ranges intersect each half-open bucket. Scroll horizontally to inspect the field; source times cannot be dragged.
+        区间表示创建至最近更新的时间跨度，不代表连续工作时长。数字为时间桶内相交的不同任务数；时间来自来源记录，只读。
       </p>
     </section>
   );
+}
+
+export function rangeStyle(range: ObservationRange, timeline: TimelineSnapshot) {
+  const buckets = timeline.buckets;
+  function position(value: string | null) {
+    const time = Date.parse(value ?? "");
+    if (time <= Date.parse(buckets[0].start)) return 0;
+    const index = buckets.findIndex(bucket => time < Date.parse(bucket.end));
+    if (index < 0) return 100;
+    const bucket = buckets[index];
+    return (index + (time - Date.parse(bucket.start)) / (Date.parse(bucket.end) - Date.parse(bucket.start))) / buckets.length * 100;
+  }
+  const left = position(range.start), right = position(range.end);
+  return { left: `${left}%`, width: range.isPoint ? "10px" : `${Math.max(0, right - left)}%` };
 }
 
 function rangeColumns(
@@ -277,6 +330,13 @@ function rangeColumns(
   });
 
   return first === -1 ? null : { start: first + 1, end: last + 2 };
+}
+
+function lastIntersectingBucketIndex(range: ObservationRange, timeline: TimelineSnapshot): number {
+  for (let index = timeline.buckets.length - 1; index >= 0; index -= 1) {
+    if (rangeIntersectsBucket(range, timeline.buckets[index])) return index;
+  }
+  return -1;
 }
 
 function countVisibleOverlaps(
@@ -314,7 +374,7 @@ function capitalize(value: string): string {
 }
 
 function formatTimelineTime(value: string | null, timezone: string): string {
-  if (!value) return "unknown time";
+  if (!value) return "未知 time";
   try {
     return new Intl.DateTimeFormat(undefined, {
       timeZone: timezone,

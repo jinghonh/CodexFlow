@@ -32,6 +32,7 @@ export interface TimelineOptions {
 
 export interface DashboardApi {
   health(): Promise<HealthResponse>;
+  pickProjectDirectory(): Promise<{ path: string | null }>;
   selectProject(path: string): Promise<{ project: ProjectView; source: SourceSummary }>;
   snapshot(options?: TimelineOptions): Promise<DashboardSnapshot>;
   refresh(options?: TimelineOptions): Promise<DashboardSnapshot>;
@@ -53,6 +54,11 @@ type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Respo
 export function createApi(fetchLike: FetchLike = globalThis.fetch.bind(globalThis)): DashboardApi {
   return {
     health: () => request<HealthResponse>(fetchLike, "/api/health"),
+    pickProjectDirectory: () => request<{ path: string | null }>(fetchLike, "/api/project/pick-directory", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    }),
     selectProject: (path) =>
       request<{ project: ProjectView; source: SourceSummary }>(fetchLike, "/api/project/select", {
         method: "POST",
