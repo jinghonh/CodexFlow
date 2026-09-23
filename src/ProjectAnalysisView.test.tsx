@@ -81,3 +81,29 @@ test("暂停运行的继续请求出错后仍可重试", async () => {
   expect(await screen.findByText(/分析完成/)).toBeTruthy();
   expect(attempts).toBe(2);
 });
+
+test("Jev 设置版本变化后清除旧预览，取得新服务范围前不可启动", async () => {
+  let resolveNew: ((value: typeof preview) => void) | undefined;
+  const newPreview = new Promise<typeof preview>((resolve) => { resolveNew = resolve; });
+  let reads = 0;
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") {
+      reads += 1;
+      return reads === 1 ? { ...preview, stages: preview.stages.map((stage) => stage.stage === "relation"
+        ? { ...stage, model: "jev-old", sendScope: "发送到 https://old.example" } : stage) } : newPreview;
+    }
+    if (command === "get_latest_analysis_run") return null;
+    if (command === "start_project_analysis") return run;
+    throw new Error(`Unexpected command ${command}`);
+  });
+  const { rerender } = render(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={0} />);
+  expect(await screen.findByText("发送到 https://old.example")).toBeTruthy();
+  rerender(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={1} />);
+  expect(screen.getByRole("button", { name: "启动总结批次" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.queryByText("发送到 https://old.example")).toBeNull();
+  resolveNew?.({ ...preview, stages: preview.stages.map((stage) => stage.stage === "relation"
+    ? { ...stage, model: "jev-new", sendScope: "发送到 https://new.example" } : stage) });
+  expect(await screen.findByText("发送到 https://new.example")).toBeTruthy();
+  expect(screen.getByText("Jev / jev-new")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "启动总结批次" }).hasAttribute("disabled")).toBe(false);
+});

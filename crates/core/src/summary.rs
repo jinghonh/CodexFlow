@@ -611,7 +611,7 @@ impl SourceService {
         self: &Arc<Self>,
         thread_id: String,
     ) -> Result<SummaryRun, AppError> {
-        self.start_summary_inner(thread_id, false, LIMIT, None)
+        self.start_summary_inner(thread_id, false, LIMIT, None, 1, CancellationToken::new())
             .await
     }
 
@@ -620,9 +620,19 @@ impl SourceService {
         thread_id: String,
         character_limit: usize,
         expected: SummaryBatchSnapshot<'_>,
+        concurrency_limit: u8,
+        queue_pause: CancellationToken,
     ) -> Result<SummaryRun, AppError> {
-        self.start_summary_inner(thread_id, true, character_limit, Some(expected))
-            .await
+        let permits = if concurrency_limit == 1 { 2 } else { 1 };
+        self.start_summary_inner(
+            thread_id,
+            true,
+            character_limit,
+            Some(expected),
+            permits,
+            queue_pause,
+        )
+        .await
     }
 
     async fn start_summary_inner(
@@ -631,6 +641,8 @@ impl SourceService {
         from_batch: bool,
         character_limit: usize,
         expected: Option<SummaryBatchSnapshot<'_>>,
+        permits: u32,
+        queue_pause: CancellationToken,
     ) -> Result<SummaryRun, AppError> {
         if !from_batch {
             if let Some(project_id) = self.sessions.thread_project_id(&thread_id)? {
@@ -783,7 +795,7 @@ impl SourceService {
         };
         tokio::spawn(async move {
             service
-                .execute_summary(run, prepared, analyzer, token)
+                .execute_summary(run, prepared, analyzer, token, permits, queue_pause)
                 .await;
         });
         Ok(self.sessions.summary_run(&id)?.expect("saved summary run"))
@@ -795,33 +807,45 @@ impl SourceService {
         prepared: Prepared,
         analyzer: A,
         token: CancellationToken,
+        permits: u32,
+        queue_pause: CancellationToken,
     ) {
         let run_id = run.id.clone();
         let service = Arc::clone(&self);
         let permit = tokio::select! {
+            biased;
             _ = token.cancelled() => Err(AppError::codex(ErrorCode::AnalysisCancelled, "分析已取消。", false)),
-            acquired = Arc::clone(&self.model_slots).acquire_owned() =>
+            _ = queue_pause.cancelled() => Err(AppError::codex(ErrorCode::AnalysisCancelled, "排队中的分析已暂停，未发起模型回合。", false)),
+            acquired = Arc::clone(&self.model_slots).acquire_many_owned(permits) =>
                 acquired.map_err(|_| AppError::codex(ErrorCode::AnalysisUnavailable, "模型调用队列不可用。", true)),
         };
         let result = match permit {
             Ok(_permit) => {
-                analyzer
-                    .summarize(prepared.prompt, token.clone(), move |event| {
-                        let Some(mut current) = service.sessions.summary_run(&run_id)? else {
-                            return Ok(());
-                        };
-                        match event {
-                            AnalysisEvent::Thread(id) => current.temporary_thread_id = Some(id),
-                            AnalysisEvent::Turn(id) => current.turn_id = Some(id),
-                            AnalysisEvent::Model(model) => current.model = model,
-                            AnalysisEvent::Cancelling => {
-                                current.state = SummaryRunState::Cancelling
+                if queue_pause.is_cancelled() {
+                    Err(AppError::codex(
+                        ErrorCode::AnalysisCancelled,
+                        "排队中的分析已暂停，未发起模型回合。",
+                        false,
+                    ))
+                } else {
+                    analyzer
+                        .summarize(prepared.prompt, token.clone(), move |event| {
+                            let Some(mut current) = service.sessions.summary_run(&run_id)? else {
+                                return Ok(());
+                            };
+                            match event {
+                                AnalysisEvent::Thread(id) => current.temporary_thread_id = Some(id),
+                                AnalysisEvent::Turn(id) => current.turn_id = Some(id),
+                                AnalysisEvent::Model(model) => current.model = model,
+                                AnalysisEvent::Cancelling => {
+                                    current.state = SummaryRunState::Cancelling
+                                }
+                                AnalysisEvent::Terminal(_) => {}
                             }
-                            AnalysisEvent::Terminal(_) => {}
-                        }
-                        service.sessions.save_summary_run(&current)
-                    })
-                    .await
+                            service.sessions.save_summary_run(&current)
+                        })
+                        .await
+                }
             }
             Err(error) => Err(error),
         };
@@ -1045,7 +1069,14 @@ mod tests {
             };
             tasks.push(tokio::spawn(async move {
                 service
-                    .execute_summary(run, prepared, analyzer, CancellationToken::new())
+                    .execute_summary(
+                        run,
+                        prepared,
+                        analyzer,
+                        CancellationToken::new(),
+                        1,
+                        CancellationToken::new(),
+                    )
                     .await;
             }));
         }

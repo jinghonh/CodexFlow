@@ -25,6 +25,7 @@ pub(crate) struct AnalysisControl {
     pub project_id: String,
     pub cancel: CancellationToken,
     pub pause: Arc<AtomicBool>,
+    queue_pause: CancellationToken,
     dispatch: Arc<tokio::sync::Mutex<()>>,
     update: Update,
 }
@@ -324,6 +325,7 @@ impl SourceService {
             project_id: project_id.clone(),
             cancel: CancellationToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            queue_pause: CancellationToken::new(),
             dispatch: Arc::new(tokio::sync::Mutex::new(())),
             update: Arc::new(on_update),
         };
@@ -401,6 +403,7 @@ impl SourceService {
                 AnalysisRunState::Running | AnalysisRunState::Queued
             ) {
                 control.pause.store(true, Ordering::SeqCst);
+                control.queue_pause.cancel();
                 run.pause_reason = Some("正在暂停；等待当前模型调用结束。".into());
                 recalculate(&mut run);
                 self.sessions.save_analysis_run(&run)?;
@@ -554,6 +557,7 @@ impl SourceService {
             project_id: run.project_id.clone(),
             cancel: CancellationToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            queue_pause: CancellationToken::new(),
             dispatch: Arc::new(tokio::sync::Mutex::new(())),
             update: Arc::new(on_update),
         };
@@ -744,15 +748,6 @@ impl SourceService {
                     continue;
                 }
             }
-            let exclusive = if run.limits.concurrency_limit == 1 {
-                Some(tokio::select! {
-                    _ = control.cancel.cancelled() => { continue; }
-                    permit = Arc::clone(&self.model_slots).acquire_owned() => permit
-                        .map_err(|_| core_error(ErrorCode::AnalysisUnavailable, "模型调用队列不可用。", true))?,
-                })
-            } else {
-                None
-            };
             let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
             if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
                 continue;
@@ -778,6 +773,8 @@ impl SourceService {
                         binary: run.codex_binary.as_deref(),
                         binary_version: run.codex_version.as_deref(),
                     },
+                    run.limits.concurrency_limit,
+                    control.queue_pause.clone(),
                 )
                 .await;
             let summary = match started {
@@ -829,7 +826,6 @@ impl SourceService {
             let (completed, timed_out) = self
                 .wait_summary(&summary.id, run.limits.timeout_seconds, &control.cancel)
                 .await?;
-            drop(exclusive);
             let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
             current.units[index].active_summary_run_id = None;
             if completed.temporary_thread_id.is_none() {
@@ -841,7 +837,9 @@ impl SourceService {
                 current.units[index].state = AnalysisUnitState::Succeeded;
                 current.units[index].actual_model = Some(completed.model);
                 current.units[index].error = None;
-            } else if control.cancel.is_cancelled() {
+            } else if control.cancel.is_cancelled()
+                || (control.pause.load(Ordering::SeqCst) && completed.temporary_thread_id.is_none())
+            {
                 current.units[index].state = AnalysisUnitState::Pending;
             } else {
                 let error = if timed_out {
@@ -895,6 +893,7 @@ impl SourceService {
             }
             if current.units[index].state == AnalysisUnitState::Pending
                 && !control.cancel.is_cancelled()
+                && !control.pause.load(Ordering::SeqCst)
             {
                 let retry_after_ms = current.units[index]
                     .error
@@ -1343,6 +1342,98 @@ mod tests {
         );
         assert!(service.sessions.summary("thread-0").unwrap().is_none());
         drop(held);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn single_call_batches_in_two_projects_do_not_deadlock_the_shared_gate() {
+        let root = root("two-projects");
+        let service = service(&root, "slow-success", 2).await;
+        service
+            .sessions
+            .save_projects_and_attributions(
+                &[LocalProject {
+                    id: "project-other".into(),
+                    name: "另一合成项目".into(),
+                    root: root.to_string_lossy().into_owned(),
+                    git_common_dir: None,
+                }],
+                &[ThreadAttribution {
+                    thread_id: "thread-1".into(),
+                    project_id: Some("project-other".into()),
+                    workspace_root: None,
+                    basis: "test".into(),
+                    detail: "测试归属".into(),
+                    diagnostic: None,
+                    source_project_id: None,
+                }],
+                None,
+            )
+            .unwrap();
+        let limits = AnalysisLimits {
+            call_limit: 1,
+            concurrency_limit: 1,
+            ..AnalysisLimits::default()
+        };
+        let held = Arc::clone(&service.model_slots)
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let first = service
+            .start_project_analysis("project-test".into(), limits.clone(), |_| {})
+            .await
+            .unwrap();
+        let second = service
+            .start_project_analysis("project-other".into(), limits, |_| {})
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(held);
+        let first = wait_state(&service, &first.id, AnalysisRunState::Complete).await;
+        let second = wait_state(&service, &second.id, AnalysisRunState::Complete).await;
+        assert_eq!((first.total_calls, second.total_calls), (1, 1));
+        assert_eq!((first.succeeded, second.succeeded), (1, 1));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pause_drops_a_queued_summary_without_spending_a_ticket() {
+        let root = root("queued-pause");
+        let service = service(&root, "ok", 1).await;
+        let held = Arc::clone(&service.model_slots)
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let run = service.analysis_run(&started.id).unwrap().unwrap();
+                if run.units[0].active_summary_run_id.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        service.pause_analysis_run(&started.id).unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(
+            (paused.total_calls, paused.batch_calls, paused.pending),
+            (0, 0, 1)
+        );
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(service.sessions.summary("thread-0").unwrap().is_none());
+        service
+            .continue_analysis_run(&started.id, 1, |_| {})
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!((complete.total_calls, complete.succeeded), (1, 1));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -93,6 +93,7 @@ function App() {
   const [jevError, setJevError] = useState("");
   const [jevConnection, setJevConnection] = useState<JevConnectionResult | null>(null);
   const [jevInference, setJevInference] = useState<JevInferenceResult | null>(null);
+  const [analysisSettingsRevision, setAnalysisSettingsRevision] = useState(0);
   const jevEpoch = useRef(0);
   const [listError, setListError] = useState("");
   const [indexRun, setIndexRun] = useState<IndexRun | null>(null);
@@ -189,6 +190,7 @@ function App() {
       setJevStatus(status);
       setJevBaseUrl(status.config.baseUrl);
       setJevModel(status.config.model);
+      setAnalysisSettingsRevision((revision) => revision + 1);
     }).catch((error) => setJevError(errorText(error)));
   }, []);
 
@@ -295,6 +297,7 @@ function App() {
       setJevKey("");
       setJevConnection(null);
       setJevInference(null);
+      setAnalysisSettingsRevision((revision) => revision + 1);
     } catch (error) { setJevError(errorText(error)); }
     finally { setJevSaving(false); }
   }
@@ -302,6 +305,7 @@ function App() {
   async function refreshJevStatus() {
     try {
       setJevStatus(await invoke<JevStatus>("get_jev_status"));
+      setAnalysisSettingsRevision((revision) => revision + 1);
       setJevError("");
     } catch (error) { setJevError(errorText(error)); }
   }
@@ -316,6 +320,7 @@ function App() {
       setJevKey("");
       setJevConnection(null);
       setJevInference(null);
+      setAnalysisSettingsRevision((revision) => revision + 1);
     } catch (error) { setJevError(errorText(error)); }
     finally { setJevDeleting(false); }
   }
@@ -461,7 +466,7 @@ function App() {
         {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} locationRequest={evidenceLocation} onHistoryLoaded={() => setTimelineVersion((value) => value + 1)} />}
         {!showUnassigned && projectSessions && <ProjectGraphView projectId={projectSessions.project.id} refreshVersion={graphVersion + timelineVersion} onSelectEvidence={selectEvidence} />}
         {!showUnassigned && projectSessions && <CandidatePreviewView projectId={projectSessions.project.id} refreshVersion={`${graphVersion}-${timelineVersion}`} onSelectEvidence={selectEvidence} />}
-        {!showUnassigned && projectSessions && <ProjectAnalysisView projectId={projectSessions.project.id} refreshVersion={`${graphVersion}-${timelineVersion}`} />}
+        {!showUnassigned && projectSessions && <ProjectAnalysisView projectId={projectSessions.project.id} refreshVersion={`${graphVersion}-${timelineVersion}`} settingsRevision={analysisSettingsRevision} />}
         <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。Jev 连接检查不运行推理；只有点击“测试固定合成推理”才会发起该次模型调用。</p>
       </div>
     </main>

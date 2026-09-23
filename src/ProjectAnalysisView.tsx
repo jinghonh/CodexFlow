@@ -22,21 +22,27 @@ function message(error: unknown): string {
     ? error.message : "分析操作失败。";
 }
 
-export function ProjectAnalysisView({ projectId, refreshVersion }: { projectId: string; refreshVersion: string }) {
+export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0 }: {
+  projectId: string; refreshVersion: string; settingsRevision?: number;
+}) {
   const [limits, setLimits] = useState<Limits>(initialLimits);
-  const [preview, setPreview] = useState<Preview | null>(null);
+  const [previewState, setPreviewState] = useState<{ key: string; value: Preview } | null>(null);
   const [run, setRun] = useState<Run | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const terminalRun = run && ["paused", "cancelled", "complete", "partial", "failed"].includes(run.state)
+    ? `${run.id}:${run.state}:${run.totalCalls}:${run.processed}` : "";
+  const previewKey = JSON.stringify([projectId, refreshVersion, settingsRevision, limits, terminalRun]);
+  const preview = previewState?.key === previewKey ? previewState.value : null;
 
   useEffect(() => {
     let active = true;
-    setPreview(null); setError("");
+    setPreviewState(null); setError("");
     invoke<Preview>("get_analysis_preview", { projectId, limits })
-      .then((value) => { if (active) setPreview(value); })
+      .then((value) => { if (active) setPreviewState({ key: previewKey, value }); })
       .catch((caught) => { if (active) setError(message(caught)); });
     return () => { active = false; };
-  }, [projectId, refreshVersion, limits.callLimit, limits.concurrencyLimit, limits.timeoutSeconds, limits.retryLimit, limits.inputCharacterLimit]);
+  }, [previewKey]);
 
   useEffect(() => {
     let active = true;
@@ -62,15 +68,6 @@ export function ProjectAnalysisView({ projectId, refreshVersion }: { projectId: 
     return () => { active = false; window.clearInterval(timer); };
   }, [run?.id, run?.state]);
 
-  useEffect(() => {
-    if (!run || !["paused", "cancelled", "complete", "partial", "failed"].includes(run.state)) return;
-    let active = true;
-    invoke<Preview>("get_analysis_preview", { projectId, limits })
-      .then((value) => { if (active) setPreview(value); })
-      .catch((caught) => { if (active) setError(message(caught)); });
-    return () => { active = false; };
-  }, [projectId, run?.id, run?.state]);
-
   async function operate(command: string, args: Record<string, unknown>) {
     setBusy(true); setError("");
     try { setRun(await invoke<Run>(command, args)); }
@@ -89,7 +86,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion }: { projectId: 
   return <section className="panel analysis-panel" aria-label="项目分析批次">
     <div className="panel-kicker">06 / 项目分析</div>
     <h2>预览与批次</h2>
-    <p className="panel-intro">只有手动启动才会调用模型。当前批次只执行会话总结；关系判断、证据选择和命名仍待接入。调用次数是上限，不是费用或令牌估计。</p>
+    <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的 Jev 设置；修改后需保存才生效。当前批次只执行会话总结；关系判断、证据选择和命名仍待接入。调用次数是上限，不是费用或令牌估计。</p>
     <div className="analysis-limits">
       <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={limits.callLimit} onChange={(event) => setLimits({ ...limits, callLimit: Number(event.target.value) })} /></label>
       <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max="2" value={limits.concurrencyLimit} onChange={(event) => setLimits({ ...limits, concurrencyLimit: Number(event.target.value) })} /></label>
