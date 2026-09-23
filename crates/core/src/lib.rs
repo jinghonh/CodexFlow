@@ -1,12 +1,12 @@
 use codexflow_codex::{diagnose, Session};
 use codexflow_domain::{
     AppError, ConnectionState, DisplayTheme, ErrorCode, JevConfig, JevConnectionResult,
-    JevInferenceResult, JevStatus, Preferences, SourceStatus,
+    JevInferenceResult, JevStatus, Preferences, SessionList, SourceStatus,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
 };
-use codexflow_store::PreferenceStore;
+use codexflow_store::{PreferenceStore, SessionStore};
 use std::{
     path::PathBuf,
     sync::Arc,
@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 pub struct SourceService {
     store: PreferenceStore,
+    sessions: SessionStore,
     state: Mutex<State>,
     credentials: Arc<dyn CredentialStore>,
     jev_gate: RwLock<()>,
@@ -38,11 +39,13 @@ impl SourceService {
         app_data_dir: PathBuf,
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppError> {
-        let store = PreferenceStore::new(app_data_dir);
+        let store = PreferenceStore::new(app_data_dir.clone());
+        let sessions = SessionStore::new(app_data_dir)?;
         let preferences = store.load()?;
         let status = SourceStatus::new(preferences.selected_binary.clone());
         Ok(Self {
             store,
+            sessions,
             state: Mutex::new(State {
                 preferences,
                 status,
@@ -245,6 +248,40 @@ impl SourceService {
             session.close().await;
         }
     }
+
+    pub fn cached_sessions(&self) -> Result<SessionList, AppError> {
+        self.sessions.list()
+    }
+
+    pub async fn refresh_sessions(&self) -> Result<SessionList, AppError> {
+        let mut state = self.state.lock().await;
+        let attempted_at = now_ms() as i64;
+        self.sessions.begin_refresh(attempted_at)?;
+        check_process(&mut state);
+        let session = match state.session.as_mut() {
+            Some(session) => session,
+            None => {
+                self.sessions
+                    .fail_refresh(attempted_at, "来源当前不可用；旧缓存已保留。")?;
+                return Err(AppError::codex(
+                    ErrorCode::SourceReadFailed,
+                    "Codex 来源当前不可用。请先连接，已有会话缓存仍可浏览。",
+                    true,
+                ));
+            }
+        };
+        let collection = session.collect_threads(attempted_at).await;
+        if let Err(error) = self
+            .sessions
+            .save_collection(&collection.threads, &collection.scopes)
+        {
+            let _ = self
+                .sessions
+                .fail_refresh(attempted_at, "保存会话列表失败；旧缓存已保留。");
+            return Err(error);
+        }
+        self.sessions.list()
+    }
 }
 
 fn jev_cancelled() -> AppError {
@@ -340,7 +377,12 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("codexflow-jev-test-{}-{nonce}", std::process::id()))
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "codexflow-jev-test-{}-{nonce}-{id}",
+            std::process::id()
+        ))
     }
 
     #[tokio::test]
@@ -542,6 +584,209 @@ mod tests {
         let (theme, source) = reopened.settings().await;
         assert!(matches!(theme, DisplayTheme::Dark));
         assert_eq!(source.selected_binary.as_deref(), binary.to_str());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn session_cache_and_jev_settings_survive_each_others_lifecycle() {
+        let dir = temp_data_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let binary = dir.join("fake-list-rich.py");
+        fs::write(
+            &binary,
+            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
+        )
+        .unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let service = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
+        service
+            .save_jev(
+                "https://api.typesafe.ai".into(),
+                "jev-1.13.0".into(),
+                Some("synthetic-only-key".into()),
+            )
+            .await
+            .unwrap();
+        service
+            .connect(Some(binary.to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        service.set_theme(DisplayTheme::Dark).await.unwrap();
+        let collected = service.refresh_sessions().await.unwrap();
+        assert_eq!(collected.threads.len(), 4);
+        assert!(collected.scopes.iter().all(|scope| scope.complete));
+        service.shutdown().await;
+        drop(service);
+
+        let locked =
+            SourceService::with_credentials(dir.clone(), Arc::new(UnavailableCredentials)).unwrap();
+        assert!(locked
+            .jev_status()
+            .await
+            .unwrap()
+            .credential_error
+            .is_some());
+        assert_eq!(locked.cached_sessions().unwrap().threads.len(), 4);
+        drop(locked);
+
+        let reopened = SourceService::with_credentials(dir.clone(), credentials).unwrap();
+        let (theme, source) = reopened.settings().await;
+        assert!(matches!(theme, DisplayTheme::Dark));
+        assert_eq!(source.selected_binary.as_deref(), binary.to_str());
+        let jev = reopened.jev_status().await.unwrap();
+        assert_eq!(jev.config.model, "jev-1.13.0");
+        assert!(jev.credential_configured);
+        reopened.delete_jev_credential().await.unwrap();
+        assert!(!reopened.jev_status().await.unwrap().credential_configured);
+        let cached = reopened.cached_sessions().unwrap();
+        assert_eq!(cached.threads.len(), 4);
+        assert!(cached.scopes.iter().all(|scope| scope.complete));
+        assert!(reopened.refresh_sessions().await.is_err());
+        drop(reopened);
+
+        let offline =
+            SourceService::with_credentials(dir.clone(), Arc::new(UnavailableCredentials)).unwrap();
+        let cached = offline.cached_sessions().unwrap();
+        assert_eq!(cached.threads.len(), 4);
+        assert!(cached.scopes.iter().all(|scope| !scope.complete));
+        drop(offline);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn complete_and_partial_lists_keep_one_cached_thread_per_id() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "codexflow-list-test-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        for mode in ["list-rich", "list-partial", "list-moved"] {
+            let binary = root.join(format!("fake-{mode}.py"));
+            let mut file = fs::File::create(&binary).unwrap();
+            file.write_all(include_bytes!("../../codex/tests/fixtures/fake_codex.py"))
+                .unwrap();
+            file.set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let service = SourceService::new(root.join("data")).unwrap();
+        service
+            .connect(Some(
+                root.join("fake-list-rich.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let first = service.refresh_sessions().await.unwrap();
+        assert_eq!(first.threads.len(), 4);
+        assert!(first.scopes.iter().all(|scope| scope.complete));
+        let archived = first
+            .threads
+            .iter()
+            .find(|thread| thread.id == "thread-a")
+            .unwrap();
+        assert!(archived.archived);
+        assert!(first
+            .threads
+            .iter()
+            .find(|thread| thread.id == "thread-b")
+            .unwrap()
+            .read_error
+            .is_some());
+        assert_eq!(
+            first
+                .threads
+                .iter()
+                .find(|thread| thread.id == "thread-b")
+                .unwrap()
+                .parent_thread_id
+                .as_deref(),
+            Some("thread-a")
+        );
+        assert_eq!(service.refresh_sessions().await.unwrap().threads.len(), 4);
+        service.shutdown().await;
+
+        let reopened = SourceService::new(root.join("data")).unwrap();
+        assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
+        assert!(reopened.refresh_sessions().await.is_err());
+        assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
+        reopened
+            .connect(Some(
+                root.join("fake-list-partial.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let partial = reopened.refresh_sessions().await.unwrap();
+        assert_eq!(partial.threads.len(), 4);
+        assert!(partial.threads.iter().any(|thread| thread.id == "thread-c"));
+        assert!(
+            !partial
+                .scopes
+                .iter()
+                .find(|scope| !scope.archived)
+                .unwrap()
+                .complete
+        );
+        assert!(
+            partial
+                .scopes
+                .iter()
+                .find(|scope| scope.archived)
+                .unwrap()
+                .complete
+        );
+        reopened
+            .connect(Some(
+                root.join("fake-list-moved.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ))
+            .await
+            .unwrap();
+        let moved = reopened.refresh_sessions().await.unwrap();
+        assert_eq!(moved.threads.len(), 4);
+        assert!(
+            moved
+                .threads
+                .iter()
+                .find(|thread| thread.id == "thread-b")
+                .unwrap()
+                .archived
+        );
+        let database = rusqlite::Connection::open(root.join("data/sessions.sqlite3")).unwrap();
+        database
+            .execute_batch(
+                "CREATE TRIGGER reject_thread_update BEFORE UPDATE ON threads
+             BEGIN SELECT RAISE(FAIL, 'simulated write failure'); END;",
+            )
+            .unwrap();
+        drop(database);
+        assert!(reopened.refresh_sessions().await.is_err());
+        let failed = reopened.cached_sessions().unwrap();
+        assert_eq!(failed.threads.len(), 4);
+        assert!(failed.scopes.iter().all(|scope| !scope.complete
+            && scope
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("保存"))));
+        assert!(failed
+            .scopes
+            .iter()
+            .all(|scope| scope.completed_at_unix_ms.is_some()));
+        reopened.shutdown().await;
+        let after_failure = SourceService::new(root.join("data"))
+            .unwrap()
+            .cached_sessions()
+            .unwrap();
+        assert_eq!(after_failure.threads.len(), 4);
+        assert!(after_failure.scopes.iter().all(|scope| !scope.complete));
         let _ = fs::remove_dir_all(root);
     }
 }

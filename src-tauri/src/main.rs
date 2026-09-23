@@ -1,6 +1,7 @@
 use codexflow_core::SourceService;
 use codexflow_domain::{
-    AppError, DisplayTheme, JevConnectionResult, JevInferenceResult, JevStatus, SourceStatus,
+    AppError, DisplayTheme, JevConnectionResult, JevInferenceResult, JevStatus, SessionList,
+    SourceStatus,
 };
 use serde::Serialize;
 use tauri::Manager;
@@ -87,6 +88,16 @@ async fn cancel_jev_request(state: tauri::State<'_, AppState>) -> Result<(), App
     Ok(())
 }
 
+#[tauri::command]
+fn get_session_list(state: tauri::State<'_, AppState>) -> Result<SessionList, AppError> {
+    service(&state)?.cached_sessions()
+}
+
+#[tauri::command]
+async fn refresh_session_list(state: tauri::State<'_, AppState>) -> Result<SessionList, AppError> {
+    service(&state)?.refresh_sessions().await
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -107,7 +118,9 @@ fn main() {
             delete_jev_credential,
             check_jev_connection,
             test_jev_inference,
-            cancel_jev_request
+            cancel_jev_request,
+            get_session_list,
+            refresh_session_list
         ])
         .build(tauri::generate_context!())
         .expect("无法启动 CodexFlow 桌面应用")

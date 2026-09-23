@@ -1,5 +1,9 @@
-use codexflow_domain::{AppError, Capability, ErrorCode, SourceCapabilities};
+use codexflow_domain::{
+    AppError, Capability, ErrorCode, GitMetadata, ListScopeStatus, SourceCapabilities,
+    ThreadMetadata,
+};
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::{
@@ -35,6 +39,149 @@ pub struct Diagnosis {
     pub version: Option<String>,
     pub capabilities: SourceCapabilities,
     pub session: Session,
+}
+
+pub struct Collection {
+    pub threads: Vec<ThreadMetadata>,
+    pub scopes: Vec<ListScopeStatus>,
+}
+
+impl Session {
+    pub async fn collect_threads(&mut self, observed_at_unix_ms: i64) -> Collection {
+        let mut threads = BTreeMap::<String, ThreadMetadata>::new();
+        let mut scopes = Vec::with_capacity(2);
+        for archived in [false, true] {
+            let mut cursor: Option<String> = None;
+            let mut seen_cursors = HashSet::new();
+            let mut errors = Vec::new();
+            loop {
+                let mut params =
+                    json!({"limit": 100, "sourceKinds": SOURCES, "archived": archived});
+                if let Some(ref cursor) = cursor {
+                    params["cursor"] = json!(cursor);
+                }
+                let page = match self.request("thread/list", params).await {
+                    Ok(page) => page,
+                    Err(error) => {
+                        errors.push(format!("列表分页读取失败：{}", error.description()));
+                        break;
+                    }
+                };
+                let Some(data) = page.get("data").and_then(Value::as_array) else {
+                    errors.push("列表响应缺少 data 数组。".to_owned());
+                    break;
+                };
+                for value in data {
+                    if value.get("ephemeral").and_then(Value::as_bool) == Some(true) {
+                        continue;
+                    }
+                    let Some(mut thread) = parse_thread(value, archived, observed_at_unix_ms)
+                    else {
+                        errors.push("某条会话的元数据无效，已跳过。".to_owned());
+                        continue;
+                    };
+                    match self
+                        .request(
+                            "thread/read",
+                            json!({"threadId": thread.id, "includeTurns": false}),
+                        )
+                        .await
+                    {
+                        Ok(_) => {}
+                        Err(error) => {
+                            thread.read_error =
+                                Some(format!("会话读取失败：{}", error.description()))
+                        }
+                    }
+                    let replace = threads.get(&thread.id).is_none_or(|old| {
+                        thread.updated_at > old.updated_at
+                            || (thread.updated_at == old.updated_at && thread.archived)
+                    });
+                    if replace {
+                        threads.insert(thread.id.clone(), thread);
+                    }
+                }
+                let next = match page.get("nextCursor") {
+                    Some(Value::String(value)) => Some(value.clone()),
+                    None | Some(Value::Null) => None,
+                    _ => {
+                        errors.push("列表响应的游标无效。".to_owned());
+                        break;
+                    }
+                };
+                match next {
+                    Some(next) if seen_cursors.insert(next.clone()) => cursor = Some(next),
+                    Some(_) => {
+                        errors.push("列表分页游标重复，已停止采集。".to_owned());
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            scopes.push(ListScopeStatus {
+                archived,
+                complete: errors.is_empty(),
+                attempted_at_unix_ms: Some(observed_at_unix_ms),
+                completed_at_unix_ms: errors.is_empty().then_some(observed_at_unix_ms),
+                error: (!errors.is_empty()).then(|| errors.join(" ")),
+            });
+        }
+        Collection {
+            threads: threads.into_values().collect(),
+            scopes,
+        }
+    }
+}
+
+fn parse_thread(value: &Value, archived: bool, observed_at_unix_ms: i64) -> Option<ThreadMetadata> {
+    let string = |key| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    let source = value.get("source")?;
+    let (source_kind, source_detail) = if let Some(kind) = source.as_str() {
+        (kind.to_owned(), None)
+    } else if let Some(sub_agent) = source.get("subAgent") {
+        let detail = sub_agent.as_str().map(str::to_owned).or_else(|| {
+            sub_agent
+                .as_object()
+                .and_then(|object| object.keys().next().cloned())
+        });
+        ("subAgent".to_owned(), detail)
+    } else if let Some(custom) = source.get("custom").and_then(Value::as_str) {
+        ("custom".to_owned(), Some(custom.to_owned()))
+    } else {
+        return None;
+    };
+    let git = value
+        .get("gitInfo")
+        .filter(|git| git.is_object())
+        .map(|git| GitMetadata {
+            branch: git.get("branch").and_then(Value::as_str).map(str::to_owned),
+            sha: git.get("sha").and_then(Value::as_str).map(str::to_owned),
+            origin_url: git
+                .get("originUrl")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        });
+    Some(ThreadMetadata {
+        id: string("id")?,
+        session_id: string("sessionId")?,
+        title: string("name"),
+        preview: string("preview")?,
+        cwd: string("cwd")?,
+        project_id: string("projectId"),
+        source_kind,
+        source_detail,
+        thread_source: string("threadSource"),
+        parent_thread_id: string("parentThreadId"),
+        forked_from_id: string("forkedFromId"),
+        git,
+        created_at: value.get("createdAt")?.as_i64()?,
+        updated_at: value.get("updatedAt")?.as_i64()?,
+        archived,
+        metadata_complete: true,
+        content_complete: false,
+        read_error: None,
+        observed_at_unix_ms,
+    })
 }
 
 pub fn resolve_binary(choice: Option<&str>) -> Result<PathBuf, AppError> {
@@ -575,6 +722,17 @@ enum ProbeError {
 impl ProbeError {
     fn unsupported(&self) -> bool {
         matches!(self, Self::Rpc(_, true))
+    }
+
+    fn description(&self) -> &'static str {
+        match self {
+            Self::Rpc(_, true) => "当前二进制不支持所需接口",
+            Self::Rpc(_, false) => "Codex 返回错误",
+            Self::Timeout => "请求超时",
+            Self::Exited => "app-server 已退出",
+            Self::InvalidResponse => "响应格式无效",
+            Self::NotRun => "请求未执行",
+        }
     }
 }
 

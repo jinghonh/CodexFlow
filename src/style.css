@@ -18,6 +18,8 @@ button { cursor: pointer; }
 .side-caption, .panel-kicker, .eyebrow, .status-caption { font-size: 10px; font-weight: 700; letter-spacing: .2em; text-transform: uppercase; }
 .side-caption { color: #a8c6ad; }
 .side-link { margin: 17px -8px 0; padding: 14px 12px; border-radius: 6px; font-size: 13px; display: flex; align-items: center; background: #ffffff13; color: white; font-weight: 650; }
+a.side-link { text-decoration: none; background: transparent; }
+a.side-link:hover { background: #ffffff13; }
 .side-dot { width: 7px; height: 7px; background: #d1e49b; border-radius: 50%; margin-right: 12px; }
 .side-index { margin-left: auto; opacity: .4; font-size: 11px; }
 .side-note { z-index: 1; margin-top: 34px; color: #aec4b6; font-size: 11px; line-height: 1.8; padding-left: 15px; position: relative; }
@@ -102,5 +104,29 @@ button:disabled { cursor: wait; opacity: .6; }
 .jev-result { display: flex; gap: 14px; align-items: baseline; border-top: 1px solid var(--line); padding: 13px 0 0; margin-top: 12px; font-size: 11px; line-height: 1.5; }
 .jev-result strong { color: var(--green); white-space: nowrap; }
 .jev-result span { color: var(--muted); }
+.session-panel { margin-top: 20px; scroll-margin-top: 24px; }
+.session-heading { display: flex; justify-content: space-between; gap: 18px; align-items: center; }
+.session-heading .panel-intro { margin-bottom: 12px; min-height: 0; }
+.list-summary { display: flex; flex-wrap: wrap; gap: 10px 18px; padding: 14px 0; border-top: 1px solid var(--line); font-size: 11px; color: var(--muted); }
+.list-summary strong { color: var(--ink); }
+.scope-line { display: flex; flex-wrap: wrap; gap: 8px 15px; align-items: center; padding: 9px 0; border-top: 1px solid var(--line); font-size: 10px; }
+.scope-line span { color: var(--green); }
+.scope-line small { color: var(--muted); }
+.scope-line em { color: var(--red); font-style: normal; width: 100%; }
+.session-search { display: block; margin: 18px 0 11px; font-size: 10px; font-weight: 700; }
+.session-search input { display: block; width: 100%; margin-top: 8px; padding: 11px; border: 1px solid var(--line); background: var(--page); color: var(--ink); font-size: 11px; }
+.thread-list { max-height: 680px; overflow-y: auto; border-top: 1px solid var(--line); }
+.empty-list { font-size: 12px; color: var(--muted); padding: 20px 0; }
+.thread-row { padding: 17px 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: minmax(200px, 1fr) minmax(300px, 1.2fr); gap: 24px; }
+.thread-main strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
+.thread-main small { display: block; color: var(--muted); font-family: ui-monospace, monospace; margin-top: 11px; overflow-wrap: anywhere; }
+.thread-badges { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
+.thread-badges span { font-size: 10px; background: var(--green-soft); color: var(--green); padding: 4px 7px; }
+.thread-badges .thread-warning { background: var(--red-soft); color: var(--red); }
+.thread-meta { display: grid; gap: 6px; }
+.thread-meta div { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 10px; font-size: 10px; }
+.thread-meta span { color: var(--muted); }
+.thread-meta code { overflow-wrap: anywhere; }
+@media (max-width: 1050px) { .thread-row { grid-template-columns: 1fr; gap: 11px; } }
 @media (max-width: 1050px) { .sidebar { width: 198px; } .page-body { padding: 35px 27px; } .topbar { padding: 0 27px; } .columns { gap: 12px; } .panel { padding: 23px 20px; } .footer-panel { flex-wrap: wrap; } }
 @media (max-width: 1050px) { .jev-fields { grid-template-columns: 1fr 1fr; } }

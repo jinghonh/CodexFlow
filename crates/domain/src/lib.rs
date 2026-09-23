@@ -39,6 +39,16 @@ impl AppError {
             backend: "store".into(),
         }
     }
+
+    pub fn migration(message: impl Into<String>) -> Self {
+        Self {
+            code: ErrorCode::MigrationFailed,
+            message: message.into(),
+            retryable: false,
+            cache_preserved: true,
+            backend: "store".into(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -64,6 +74,56 @@ pub enum ErrorCode {
     JevTimeout,
     JevCancelled,
     JevCredentialFailed,
+    MigrationFailed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitMetadata {
+    pub branch: Option<String>,
+    pub sha: Option<String>,
+    pub origin_url: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMetadata {
+    pub id: String,
+    pub session_id: String,
+    pub title: Option<String>,
+    pub preview: String,
+    pub cwd: String,
+    pub project_id: Option<String>,
+    pub source_kind: String,
+    pub source_detail: Option<String>,
+    pub thread_source: Option<String>,
+    pub parent_thread_id: Option<String>,
+    pub forked_from_id: Option<String>,
+    pub git: Option<GitMetadata>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub archived: bool,
+    pub metadata_complete: bool,
+    pub content_complete: bool,
+    pub read_error: Option<String>,
+    pub observed_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListScopeStatus {
+    pub archived: bool,
+    pub complete: bool,
+    pub attempted_at_unix_ms: Option<i64>,
+    pub completed_at_unix_ms: Option<i64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionList {
+    pub threads: Vec<ThreadMetadata>,
+    pub scopes: Vec<ListScopeStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
