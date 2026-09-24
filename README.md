@@ -31,6 +31,4 @@ Jev 的「验证连接」只请求模型列表，不会推理；「测试固定�
 
 维护者的构建、受控验收步骤和逐项证据见 [#33 发布验收记录](docs/release/issue-33-acceptance.md)。源码回归入口为 `npm run test:ui`、相关 Rust 包的 `cargo test` 和正式 `npm run tauri -- build`；正式包验收应使用独立应用数据目录与受控会话，不能触碰用户原有会话。
 
-隔离包标识和独立 `CODEX_HOME` 只隔离应用缓存与 Codex 来源；Jev 系统钥匙串项目使用固定服务名。测试 Jev 凭据、连接或推理时须使用独立 macOS 测试用户，不要以为更换包标识就获得了独立钥匙串。
-
 V1 范围与完整验收条件以 [规格](docs/SPEC.md)、[#35 文本服务后续需求](https://github.com/jinghonh/CodexFlow/issues/35)及 [#33](https://github.com/jinghonh/CodexFlow/issues/33) 为准。#35 补充并覆盖旧规格中总结与命名只能使用 Codex 临时会话的限制。当前发布准备不等于整体验收完成：真实 Jev 关系质量仍依赖 #31、#32；性能门槛按 [#30 最终记录](docs/performance/issue-30-final-acceptance.md)区分已通过和用户授权暂缓的项目。外部渠道发布不在本次默认动作内。
