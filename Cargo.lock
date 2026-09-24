@@ -348,6 +348,7 @@ dependencies = [
  "codexflow-domain",
  "codexflow-jev",
  "codexflow-store",
+ "codexflow-text",
  "rusqlite",
  "serde",
  "serde_json",
@@ -396,6 +397,19 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "codexflow-text"
+version = "0.1.0"
+dependencies = [
+ "codexflow-domain",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "url",
 ]
 
 [[package]]

@@ -41,7 +41,8 @@ test("改名冲突要求刷新且保留输入，随后可以保存和移动未�
   let conflict = true;
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "get_project_workstreams") return {
-      revision, workstreams: [{ id: "stream", name, members, relationIds: [], nameInputVersion: "v1", nameError: null }],
+      revision, workstreams: [{ id: "stream", name, members, relationIds: [], nameInputVersion: "v1", nameError: null,
+        nameServiceBaseUrl: "https://text.example/v1", nameRequestedModel: "requested", nameActualModel: "actual" }],
       ungroupedThreadIds: ungrouped, crossRelationIds: [],
       manuallyNamedWorkstreamIds: name === "人工名称" ? ["stream"] : [],
       manuallyAssignedThreadIds: members.includes("c") ? ["c"] : [],
@@ -72,6 +73,7 @@ test("改名冲突要求刷新且保留输入，随后可以保存和移动未�
   render(<ProjectWorkstreamsView projectId="project" refreshVersion={1}
     onSelectThread={vi.fn()} onSelectEvidence={vi.fn()} />);
   const input = await screen.findByLabelText("工作流名称") as HTMLInputElement;
+  expect(screen.getByText(/自动命名服务：https:\/\/text.example\/v1 · 请求模型：requested · 实际模型：actual/)).toBeTruthy();
   fireEvent.change(input, { target: { value: "人工名称" } });
   fireEvent.click(screen.getByRole("button", { name: "保存名称" }));
   expect(await screen.findByText(/工作流已被更新。请刷新工作流后重试/)).toBeTruthy();

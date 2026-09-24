@@ -4,7 +4,8 @@ import { formatAppError } from "./appError";
 import { threadDisplayTitle } from "./threadDisplay";
 
 type Stream = { id: string; name: string; members: string[]; relationIds: string[];
-  nameInputVersion: string | null; nameError: string | null };
+  nameInputVersion: string | null; nameError: string | null;
+  nameServiceBaseUrl?: string | null; nameRequestedModel?: string | null; nameActualModel?: string | null };
 type View = { workstreams: Stream[]; ungroupedThreadIds: string[]; crossRelationIds: string[];
   revision: number; manuallyNamedWorkstreamIds: string[]; manuallyAssignedThreadIds: string[] };
 type Node = { id: string; title: string | null; sourceKind?: string | null; referenceOnly: boolean };
@@ -112,7 +113,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
   };
   return <section id="workstreams" className="panel workstreams-panel" aria-label="项目工作流">
     <div className="panel-kicker">04 / 工作流</div><h2>工作流导航</h2>
-    <p className="panel-intro">分组由有效关系生成，自动名称来自 Codex 临时分析。可改名或调整会话的主要工作流；跨组联系与未分组会话保留在这里。</p>
+    <p className="panel-intro">分组由有效关系生成，自动名称来自所配置的文本服务。可改名或调整会话的主要工作流；跨组联系与未分组会话保留在这里。</p>
     {error && <p className="page-error" role="alert">{error} <button className="browse-button" onClick={refresh}>刷新工作流</button></p>}
     {saved && <p role="status">{saved}</p>}
     {!view && !error && <p>正在读取工作流…</p>}
@@ -123,6 +124,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
         {view.workstreams.length === 0 && <p>当前没有可形成工作流的关系。</p>}
       </div>
       {selected && <div className="workstream-detail"><h3>{selected.name}</h3>
+        {selected.nameServiceBaseUrl && <small>自动命名服务：{selected.nameServiceBaseUrl} · 请求模型：{selected.nameRequestedModel ?? "未知"} · 实际模型：{selected.nameActualModel ?? "未知"}</small>}
         <div className="workstream-editor"><label htmlFor="workstream-name">工作流名称</label>
           <input id="workstream-name" value={nameDraft} maxLength={80} disabled={!!saving}
             onChange={(event) => { setNameDraft(event.target.value); setEditingName(true); }} />

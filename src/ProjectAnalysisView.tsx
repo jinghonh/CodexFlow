@@ -98,7 +98,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   return <section id="project-analysis" className="panel analysis-panel" aria-label="项目分析批次">
     <div className="panel-kicker">06 / 项目分析</div>
     <h2>预览与批次</h2>
-    <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的 Jev 设置；修改后需保存才生效。Codex 负责会话总结和工作流命名，Jev 负责关系判断和证据选择。调用次数是上限，不是费用或令牌估计。</p>
+    <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的文本服务与 Jev 设置。文本服务负责会话总结和工作流命名，Jev 负责关系判断和证据选择。调用次数是上限，不是费用或令牌估计。</p>
     <div className="analysis-limits">
       <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={limits.callLimit} onChange={(event) => setLimits({ ...limits, callLimit: Number(event.target.value) })} /></label>
       <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max="2" value={limits.concurrencyLimit} onChange={(event) => setLimits({ ...limits, concurrencyLimit: Number(event.target.value) })} /></label>
@@ -117,7 +117,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
         <span>待处理 {stage.pendingItems}；调用上界 {stage.maximumCalls}</span>
         <small>{stage.sendScope}</small><small>{stage.note}</small>
       </div>)}</div>
-      <p className="analysis-note">候选最多 {preview.maximumCandidates} 对，证据选择最多 {preview.evidenceSelectionCallLimit} 次 Jev POST；每对两阶段合计最多两次推理请求。待命名分组尚未知。Jev {preview.jevConfigured ? "已配置" : "未配置"}，关系材料将发送到预览所示服务。GET 模型列表与缓存命中不计推理，重试另计调用。</p>
+      <p className="analysis-note">候选最多 {preview.maximumCandidates} 对，证据选择最多 {preview.evidenceSelectionCallLimit} 次 Jev POST；每对两阶段合计最多两次推理请求。待命名分组尚未知。Jev {preview.jevConfigured ? "已配置" : "未配置"}，关系材料将发送到预览所示服务。缓存命中不计推理，重试另计调用。</p>
     </>}
     <div className="summary-actions"><button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits })}>启动项目分析</button>
       {active && run?.state !== "cancelling" && <button className="browse-button" disabled={busy || !!run.pauseReason} onClick={() => void operate("pause_analysis_run", { runId: run.id })}>暂停</button>}

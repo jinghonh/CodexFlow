@@ -848,6 +848,8 @@ impl SessionStore {
         stream.name = name.into();
         stream.name_input_version = Some(input_version.into());
         stream.name_actual_model = None;
+        stream.name_service_base_url = None;
+        stream.name_requested_model = None;
         stream.name_error = None;
         let json =
             serde_json::to_string(&stream).map_err(|_| AppError::store("序列化工作流失败。"))?;
@@ -912,11 +914,50 @@ impl SessionStore {
         name: &str,
         input_version: &str,
         actual_model: &str,
+        expected_revision: u64,
+        expected_sources: &[(String, i64, i64)],
     ) -> Result<bool, AppError> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AppError::store("开始保存命名结果失败。"))?;
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM workstream_revisions WHERE project_id=?1",
+                [&run.project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查工作流修订号失败。"))?
+            .unwrap_or(0);
+        if revision != i64::try_from(expected_revision).unwrap_or(-1) {
+            return Ok(false);
+        }
+        for (thread_id, updated_at, generation) in expected_sources {
+            let metadata: Option<String> = transaction
+                .query_row(
+                    "SELECT metadata_json FROM threads WHERE id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查命名来源版本失败。"))?;
+            let current_generation: Option<i64> = transaction
+                .query_row(
+                    "SELECT generation FROM history_revisions WHERE thread_id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查命名历史版本失败。"))?;
+            if !metadata
+                .and_then(|json| serde_json::from_str::<ThreadMetadata>(&json).ok())
+                .is_some_and(|thread| thread.updated_at == *updated_at)
+                || current_generation.unwrap_or(0) != *generation
+            {
+                return Ok(false);
+            }
+        }
         let current: String = transaction
             .query_row(
                 "SELECT run_json FROM analysis_runs WHERE id=?1",
@@ -948,6 +989,8 @@ impl SessionStore {
         stream.name = name.into();
         stream.name_input_version = Some(input_version.into());
         stream.name_actual_model = Some(actual_model.into());
+        stream.name_service_base_url = Some(run.text_base_url.clone());
+        stream.name_requested_model = Some(run.codex_model.clone());
         stream.name_error = None;
         let stream_json =
             serde_json::to_string(&stream).map_err(|_| AppError::store("序列化工作流失败。"))?;
@@ -2942,6 +2985,8 @@ mod tests {
                 theme: DisplayTheme::Dark,
                 jev: Default::default(),
                 jev_revision: 0,
+                text: Default::default(),
+                text_revision: 0,
             })
             .unwrap();
         let loaded = PreferenceStore::new(dir.clone()).load().unwrap();
@@ -2966,6 +3011,8 @@ mod tests {
                 model: "jev-1.13.0".into(),
             },
             jev_revision: 3,
+            text: Default::default(),
+            text_revision: 0,
         };
         fs::write(
             dir.join("preferences.json"),
@@ -3023,6 +3070,8 @@ mod tests {
             algorithm_version: "test".into(),
             name_input_version: None,
             name_actual_model: None,
+            name_service_base_url: None,
+            name_requested_model: None,
             name_error: None,
             predecessor_ids: Vec::new(),
         };
@@ -3075,6 +3124,8 @@ mod tests {
                     algorithm_version: "test".into(),
                     name_input_version: None,
                     name_actual_model: None,
+                    name_service_base_url: None,
+                    name_requested_model: None,
                     name_error: None,
                     predecessor_ids: vec![],
                 }],

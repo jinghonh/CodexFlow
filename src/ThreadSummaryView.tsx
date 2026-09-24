@@ -4,8 +4,8 @@ import { listen } from "@tauri-apps/api/event";
 import { formatAppError } from "./appError";
 
 type Summary = { content: { goal: string; activity: string; outcome: string; decisions: string; issues: string };
-  evidenceIds: string[]; model: string; createdAtUnixMs: number; sourceUpdatedAt: number; inputDigest?: string };
-type Preview = { model: string; characterLimit: number; characterCount: number; totalFacts: number;
+  evidenceIds: string[]; model: string; requestedModel?: string | null; serviceBaseUrl?: string | null; createdAtUnixMs: number; sourceUpdatedAt: number; inputDigest?: string };
+type Preview = { model: string; serviceBaseUrl?: string | null; characterLimit: number; characterCount: number; totalFacts: number;
   includedFacts: number; totalMessages: number; includedMessages: number; truncated: boolean;
   turnsComplete: boolean; itemsComplete: boolean; sourceCurrent: boolean; contentAvailable: boolean;
   readError?: string | null;
@@ -22,7 +22,7 @@ function errorText(error: unknown): string {
   return formatAppError(error, "总结请求失败。");
 }
 
-export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
+export function ThreadSummaryView({ threadId, revision, onLocate }: {
   threadId: string; connected: boolean; revision: number;
   onLocate: (location: Location, itemId: string) => Promise<void>;
 }) {
@@ -127,13 +127,14 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
   const summary = preview?.cachedSummary;
   const labels = { goal: "目标", activity: "活动", outcome: "结果", decisions: "决定", issues: "问题" };
   return <section className="thread-summary" aria-label="会话总结">
-    <div className="history-heading"><div><h3>AI 会话总结</h3><small>由 Codex 临时分析会话生成；下列文字是模型解释，来源执行状态以结构化事实为准。</small></div>
-      <div className="summary-actions"><button className="browse-button" disabled={!connected || !preview?.contentAvailable || !preview.sourceCurrent || !preview.turnsComplete || !preview.itemsComplete || !!preview.analysisBlockedReason || running || busy} onClick={() => void generate()}>
+    <div className="history-heading"><div><h3>AI 会话总结</h3><small>由所配置的文本服务生成；下列文字是模型解释，来源执行状态以结构化事实为准。</small></div>
+      <div className="summary-actions"><button className="browse-button" disabled={!preview?.contentAvailable || !preview.sourceCurrent || !preview.turnsComplete || !preview.itemsComplete || !!preview.analysisBlockedReason || running || busy} onClick={() => void generate()}>
         {busy ? "正在启动…" : summary ? "重新生成" : "手动生成"}</button>
         {running && <button className="browse-button" disabled={run?.state === "cancelling"} onClick={() => void cancel()}>{run?.state === "cancelling" ? "取消中…" : "取消分析"}</button>}
       </div></div>
     {preview && <div className="summary-coverage">
-      <span>下次调用：{preview.model}</span>
+      <span>下次调用：{preview.serviceBaseUrl || "未配置文本服务"} / {preview.model}</span>
+      <span>手动生成最多发起 1 次推理；发送本会话已读取的历史、结构化事实和可定位证据。</span>
       {run && <span>最近运行模型：{run.model}</span>}
       <span>输入：{preview.characterCount.toLocaleString()} / {preview.characterLimit.toLocaleString()} 字符</span>
       <span>事实：{preview.includedFacts} / {preview.totalFacts}；消息：{preview.includedMessages} / {preview.totalMessages}</span>
@@ -156,7 +157,7 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
           {check && <small className={check.state === "valid" ? "" : "thread-warning"}>{check.message}</small>}
           {check?.excerpt && <blockquote>{check.excerpt}</blockquote>}</div>;
       })}{evidenceMessage && <p role="status">{evidenceMessage}</p>}</div>
-      <small>模型 {summary.model} · 来源更新版本 {summary.sourceUpdatedAt} · 输入版本 {summary.inputDigest?.slice(0, 12) ?? "旧版未记录"} · 保存于 {new Date(summary.createdAtUnixMs).toLocaleString("zh-CN")}</small></div>
-      : <p className="empty-list">待分析：尚无已保存的 AI 总结。点击“手动生成”后才会调用 Codex。</p>}
+      <small>服务 {summary.serviceBaseUrl || "旧版 Codex"} · 请求模型 {summary.requestedModel || "未知"} · 实际模型 {summary.model} · 来源更新版本 {summary.sourceUpdatedAt} · 输入版本 {summary.inputDigest?.slice(0, 12) ?? "旧版未记录"} · 保存于 {new Date(summary.createdAtUnixMs).toLocaleString("zh-CN")}</small></div>
+      : <p className="empty-list">待分析：尚无已保存的 AI 总结。点击“手动生成”后才会调用文本服务。</p>}
   </section>;
 }

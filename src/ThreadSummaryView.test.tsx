@@ -8,7 +8,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 afterEach(() => { cleanup(); vi.clearAllMocks(); });
 
 test("手动启动且显示输入覆盖和已保存的五项总结", async () => {
-  const preview = { model: "Codex 默认模型（启动后确认）", characterLimit: 40000, characterCount: 1200,
+  const preview = { model: "requested-model", serviceBaseUrl: "https://text.example/v1", characterLimit: 40000, characterCount: 1200,
     totalFacts: 6, includedFacts: 4, totalMessages: 3, includedMessages: 2,
     truncated: true, turnsComplete: true, itemsComplete: true, sourceCurrent: true,
     contentAvailable: true, cacheCurrent: false, cachedSummary: null, analysisBlockedReason: null };
@@ -18,7 +18,7 @@ test("手动启动且显示输入覆盖和已保存的五项总结", async () =>
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "get_summary_preview") return { ...preview, cachedSummary: generated ? {
       content: { goal: "目标内容", activity: "活动内容", outcome: "结果内容", decisions: "决定内容", issues: "问题内容" },
-      evidenceIds: ["item:turn-1:item-1"], model: "test-model", createdAtUnixMs: 1000, sourceUpdatedAt: 200 } : null };
+      evidenceIds: ["item:turn-1:item-1"], model: "test-model", requestedModel: "requested-model", serviceBaseUrl: "https://text.example/v1", createdAtUnixMs: 1000, sourceUpdatedAt: 200 } : null };
     if (command === "get_latest_summary_run") return null;
     if (command === "start_thread_summary") {
       generated = true;
@@ -32,6 +32,8 @@ test("手动启动且显示输入覆盖和已保存的五项总结", async () =>
   const onLocate = vi.fn(async () => {});
   render(<ThreadSummaryView threadId="thread-h" connected revision={0} onLocate={onLocate} />);
   expect(await screen.findByText("已截断或抽样，部分内容未发送")).toBeTruthy();
+  expect(screen.getByText(/https:\/\/text.example\/v1 \/ requested-model/)).toBeTruthy();
+  expect(screen.getByText(/手动生成最多发起 1 次推理/)).toBeTruthy();
   expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("start_thread_summary", expect.anything());
   fireEvent.click(screen.getByRole("button", { name: "手动生成" }));
   await waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith("start_thread_summary", { threadId: "thread-h" }));
@@ -85,18 +87,18 @@ test("部分读取时保留旧总结和版本并禁止生成确定性新总结",
   expect(screen.getByRole("button", { name: "重新生成" }).hasAttribute("disabled")).toBe(true);
 });
 
-test("认证隔离不成立时禁用生成并保留查看入口", async () => {
+test("文本服务未配置时禁用生成并保留查看入口", async () => {
   vi.mocked(invoke).mockImplementation(async (command) => {
-    if (command === "get_summary_preview") return { model: "Codex 默认模型", characterLimit: 40000, characterCount: 100,
+    if (command === "get_summary_preview") return { model: "未配置文本模型", characterLimit: 40000, characterCount: 100,
       totalFacts: 0, includedFacts: 0, totalMessages: 1, includedMessages: 1,
       truncated: false, turnsComplete: true, itemsComplete: true, sourceCurrent: true,
       contentAvailable: true, cachedSummary: null, cacheCurrent: false,
-      analysisBlockedReason: "认证文件无法隔离。" };
+      analysisBlockedReason: "请先配置文本服务。" };
     if (command === "get_latest_summary_run") return null;
     throw new Error(`Unexpected command ${command}`);
   });
   render(<ThreadSummaryView threadId="thread-h" connected revision={0} onLocate={vi.fn(async () => {})} />);
-  expect(await screen.findByRole("alert")).toHaveProperty("textContent", "认证文件无法隔离。");
+  expect(await screen.findByRole("alert")).toHaveProperty("textContent", "请先配置文本服务。");
   expect(screen.getByRole("button", { name: "手动生成" }).hasAttribute("disabled")).toBe(true);
   expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("start_thread_summary", expect.anything());
 });

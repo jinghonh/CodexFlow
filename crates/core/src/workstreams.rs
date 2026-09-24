@@ -212,6 +212,16 @@ pub(crate) fn build(graph: &ProjectGraph, old: &[Workstream]) -> ProjectWorkstre
             } else {
                 None
             },
+            name_service_base_url: if keep_name {
+                prior.unwrap().name_service_base_url.clone()
+            } else {
+                None
+            },
+            name_requested_model: if keep_name {
+                prior.unwrap().name_requested_model.clone()
+            } else {
+                None
+            },
             name_error,
             predecessor_ids,
         };
