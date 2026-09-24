@@ -278,6 +278,53 @@ fn get_project_workstreams(
 }
 
 #[tauri::command]
+fn rename_workstream(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    workstream_id: String,
+    name: String,
+    expected_revision: u64,
+) -> Result<u64, AppError> {
+    service(&state)?.rename_workstream(&project_id, &workstream_id, &name, expected_revision)
+}
+
+#[tauri::command]
+fn restore_workstream_name(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    workstream_id: String,
+    expected_revision: u64,
+) -> Result<u64, AppError> {
+    service(&state)?.restore_workstream_name(&project_id, &workstream_id, expected_revision)
+}
+
+#[tauri::command]
+fn move_thread_to_workstream(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    thread_id: String,
+    target_id: Option<String>,
+    expected_revision: u64,
+) -> Result<u64, AppError> {
+    service(&state)?.move_thread_to_workstream(
+        &project_id,
+        &thread_id,
+        target_id.as_deref(),
+        expected_revision,
+    )
+}
+
+#[tauri::command]
+fn restore_thread_workstream(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    thread_id: String,
+    expected_revision: u64,
+) -> Result<u64, AppError> {
+    service(&state)?.restore_thread_workstream(&project_id, &thread_id, expected_revision)
+}
+
+#[tauri::command]
 fn decide_inferred_relation(
     state: tauri::State<'_, AppState>,
     project_id: String,
@@ -445,6 +492,10 @@ fn main() {
             get_project_sessions,
             get_project_graph,
             get_project_workstreams,
+            rename_workstream,
+            restore_workstream_name,
+            move_thread_to_workstream,
+            restore_thread_workstream,
             decide_inferred_relation,
             get_candidate_preview,
             get_analysis_preview,

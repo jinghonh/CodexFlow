@@ -19,7 +19,7 @@ use codexflow_domain::{
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
 };
-use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore};
+use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore, WorkstreamChange};
 use std::{
     path::PathBuf,
     sync::{
@@ -757,13 +757,141 @@ impl SourceService {
     pub fn project_workstreams(&self, project_id: &str) -> Result<ProjectWorkstreams, AppError> {
         let graph = self.project_graph(project_id)?;
         let _guard = self.lock_project_updates();
+        let automatic = self.automatic_workstreams_for_graph(&graph)?;
+        let corrections = self.sessions.workstream_corrections(project_id)?;
+        Ok(workstreams::apply_corrections(
+            &graph,
+            automatic,
+            &corrections,
+        ))
+    }
+
+    fn automatic_workstreams(&self, project_id: &str) -> Result<ProjectWorkstreams, AppError> {
+        let graph = self.project_graph(project_id)?;
+        let _guard = self.lock_project_updates();
+        self.automatic_workstreams_for_graph(&graph)
+    }
+
+    fn automatic_workstreams_for_graph(
+        &self,
+        graph: &ProjectGraph,
+    ) -> Result<ProjectWorkstreams, AppError> {
+        let project_id = &graph.project.id;
         let previous = self.sessions.workstreams(project_id)?;
-        let result = workstreams::build(&graph, &previous);
+        let corrections = self.sessions.workstream_corrections(project_id)?;
+        let mut result = workstreams::build(graph, &previous);
+        for old in &previous {
+            if result.workstreams.iter().any(|stream| stream.id == old.id) {
+                continue;
+            }
+            if corrections.names.contains_key(&old.id)
+                || corrections
+                    .members
+                    .values()
+                    .any(|target| target.as_deref() == Some(&old.id))
+            {
+                let mut retained = old.clone();
+                retained.members.clear();
+                retained.relation_ids.clear();
+                result.workstreams.push(retained);
+            }
+        }
+        result.workstreams.sort_by(|a, b| a.id.cmp(&b.id));
         if result.workstreams != previous {
             self.sessions
                 .replace_workstreams(project_id, &result.workstreams)?;
         }
         Ok(result)
+    }
+
+    pub fn rename_workstream(
+        &self,
+        project_id: &str,
+        id: &str,
+        name: &str,
+        expected_revision: u64,
+    ) -> Result<u64, AppError> {
+        let name = name.trim();
+        if !(2..=80).contains(&name.chars().count()) || name.chars().any(char::is_control) {
+            return Err(AppError::project("工作流名称须为 2–80 个可显示字符。"));
+        }
+        let view = self.project_workstreams(project_id)?;
+        if !view.workstreams.iter().any(|stream| stream.id == id) {
+            return Err(AppError::workstream_conflict());
+        }
+        self.sessions.save_workstream_correction(
+            project_id,
+            expected_revision,
+            WorkstreamChange::Rename { id, name },
+        )
+    }
+
+    pub fn restore_workstream_name(
+        &self,
+        project_id: &str,
+        id: &str,
+        expected_revision: u64,
+    ) -> Result<u64, AppError> {
+        let view = self.project_workstreams(project_id)?;
+        if !view.workstreams.iter().any(|stream| stream.id == id) {
+            return Err(AppError::workstream_conflict());
+        }
+        self.sessions.save_workstream_correction(
+            project_id,
+            expected_revision,
+            WorkstreamChange::RestoreName { id },
+        )
+    }
+
+    pub fn move_thread_to_workstream(
+        &self,
+        project_id: &str,
+        thread_id: &str,
+        target_id: Option<&str>,
+        expected_revision: u64,
+    ) -> Result<u64, AppError> {
+        let graph = self.project_graph(project_id)?;
+        if !graph
+            .nodes
+            .iter()
+            .any(|node| node.id == thread_id && !node.reference_only)
+        {
+            return Err(AppError::project("该会话不属于当前项目，请刷新项目。"));
+        }
+        let view = self.project_workstreams(project_id)?;
+        if target_id.is_some_and(|id| !view.workstreams.iter().any(|stream| stream.id == id)) {
+            return Err(AppError::workstream_conflict());
+        }
+        self.sessions.save_workstream_correction(
+            project_id,
+            expected_revision,
+            WorkstreamChange::Move {
+                thread_id,
+                target_id,
+            },
+        )
+    }
+
+    pub fn restore_thread_workstream(
+        &self,
+        project_id: &str,
+        thread_id: &str,
+        expected_revision: u64,
+    ) -> Result<u64, AppError> {
+        let graph = self.project_graph(project_id)?;
+        if !graph
+            .nodes
+            .iter()
+            .any(|node| node.id == thread_id && !node.reference_only)
+        {
+            return Err(AppError::project("该会话不属于当前项目，请刷新项目。"));
+        }
+        self.project_workstreams(project_id)?;
+        self.sessions.save_workstream_correction(
+            project_id,
+            expected_revision,
+            WorkstreamChange::RestoreMember { thread_id },
+        )
     }
 
     pub fn decide_inferred_relation(
@@ -2812,6 +2940,252 @@ mod tests {
             reopened.project_graph(&first_id).unwrap().relations.len(),
             9
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workstream_corrections_survive_regrouping_restart_and_restore_independently() {
+        use codexflow_domain::ThreadMetadata;
+        let root = temp_data_dir();
+        let project_path = root.join("project");
+        fs::create_dir_all(&project_path).unwrap();
+        let data = root.join("data");
+        let service =
+            SourceService::with_credentials(data.clone(), Arc::new(MemoryCredentials::default()))
+                .unwrap();
+        let thread = |id: &str, parent: Option<&str>, updated_at| ThreadMetadata {
+            id: id.into(),
+            session_id: id.into(),
+            title: Some(id.into()),
+            preview: id.into(),
+            cwd: project_path.to_string_lossy().into_owned(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: parent.map(str::to_owned),
+            forked_from_id: None,
+            git: None,
+            created_at: 1,
+            updated_at,
+            archived: false,
+            metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
+            content_complete: false,
+            read_error: None,
+            observed_at_unix_ms: updated_at,
+        };
+        service
+            .sessions
+            .save_collection(
+                &[
+                    thread("a", None, 2),
+                    thread("b", Some("a"), 2),
+                    thread("c", None, 2),
+                    thread("d", Some("c"), 2),
+                    thread("x", None, 2),
+                ],
+                &[],
+            )
+            .unwrap();
+        let project_id = service
+            .choose_project(project_path.to_str().unwrap())
+            .unwrap()
+            .selected_project_id
+            .unwrap();
+        let mut view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(view.workstreams.len(), 2);
+        let first = view
+            .workstreams
+            .iter()
+            .find(|stream| stream.members == ["a", "b"])
+            .unwrap()
+            .id
+            .clone();
+        let second = view
+            .workstreams
+            .iter()
+            .find(|stream| stream.members == ["c", "d"])
+            .unwrap()
+            .id
+            .clone();
+        let stale_revision = view.revision;
+        service
+            .rename_workstream(&project_id, &first, "人工工作", view.revision)
+            .unwrap();
+        assert!(matches!(
+            service.move_thread_to_workstream(&project_id, "a", Some(&second), stale_revision),
+            Err(AppError {
+                code: ErrorCode::ConcurrentModification,
+                ..
+            })
+        ));
+        view = service.project_workstreams(&project_id).unwrap();
+        service
+            .move_thread_to_workstream(&project_id, "a", Some(&second), view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        service
+            .move_thread_to_workstream(&project_id, "b", Some(&second), view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .members,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .name,
+            "人工工作"
+        );
+        service
+            .move_thread_to_workstream(&project_id, "x", Some(&first), view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        service
+            .move_thread_to_workstream(&project_id, "c", None, view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .members,
+            ["x"]
+        );
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == second)
+                .unwrap()
+                .members,
+            ["a", "b", "d"]
+        );
+        assert_eq!(view.ungrouped_thread_ids, ["c"]);
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .flat_map(|stream| stream.members.iter())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            4
+        );
+
+        service
+            .sessions
+            .save_collection(&[thread("c", Some("a"), 3)], &[])
+            .unwrap();
+        service.reconcile_projects().unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .name,
+            "人工工作"
+        );
+        assert!(view.workstreams.iter().any(|stream| stream.id == second));
+        assert!(view
+            .workstreams
+            .iter()
+            .find(|stream| stream.id == second)
+            .unwrap()
+            .members
+            .contains(&"b".into()));
+        assert_eq!(view.ungrouped_thread_ids, ["c"]);
+
+        drop(service);
+        let service =
+            SourceService::with_credentials(data, Arc::new(MemoryCredentials::default())).unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .name,
+            "人工工作"
+        );
+        assert!(view.manually_assigned_thread_ids.contains(&"c".into()));
+        service
+            .sessions
+            .save_collection(&[thread("c", None, 4)], &[])
+            .unwrap();
+        service.reconcile_projects().unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(view.workstreams.len(), 2);
+        service
+            .restore_thread_workstream(&project_id, "a", view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        service
+            .restore_thread_workstream(&project_id, "b", view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        service
+            .restore_thread_workstream(&project_id, "c", view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .name,
+            "人工工作"
+        );
+        service
+            .restore_workstream_name(&project_id, &first, view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_ne!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .name,
+            "人工工作"
+        );
+        assert!(view.manually_named_workstream_ids.is_empty());
+        assert!(view
+            .workstreams
+            .iter()
+            .find(|stream| stream.id == first)
+            .unwrap()
+            .members
+            .contains(&"x".into()));
+        service
+            .restore_thread_workstream(&project_id, "x", view.revision)
+            .unwrap();
+        view = service.project_workstreams(&project_id).unwrap();
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == first)
+                .unwrap()
+                .members,
+            ["a", "b"]
+        );
+        assert_eq!(
+            view.workstreams
+                .iter()
+                .find(|stream| stream.id == second)
+                .unwrap()
+                .members,
+            ["c", "d"]
+        );
+        assert_eq!(view.ungrouped_thread_ids, ["x"]);
         let _ = fs::remove_dir_all(root);
     }
 }

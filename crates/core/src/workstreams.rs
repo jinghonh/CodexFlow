@@ -2,6 +2,7 @@ use codexflow_domain::{
     DerivedRelationKind, ParentEndpoint, ProjectGraph, ProjectWorkstreams, UserRelationDecision,
     Workstream,
 };
+use codexflow_store::WorkstreamCorrections;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -240,7 +241,110 @@ pub(crate) fn build(graph: &ProjectGraph, old: &[Workstream]) -> ProjectWorkstre
         workstreams,
         ungrouped_thread_ids,
         cross_relation_ids,
+        revision: 0,
+        manually_named_workstream_ids: Vec::new(),
+        manually_assigned_thread_ids: Vec::new(),
     }
+}
+
+pub(crate) fn apply_corrections(
+    graph: &ProjectGraph,
+    mut automatic: ProjectWorkstreams,
+    corrections: &WorkstreamCorrections,
+) -> ProjectWorkstreams {
+    let nodes: BTreeSet<_> = graph
+        .nodes
+        .iter()
+        .filter(|node| !node.reference_only)
+        .map(|node| node.id.clone())
+        .collect();
+    let included: BTreeSet<_> = automatic
+        .workstreams
+        .iter()
+        .flat_map(|stream| stream.relation_ids.iter().cloned())
+        .chain(automatic.cross_relation_ids.iter().cloned())
+        .collect();
+    automatic.revision = corrections.revision;
+    automatic.manually_named_workstream_ids = corrections.names.keys().cloned().collect();
+    automatic.manually_assigned_thread_ids = corrections.members.keys().cloned().collect();
+    for stream in &mut automatic.workstreams {
+        if let Some(name) = corrections.names.get(&stream.id) {
+            stream.name = name.clone();
+            stream.name_error = None;
+        }
+        stream
+            .members
+            .retain(|id| !corrections.members.contains_key(id));
+    }
+    for (thread_id, target) in &corrections.members {
+        if !nodes.contains(thread_id) {
+            continue;
+        }
+        if let Some(target) = target {
+            if let Some(stream) = automatic
+                .workstreams
+                .iter_mut()
+                .find(|stream| &stream.id == target)
+            {
+                stream.members.push(thread_id.clone());
+            }
+        }
+    }
+    let mut owners = BTreeMap::new();
+    for stream in &mut automatic.workstreams {
+        stream.members.sort();
+        stream.members.dedup();
+        stream.relation_ids.clear();
+        for member in &stream.members {
+            owners.insert(member.clone(), stream.id.clone());
+        }
+    }
+    let mut endpoints = BTreeMap::new();
+    for item in &graph.relations {
+        endpoints.insert(
+            item.id.as_str(),
+            (item.from_thread_id.as_str(), item.to_thread_id.as_str()),
+        );
+    }
+    for item in &graph.derived_relations {
+        endpoints.insert(
+            item.id.as_str(),
+            (item.from_thread_id.as_str(), item.to_thread_id.as_str()),
+        );
+    }
+    for item in &graph.reviewed_relations {
+        endpoints.insert(
+            item.relation.id.as_str(),
+            (
+                item.relation.from_thread_id.as_str(),
+                item.relation.to_thread_id.as_str(),
+            ),
+        );
+    }
+    automatic.cross_relation_ids.clear();
+    for id in included {
+        let Some(&(left, right)) = endpoints.get(id.as_str()) else {
+            continue;
+        };
+        match (owners.get(left), owners.get(right)) {
+            (Some(a), Some(b)) if a == b => {
+                if let Some(stream) = automatic
+                    .workstreams
+                    .iter_mut()
+                    .find(|stream| &stream.id == a)
+                {
+                    stream.relation_ids.push(id);
+                }
+            }
+            (a, b) if a != b => automatic.cross_relation_ids.push(id),
+            _ => {}
+        }
+    }
+    automatic.ungrouped_thread_ids = nodes
+        .into_iter()
+        .filter(|id| !owners.contains_key(id))
+        .collect();
+    automatic
 }
 
 #[cfg(test)]

@@ -323,3 +323,11 @@ button:disabled { cursor: wait; opacity: .6; }
 .workstream-detail, .workstream-cross, .workstream-ungrouped { border-top: 1px solid var(--line, #c6c6c6); padding-top: 1rem; margin-top: 1rem; }
 .workstream-relations > div, .workstream-cross > div { padding: 0.5rem 0; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
 .workstream-relations small { display: block; width: 100%; opacity: 0.7; }
+.workstream-editor { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0; }
+.workstream-editor label { font-size: 11px; }
+.workstream-editor input, .workstream-thread select { border: 1px solid var(--line); background: var(--page); color: var(--ink); padding: 8px; min-width: 0; }
+.workstream-editor input { flex: 1; min-width: 170px; }
+.workstream-thread { display: grid; gap: 7px; min-width: min(100%, 240px); padding: 9px; border: 1px solid var(--line); border-radius: 8px; }
+.workstream-thread > button:first-child { width: 100%; }
+.workstream-thread label { display: grid; gap: 4px; font-size: 10px; }
+.workstream-thread .browse-button, .workstream-thread .plain-button { align-self: start; }
