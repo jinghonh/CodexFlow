@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 type Grain = "day" | "week" | "month";
@@ -108,8 +108,10 @@ function duration(value: number | null): string {
   return hours ? `${hours} 小时 ${minutes} 分钟` : minutes ? `${minutes} 分钟 ${seconds % 60} 秒` : `${seconds} 秒`;
 }
 
-export function ProjectTimelineView({ projectId, refreshVersion, connected, onSelectThread }: {
+export function ProjectTimelineView({ projectId, refreshVersion, connected, onSelectThread, selectedThreadId = null, visibleThreadIds, workstreams = [], onHistoryLoaded }: {
   projectId: string; refreshVersion: string; connected: boolean; onSelectThread: (threadId: string) => void;
+  selectedThreadId?: string | null; visibleThreadIds?: Set<string>; workstreams?: { id: string; name: string; members: string[] }[];
+  onHistoryLoaded?: () => void;
 }) {
   const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [error, setError] = useState("");
@@ -134,15 +136,23 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
     return () => { active = false; };
   }, [projectId, refreshVersion]);
 
-  const scale = useMemo(() => makeScale(timeline?.threads ?? [], grain, zoom), [timeline, grain, zoom]);
-  const rows = useMemo(() => (timeline?.threads ?? []).map((thread) => {
+  const visible = useMemo(() => (timeline?.threads ?? []).filter((thread) => !visibleThreadIds || visibleThreadIds.has(thread.threadId)), [timeline, visibleThreadIds]);
+  const owners = useMemo(() => new Map(workstreams.flatMap((stream) => stream.members.map((id) => [id, stream.id] as const))), [workstreams]);
+  const rows = useMemo(() => [...visible].sort((a, b) => {
+    const left = owners.get(a.threadId) ?? "~";
+    const right = owners.get(b.threadId) ?? "~";
+    return left.localeCompare(right) || (a.lastActivityAtUnixMs ?? 0) - (b.lastActivityAtUnixMs ?? 0) || a.threadId.localeCompare(b.threadId);
+  }).map((thread) => {
     const placed = placeTurns(thread.turns);
     const height = Math.max(72, 28 + (Math.max(0, ...placed.map(({ lane }) => lane)) + 1) * 20);
-    return { thread, placed, height };
-  }), [timeline]);
+    return { thread, placed, height, group: owners.get(thread.threadId) ?? "ungrouped" };
+  }), [visible, owners]);
+  const scale = useMemo(() => makeScale(visible, grain, zoom), [visible, grain, zoom]);
   const position = (at: number) => scale ? ((at - scale.start) / (scale.end - scale.start)) * scale.width : 0;
-  const selectedThread = timeline?.threads.find((thread) => thread.threadId === selected?.threadId);
-  const selectedTurn = selectedThread?.turns.find((turn) => turn.id === selected?.turnId);
+  const effectiveSelectedId = selectedThreadId ?? selected?.threadId;
+  const selectedThread = timeline?.threads.find((thread) => thread.threadId === effectiveSelectedId);
+  const selectedTurn = selectedThread && selectedThread.threadId === selected?.threadId ? selectedThread.turns.find((turn) => turn.id === selected?.turnId) : undefined;
+  const choose = (threadId: string, turnId: string | null) => { setSelected({ threadId, turnId }); onSelectThread(threadId); };
   const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
 
   useLayoutEffect(() => {
@@ -162,7 +172,7 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
 
   async function loadMissingTurns() {
     if (!timeline || loading) return;
-    const missing = timeline.threads.filter((thread) => !thread.turnsComplete);
+    const missing = visible.filter((thread) => !thread.turnsComplete);
     stopLoading.current = false;
     setLoadError("");
     setLoading({ done: 0, total: missing.length });
@@ -178,48 +188,50 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
     }
     setLoading(null);
     if (errors) setLoadError(`${errors} 条会话读取失败；已保留原有缓存，可再次尝试。`);
+    onHistoryLoaded?.();
   }
 
   return <section id="project-timeline" className="panel timeline-panel" aria-label="项目活动时间线">
     <div className="timeline-heading"><div><div className="panel-kicker">04 / 真实活动时间线</div><h2>回合活动</h2>
       <p className="panel-intro">每段色条来自一个回合的有效起止时间。恢复间隔留白；重叠回合分层显示。</p></div>
       <div className="timeline-controls" aria-label="时间线视图控制">
-        {connected && timeline?.threads.some((thread) => !thread.turnsComplete) && <button className="timeline-load" onClick={() => loading ? stopLoading.current = true : void loadMissingTurns()}>{loading ? `停止读取 · ${loading.done}/${loading.total}` : "读取缺失回合"}</button>}
+        {connected && visible.some((thread) => !thread.turnsComplete) && <button className="timeline-load" onClick={() => loading ? stopLoading.current = true : void loadMissingTurns()}>{loading ? `停止读取 · ${loading.done}/${loading.total}` : "读取缺失回合"}</button>}
         <div className="timeline-grains">{(["day", "week", "month"] as const).map((value) => <button key={value} className={grain === value ? "active" : ""} aria-pressed={grain === value} onClick={() => changeView(value, zoom)}>{ { day: "日", week: "周", month: "月" }[value] }</button>)}</div>
         <button aria-label="缩小时间线" disabled={zoom <= 0.5} onClick={() => changeView(grain, Math.max(0.5, zoom / 2))}>−</button><span>{Math.round(zoom * 100)}%</span><button aria-label="放大时间线" disabled={zoom >= 4} onClick={() => changeView(grain, Math.min(4, zoom * 2))}>＋</button>
       </div></div>
-    <div className="timeline-legend"><strong>未分组会话</strong><span>{timeline?.threads.length ?? 0} 条</span><span>系统时区：{zone}</span><span>横向滚动查看更早或更晚的活动</span></div>
+    <div className="timeline-legend"><strong>工作流泳道</strong><span>显示 {visible.length} / {timeline?.threads.length ?? 0} 条；每条会话只占一个主要工作流</span><span>系统时区：{zone}</span><span>横向滚动查看更早或更晚的活动</span></div>
     {error && <div className="page-error" role="alert">{error}</div>}
     {loadError && <div className="page-error" role="alert">{loadError}</div>}
     {!timeline && !error && <p className="empty-list">正在读取已缓存回合…</p>}
     {timeline && timeline.threads.length === 0 && <p className="empty-list">此项目暂无会话。</p>}
+    {timeline && timeline.threads.length > 0 && visible.length === 0 && <p className="empty-list">当前过滤条件没有可见会话；已选会话的详情仍会保留。</p>}
     {timeline && timeline.threads.length > 0 && <>
       {!scale && <p className="timeline-empty">暂无可定位的活动区间；仍可查看已知时长和时间状态。打开会话历史后，时间线会更新。</p>}
-      <div ref={board} className="timeline-board" role="region" aria-label="可横向滚动的活动时间线" tabIndex={0}>
+      {visible.length > 0 && <div ref={board} className="timeline-board" role="region" aria-label="可横向滚动的活动时间线" tabIndex={0}>
         <div className="timeline-content" style={{ width: labelWidth + (scale?.width ?? 620) }}>
           <div className="timeline-axis" style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px` }}><div className="timeline-axis-label">会话 · 已知时长</div><div className="timeline-axis-track">
             {scale?.ticks.map((tick) => <span key={tick.at} className="timeline-tick" style={{ left: position(tick.at) }}>{tick.label}</span>)}
             {!scale && <span className="timeline-axis-unknown">位置未知</span>}
           </div></div>
-          {rows.map(({ thread, placed, height }) => <div className="timeline-row" key={thread.threadId} style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px`, minHeight: height }}>
-            <button className={`timeline-row-label ${selected?.threadId === thread.threadId ? "selected" : ""}`} onClick={() => setSelected({ threadId: thread.threadId, turnId: null })} title={thread.title}>
+      {rows.map(({ thread, placed, height, group }, index) => <Fragment key={thread.threadId}>{(index === 0 || rows[index - 1].group !== group) && <div className="timeline-group" style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px` }}><strong>{workstreams.find((stream) => stream.id === group)?.name ?? "未分组会话"}</strong><span>{rows.filter((row) => row.group === group).length} 条会话</span></div>}<div className="timeline-row" style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px`, minHeight: height }}>
+            <button className={`timeline-row-label ${effectiveSelectedId === thread.threadId ? "selected" : ""}`} onClick={() => choose(thread.threadId, null)} title={thread.title}>
               <strong>{thread.title}</strong><span className={`timeline-quality quality-${thread.quality}`}>{qualityText[thread.quality]}</span><small title={thread.knownDurationMs === null ? "来源未提供可累计时长" : `${thread.knownDurationMs.toLocaleString("zh-CN")} 毫秒`}>{thread.knownDurationMs === null ? "已知时长：未知" : `已知时长：${duration(thread.knownDurationMs)}`}</small>
             </button>
             <div className="timeline-track" style={{ height }}>
               {placed.map(({ turn, lane }) => {
                 const start = position(turn.intervalStartUnixMs!);
                 const width = Math.max(3, position(turn.intervalEndUnixMs!) - start);
-                return <button key={turn.id} className={`timeline-segment ${turn.intervalStartUnixMs === turn.intervalEndUnixMs ? "instant" : ""} ${selected?.threadId === thread.threadId && selected.turnId === turn.id ? "selected" : ""}`}
+                return <button key={turn.id} className={`timeline-segment ${effectiveSelectedId === thread.threadId && selected?.threadId === thread.threadId && selected.turnId === turn.id ? "selected" : ""} ${turn.intervalStartUnixMs === turn.intervalEndUnixMs ? "instant" : ""}`}
                   style={{ left: start, width, top: 18 + lane * 20 }} aria-label={`${thread.title} 第 ${turn.ordinal + 1} 回合，${preciseTime(turn.intervalStartUnixMs)} 至 ${preciseTime(turn.intervalEndUnixMs)}`}
-                  title={`${preciseTime(turn.intervalStartUnixMs)} → ${preciseTime(turn.intervalEndUnixMs)}`} onClick={() => setSelected({ threadId: thread.threadId, turnId: turn.id })} />;
+                  title={`${preciseTime(turn.intervalStartUnixMs)} → ${preciseTime(turn.intervalEndUnixMs)}`} onClick={() => choose(thread.threadId, turn.id)} />;
               })}
             </div>
-          </div>)}
+          </div></Fragment>)}
         </div>
-      </div>
+      </div>}
       <div className="timeline-details" aria-live="polite">
         {selectedThread ? <><div><strong>{selectedThread.title}</strong><code>{selectedThread.threadId}</code><span>时间状态：{qualityText[selectedThread.quality]}；回合记录{selectedThread.turnsComplete ? "完整" : "未完整取得"}</span></div>
-          {selectedThread.turns.length > 0 && <div className="timeline-turn-picker" aria-label="选择回合">{selectedThread.turns.map((turn) => <button key={turn.id} className={selectedTurn?.id === turn.id ? "active" : ""} onClick={() => setSelected({ threadId: selectedThread.threadId, turnId: turn.id })} title={turnStateText(turn)}>#{turn.ordinal + 1} {turn.timeState === "complete" ? "区间" : turnStateText(turn)}</button>)}</div>}
+          {selectedThread.turns.length > 0 && <div className="timeline-turn-picker" aria-label="选择回合">{selectedThread.turns.map((turn) => <button key={turn.id} className={selectedTurn?.id === turn.id ? "active" : ""} onClick={() => choose(selectedThread.threadId, turn.id)} title={turnStateText(turn)}>#{turn.ordinal + 1} {turn.timeState === "complete" ? "区间" : turnStateText(turn)}</button>)}</div>}
           <dl className="timeline-last-activity"><dt>最后时间</dt><dd>{preciseTime(selectedThread.lastActivityAtUnixMs)} · {basisText[selectedThread.lastActivityBasis]}</dd></dl>
           {selectedTurn ? <dl><dt>回合</dt><dd>{selectedTurn.ordinal + 1} · <code>{selectedTurn.id}</code> · {turnStateText(selectedTurn)}（{selectedTurn.sourceStatus}）</dd>
             <dt>开始</dt><dd>{preciseTime(selectedTurn.startedAtUnixMs)}{selectedTurn.startedAtUnixMs !== null && <small> UTC {new Date(selectedTurn.startedAtUnixMs).toISOString()}</small>}</dd>

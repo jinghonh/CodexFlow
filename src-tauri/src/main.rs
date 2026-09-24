@@ -1,4 +1,4 @@
-use codexflow_core::SourceService;
+use codexflow_core::{ProjectThreadQuery, ProjectThreadQueryResult, SourceService};
 use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AppError, CandidatePreview, DisplayTheme,
     EvidenceCheck, EvidencePage, FactPage, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
@@ -262,6 +262,15 @@ fn get_project_sessions(
 }
 
 #[tauri::command]
+fn query_project_threads(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    query: ProjectThreadQuery,
+) -> Result<ProjectThreadQueryResult, AppError> {
+    service(&state)?.query_project_threads(&project_id, query)
+}
+
+#[tauri::command]
 fn get_project_graph(
     state: tauri::State<'_, AppState>,
     project_id: String,
@@ -490,6 +499,7 @@ fn main() {
             cancel_index_run,
             get_project_catalog,
             get_project_sessions,
+            query_project_threads,
             get_project_graph,
             get_project_workstreams,
             rename_workstream,

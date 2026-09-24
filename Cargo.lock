@@ -349,6 +349,7 @@ dependencies = [
  "codexflow-jev",
  "codexflow-store",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tokio",
