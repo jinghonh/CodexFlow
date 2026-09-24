@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, test, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectGraphView } from "./ProjectGraphView";
 
@@ -237,4 +237,20 @@ test("旧确认不会让新证据的低分关系默认显示", async () => {
   fireEvent.click(await screen.findByRole("button", { name: "推断 · 相关 · 0.51" }));
   expect(screen.getByText("已确认；当前证据尚未确认")).toBeTruthy();
   expect(screen.getByRole("button", { name: "确认关系" }).hasAttribute("disabled")).toBe(false);
+});
+
+test("关系来源与类型过滤仅更新可见边，不调用裁决接口", async () => {
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: [{ id: "a", title: "甲", referenceOnly: false }, { id: "b", title: "乙", referenceOnly: false }],
+    relations: [{ id: "observed", projectId: "project", fromThreadId: "a", toThreadId: "b", kind: "FORKED_FROM",
+      source: "observed", sourceField: "forkedFromId", confidence: 1, parentEndpoint: "inProject" }],
+    derivedRelations: [{ id: "derived", projectId: "project", fromThreadId: "a", toThreadId: "b",
+      kind: "SHARED_FILE", source: "derived", basis: "同一文件", evidence: [] }],
+    inferredRelations: [], diagnostics: [] });
+  const { rerender } = render(<ProjectGraphView projectId="project" refreshVersion={0} relationSource="all" relationKind="all" />);
+  await screen.findByRole("button", { name: "观察 · 派生 · 1.0" });
+  rerender(<ProjectGraphView projectId="project" refreshVersion={0} relationSource="derived" relationKind="SHARED_FILE" />);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "观察 · 派生 · 1.0" })).toBeNull());
+  expect(screen.getByRole("button", { name: "规则 · 共同文件" })).toBeTruthy();
+  expect(vi.mocked(invoke).mock.calls.every(([command]) => command === "get_project_graph")).toBe(true);
 });

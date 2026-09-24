@@ -63,12 +63,12 @@ function confirmedWithCurrentEvidence(relation: ReviewedRelation): boolean {
     && relation.review.confirmedEvidenceVersion === relation.evidenceVersion;
 }
 
-function visibleInferred(graph: ProjectGraph, showLowConfidence: boolean): InferredRelation[] {
+function visibleInferred(graph: ProjectGraph, minimumConfidence: number): InferredRelation[] {
   const byId = new Map(reviewedRelations(graph).map((relation) => [relation.id, relation]));
   return (graph.inferredRelations ?? []).filter((relation) => {
     const reviewed = byId.get(relation.id);
     return reviewed?.review.decision !== "rejected" && (!reviewed || reviewed.evidenceValid)
-      && (showLowConfidence || relation.confidence >= 0.70 || (reviewed && confirmedWithCurrentEvidence(reviewed)));
+      && (relation.confidence >= minimumConfidence || (minimumConfidence === 0.7 && reviewed && confirmedWithCurrentEvidence(reviewed)));
   });
 }
 
@@ -94,8 +94,24 @@ function ThreadNode({ data }: NodeProps<Node<GraphNodeData>>) {
 
 const nodeTypes = { thread: ThreadNode };
 
-async function layoutGraph(graph: ProjectGraph, showLowConfidence: boolean): Promise<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }> {
-  const visibleRelations = visibleInferred(graph, showLowConfidence);
+function filteredGraph(graph: ProjectGraph, visibleThreadIds: Set<string> | undefined, source: string, kind: string, minimumConfidence: number): ProjectGraph {
+  const visible = (id: string) => !visibleThreadIds || visibleThreadIds.has(id);
+  const observed = source === "all" || source === "observed";
+  const derived = source === "all" || source === "derived";
+  const inferred = source === "all" || source === "inferred";
+  const relations = observed ? graph.relations.filter((item) => (kind === "all" || kind === item.kind) && visible(item.toThreadId) && (visible(item.fromThreadId) || graph.nodes.some((node) => node.id === item.fromThreadId && node.referenceOnly))) : [];
+  const referenceIds = new Set(relations.map((item) => item.fromThreadId));
+  return {
+    ...graph,
+    nodes: graph.nodes.filter((node) => node.referenceOnly ? referenceIds.has(node.id) : visible(node.id)),
+    relations,
+    derivedRelations: derived ? (graph.derivedRelations ?? []).filter((item) => (kind === "all" || kind === item.kind) && visible(item.fromThreadId) && visible(item.toThreadId)) : [],
+    inferredRelations: inferred ? visibleInferred(graph, minimumConfidence).filter((item) => (kind === "all" || kind === item.kind) && visible(item.fromThreadId) && visible(item.toThreadId)) : [],
+  };
+}
+
+async function layoutGraph(graph: ProjectGraph): Promise<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }> {
+  const visibleRelations = graph.inferredRelations ?? [];
   let coordinates = new Map<string, { x?: number; y?: number }>();
   let warning = "";
   try {
@@ -164,47 +180,58 @@ async function layoutGraph(graph: ProjectGraph, showLowConfidence: boolean): Pro
   return { nodes, edges, warning };
 }
 
-export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }: { projectId: string; refreshVersion: number;
-  onSelectEvidence?: (evidence: Evidence) => void }) {
+export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, selectedThreadId = null, onSelectThread, visibleThreadIds, relationSource = "all", onRelationSourceChange, relationKind = "all", onRelationKindChange, minimumConfidence = 0.7, onMinimumConfidenceChange }: { projectId: string; refreshVersion: number;
+  onSelectEvidence?: (evidence: Evidence) => void; selectedThreadId?: string | null; onSelectThread?: (id: string) => void;
+  visibleThreadIds?: Set<string>; relationSource?: string; onRelationSourceChange?: (value: string) => void;
+  relationKind?: string; onRelationKindChange?: (value: string) => void; minimumConfidence?: number; onMinimumConfidenceChange?: (value: number) => void }) {
   const [graph, setGraph] = useState<ProjectGraph | null>(null);
   const [layout, setLayout] = useState<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }>({ nodes: [], edges: [], warning: "" });
   const [selection, setSelection] = useState<Selection>(null);
   const [error, setError] = useState("");
   const [decisionError, setDecisionError] = useState("");
   const [savingDecision, setSavingDecision] = useState(false);
-  const [showLowConfidence, setShowLowConfidence] = useState(false);
+  const [localMinimumConfidence, setLocalMinimumConfidence] = useState(minimumConfidence);
+  const threshold = onMinimumConfidenceChange ? minimumConfidence : localMinimumConfidence;
+  const changeThreshold = (value: number) => onMinimumConfidenceChange ? onMinimumConfidenceChange(value) : setLocalMinimumConfidence(value);
+  useEffect(() => { setSelection(null); }, [selectedThreadId]);
   useEffect(() => {
     let active = true;
     setGraph(null);
     setError("");
     invoke<ProjectGraph>("get_project_graph", { projectId })
-      .then(async (next) => {
-        const positioned = await layoutGraph(next, showLowConfidence);
-        if (active) {
-          setGraph(next);
-          setLayout(positioned);
-          setSelection((current) => current &&
-            (current.type === "edge" ? [...next.relations, ...(next.derivedRelations ?? []), ...reviewedRelations(next)].some((relation) => relation.id === current.id) : next.nodes.some((node) => node.id === current.id))
-            ? current : null);
-        }
+      .then((next) => {
+        if (!active) return;
+        setGraph(next);
+        setSelection((current) => current &&
+          (current.type === "edge" ? [...next.relations, ...(next.derivedRelations ?? []), ...reviewedRelations(next)].some((relation) => relation.id === current.id) : next.nodes.some((node) => node.id === current.id))
+          ? current : null);
       })
       .catch((cause) => { if (active) setError(typeof cause?.message === "string" ? cause.message : "关系图读取失败。请重试刷新。"); });
     return () => { active = false; };
-  }, [projectId, refreshVersion, showLowConfidence]);
+  }, [projectId, refreshVersion]);
+
+  useEffect(() => {
+    if (!graph) return;
+    let active = true;
+    layoutGraph(filteredGraph(graph, visibleThreadIds, relationSource, relationKind, threshold))
+      .then((positioned) => { if (active) setLayout(positioned); });
+    return () => { active = false; };
+  }, [graph, visibleThreadIds, relationSource, relationKind, threshold]);
 
   const detail = useMemo(() => {
-    if (!graph || !selection) return null;
-    if (selection.type === "edge") {
-      const relation = graph.relations.find((item) => item.id === selection.id);
+    const current = selection ?? (selectedThreadId ? { type: "node" as const, id: selectedThreadId } : null);
+    if (!graph || !current) return null;
+    if (current.type === "edge") {
+      const relation = graph.relations.find((item) => item.id === current.id);
       if (relation) return { type: "edge" as const, relation };
-      const derived = graph.derivedRelations?.find((item) => item.id === selection.id);
+      const derived = graph.derivedRelations?.find((item) => item.id === current.id);
       if (derived) return { type: "derived" as const, relation: derived };
-      const inferred = reviewedRelations(graph).find((item) => item.id === selection.id);
+      const inferred = reviewedRelations(graph).find((item) => item.id === current.id);
       return inferred ? { type: "inferred" as const, relation: inferred } : null;
     }
-    const node = graph.nodes.find((item) => item.id === selection.id);
+    const node = graph.nodes.find((item) => item.id === current.id);
     return node ? { type: "node" as const, node } : null;
-  }, [graph, selection]);
+  }, [graph, selection, selectedThreadId]);
 
   async function decide(relation: ReviewedRelation, decision: RelationReview["decision"]) {
     setSavingDecision(true);
@@ -215,9 +242,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
         expectedEvidenceVersion: relation.evidenceVersion,
       });
       const next = await invoke<ProjectGraph>("get_project_graph", { projectId });
-      const positioned = await layoutGraph(next, showLowConfidence);
       setGraph(next);
-      setLayout(positioned);
     } catch (cause) {
       const failure = cause as { code?: string; message?: string };
       setDecisionError(failure?.code === "CONCURRENT_MODIFICATION"
@@ -233,7 +258,6 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
     try {
       const next = await invoke<ProjectGraph>("get_project_graph", { projectId });
       setGraph(next);
-      setLayout(await layoutGraph(next, showLowConfidence));
     } catch (cause) {
       setDecisionError((cause as { message?: string })?.message || "刷新关系图失败。");
     }
@@ -246,8 +270,9 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
     {error && <div className="page-error" role="alert">{error}</div>}
     {!graph && !error && <p className="empty-list">正在读取项目关系图…</p>}
     {graph && <>
-      <div className="graph-summary"><strong>{graph.nodes.filter((node) => !node.referenceOnly).length} 条会话</strong><span>{graph.relations.length} 条观察关系</span><span>{graph.derivedRelations?.length ?? 0} 条规则关系</span><span>{visibleInferred(graph, false).length} 条默认显示的推断关系</span><span>{graph.nodes.filter((node) => node.referenceOnly).length} 个仅有引用的端点</span></div>
-      <label className="graph-confidence-toggle"><input type="checkbox" checked={showLowConfidence} onChange={(event) => setShowLowConfidence(event.target.checked)} />查看低于 0.70 的推断关系（{(graph.inferredRelations ?? []).filter((item) => item.confidence < 0.70).length}）</label>
+      <div className="graph-summary"><strong>{layout.nodes.filter((node) => !node.data.referenceOnly).length} 条可见会话</strong><span>{layout.edges.length} 条可见关系</span><span>{graph.relations.length} 条观察关系</span><span>{graph.derivedRelations?.length ?? 0} 条规则关系</span><span>{visibleInferred(graph, 0.7).length} 条默认显示的推断关系</span></div>
+      <div className="explorer-filters" aria-label="关系过滤"><label>来源类别<select aria-label="按来源类别过滤关系" value={relationSource} onChange={(event) => onRelationSourceChange?.(event.target.value)}><option value="all">全部</option><option value="observed">观察</option><option value="derived">规则</option><option value="inferred">推断</option></select></label><label>关系类型<select aria-label="按关系类型过滤" value={relationKind} onChange={(event) => onRelationKindChange?.(event.target.value)}><option value="all">全部类型</option>{[...new Set([...graph.relations, ...(graph.derivedRelations ?? []), ...(graph.inferredRelations ?? [])].map((item) => item.kind))].sort().map((kind) => <option value={kind} key={kind}>{kind}</option>)}</select></label><label>最低置信度<select aria-label="最低关系置信度" value={threshold} onChange={(event) => changeThreshold(Number(event.target.value))}><option value={0}>全部</option><option value={0.5}>0.50</option><option value={0.7}>0.70（默认）</option><option value={0.9}>0.90</option></select></label></div>
+      <label className="graph-confidence-toggle"><input type="checkbox" checked={threshold < 0.7} onChange={(event) => changeThreshold(event.target.checked ? 0 : 0.7)} />查看低于 0.70 的推断关系（{(graph.inferredRelations ?? []).filter((item) => item.confidence < 0.70).length}）</label>
       {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid).length > 0 &&
         <div className="graph-review-list"><strong>已拒绝或过期的推断关系</strong>
           {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid)
@@ -256,16 +281,17 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
             </button>)}
         </div>}
       {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}，证据不足 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "insufficientEvidence").length}；这些结果不生成图边。</p>}
+      <button className="browse-button" onClick={() => void refreshGraph()}>自动布局</button>
       {layout.warning && <div className="graph-layout-warning" role="status">{layout.warning}</div>}
-      {graph.nodes.length ? <div className="graph-canvas" aria-label="项目结构关系图">
-        <ReactFlow nodes={layout.nodes} edges={layout.edges} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }}
-          nodesDraggable={false} onNodeClick={(_, node) => setSelection({ type: "node", id: node.id })}
+      {layout.nodes.length ? <div className="graph-canvas" aria-label="项目结构关系图">
+        <ReactFlow nodes={layout.nodes.map((node) => ({ ...node, selected: node.id === selectedThreadId }))} edges={layout.edges} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }}
+          nodesDraggable={false} onNodeClick={(_, node) => { setSelection({ type: "node", id: node.id }); if (!node.data.referenceOnly) onSelectThread?.(node.id); }}
           onEdgeClick={(_, edge) => setSelection({ type: "edge", id: edge.id })}
           onPaneClick={() => setSelection(null)} minZoom={0.15} maxZoom={2}>
           <Background gap={22} size={1} />
           <Controls showInteractive={false} />
         </ReactFlow>
-      </div> : <p className="empty-list">当前项目没有会话。</p>}
+      </div> : <p className="empty-list">{graph.nodes.length ? "当前条件没有可见会话；已选会话详情仍会保留。" : "当前项目没有会话。"}</p>}
       <div className="graph-details" aria-live="polite">
         {!detail && <p>选择节点或关系以查看来源详情。</p>}
         {detail?.type === "node" && <><h3>{detail.node.referenceOnly ? "仅有引用的端点" : "会话"}</h3><strong>{detail.node.title ?? detail.node.id}</strong><code>{detail.node.id}</code>{detail.node.referenceOnly && <p>来源记录了此会话 ID，当前项目图没有可展示的会话内容。</p>}</>}

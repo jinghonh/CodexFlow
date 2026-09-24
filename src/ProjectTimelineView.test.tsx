@@ -99,3 +99,13 @@ test("可按需读取项目缺失回合并更新活动段", async () => {
   await waitFor(() => expect(document.querySelectorAll(".timeline-segment")).toHaveLength(1));
   expect(vi.mocked(invoke)).toHaveBeenCalledWith("load_thread_history", { threadId: "thread" });
 });
+
+test("工作流泳道按主要归属显示，同一会话只出现一次", async () => {
+  vi.mocked(invoke).mockResolvedValue(timeline);
+  render(<ProjectTimelineView projectId="project" refreshVersion="0" connected={false} onSelectThread={vi.fn()}
+    visibleThreadIds={new Set(["thread", "unknown"])} workstreams={[{ id: "stream", name: "实现功能", members: ["thread"] }]} />);
+  await screen.findByText("实现功能");
+  expect(document.querySelectorAll(".timeline-row")).toHaveLength(2);
+  expect(screen.getByText("未分组会话")).toBeTruthy();
+  expect(screen.getAllByRole("button", { name: /恢复的会话.*已知时长/ })).toHaveLength(1);
+});

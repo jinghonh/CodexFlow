@@ -1,5 +1,6 @@
 mod analysis_batch;
 mod candidates;
+mod explorer;
 mod facts;
 mod inferred;
 mod projects;
@@ -20,6 +21,7 @@ use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
 };
 use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore, WorkstreamChange};
+pub use explorer::{ProjectThreadQuery, ProjectThreadQueryResult};
 use sha2::{Digest, Sha256};
 use std::{
     io::Read,
