@@ -45,6 +45,8 @@ pub(crate) fn candidate_version(
     candidate: &RelationCandidate,
 ) -> Result<String, AppError> {
     let mut hash = Sha256::new();
+    hash.update(super::candidates::CANDIDATE_RULE_VERSION);
+    hash.update(super::facts::RULE_VERSION);
     hash.update(serde_json::to_vec(candidate).map_err(|_| AppError::store("候选版本计算失败。"))?);
     for thread_id in [&candidate.left_thread_id, &candidate.right_thread_id] {
         let thread = service

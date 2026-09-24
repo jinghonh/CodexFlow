@@ -48,15 +48,21 @@ fn reusable_jev_outcome(
     input_version: &str,
     base_url: &str,
     requested_model: &str,
+    verified_actual_model: Option<&str>,
     input_character_limit: usize,
 ) -> bool {
+    let actual_model = if pinned_jev_model(requested_model) {
+        Some(requested_model)
+    } else {
+        verified_actual_model
+    };
     result.candidate_id == candidate_id
         && result.input_version == input_version
-        && pinned_jev_model(requested_model)
+        && actual_model.is_some()
         && result.jev_identity.as_ref().is_some_and(|identity| {
             identity.base_url == base_url
                 && identity.requested_model == requested_model
-                && identity.actual_model == requested_model
+                && Some(identity.actual_model.as_str()) == actual_model
                 && identity.rules_version == RELATION_RULES_VERSION
                 && identity.input_character_limit == input_character_limit
         })
@@ -244,6 +250,7 @@ impl SourceService {
                     &version,
                     &jev.config.base_url,
                     &jev.config.model,
+                    None,
                     limits.input_character_limit,
                 )
             }) {
@@ -369,8 +376,9 @@ impl SourceService {
         &self,
         run: &mut AnalysisRun,
         result: &codexflow_domain::InferredPairOutcome,
+        expected_sources: &[(String, i64, i64)],
         update: &Update,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let _guard = self.analysis_update_lock.lock().unwrap();
         if self
             .sessions
@@ -384,9 +392,14 @@ impl SourceService {
             ));
         }
         recalculate(run);
-        self.sessions.save_analysis_with_outcome(run, result)?;
+        if !self
+            .sessions
+            .save_analysis_with_outcome(run, result, expected_sources)?
+        {
+            return Ok(false);
+        }
         update(run.clone());
-        Ok(())
+        Ok(true)
     }
 
     pub async fn start_project_analysis(
@@ -828,6 +841,7 @@ impl SourceService {
                                 &version,
                                 &run.jev_base_url,
                                 &run.jev_model,
+                                None,
                                 run.limits.input_character_limit,
                             )
                         }) {
@@ -1319,6 +1333,42 @@ impl SourceService {
             self.save_analysis(&mut run, &control.update)?;
             return Ok(());
         }
+        if self.preferences.lock().await.jev_revision == run.jev_config_revision {
+            if let Some(cached) = self
+                .sessions
+                .inferred_pair_outcomes(&run.project_id)?
+                .into_iter()
+                .find(|result| {
+                    reusable_jev_outcome(
+                        result,
+                        &candidate.id,
+                        &run.units[index].input_version,
+                        &run.jev_base_url,
+                        &run.jev_model,
+                        run.jev_pinned_model.as_deref(),
+                        run.limits.input_character_limit,
+                    )
+                })
+            {
+                run.units[index].state = AnalysisUnitState::Succeeded;
+                run.units[index].actual_model =
+                    cached.jev_identity.map(|identity| identity.actual_model);
+                run.units[index].error = None;
+                self.save_analysis(&mut run, &control.update)?;
+                return Ok(());
+            }
+        }
+        let mut expected_sources = Vec::with_capacity(2);
+        for thread_id in [&candidate.left_thread_id, &candidate.right_thread_id] {
+            let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
+                core_error(ErrorCode::SourceReadFailed, "候选来源会话已消失。", true)
+            })?;
+            expected_sources.push((
+                thread_id.clone(),
+                thread.updated_at,
+                self.sessions.history_generation(thread_id)?,
+            ));
+        }
         let phase = run.units[index].stage;
         let supported = run.units[index]
             .relation_classification
@@ -1418,7 +1468,6 @@ impl SourceService {
             }
         };
         drop(permit);
-        drop(gate);
         let _dispatch = Arc::clone(&control.dispatch).lock_owned().await;
         let mut current = self
             .sessions
@@ -1617,10 +1666,21 @@ impl SourceService {
             }
         }
         if let Some(result) = outcome {
-            self.save_analysis_outcome(&mut current, &result, &control.update)?;
+            if !self.save_analysis_outcome(
+                &mut current,
+                &result,
+                &expected_sources,
+                &control.update,
+            )? {
+                current.units[index].state = AnalysisUnitState::Pending;
+                current.state = AnalysisRunState::Paused;
+                current.pause_reason = Some("来源版本或运行状态已变化；迟到结果未保存。".into());
+                self.save_analysis(&mut current, &control.update)?;
+            }
         } else {
             self.save_analysis(&mut current, &control.update)?;
         }
+        drop(gate);
         if current.units[index].state == AnalysisUnitState::Pending
             && current.state != AnalysisRunState::Paused
             && current.units[index].error.is_some()
@@ -2594,6 +2654,57 @@ mod tests {
         assert_eq!(relation.evidence.left.thread_id, "thread-0");
         assert_eq!(relation.evidence.right.thread_id, "thread-1");
         assert_eq!(graph.inference_outcomes[0].status, "valid");
+        let old = service
+            .sessions
+            .inferred_pair_outcomes("project-test")
+            .unwrap()
+            .remove(0);
+        let sources: Vec<_> = ["thread-0", "thread-1"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.to_owned(),
+                    service.sessions.thread(id).unwrap().unwrap().updated_at,
+                    service.sessions.history_generation(id).unwrap(),
+                )
+            })
+            .collect();
+        let mut replay = completed.clone();
+        replay.state = AnalysisRunState::Running;
+        replay
+            .units
+            .iter_mut()
+            .find(|unit| unit.id == old.candidate_id)
+            .unwrap()
+            .state = AnalysisUnitState::Running;
+        service.sessions.save_analysis_run(&replay).unwrap();
+        let mut changed = service.sessions.thread("thread-0").unwrap().unwrap();
+        changed.updated_at = 201;
+        service.sessions.save_collection(&[changed], &[]).unwrap();
+        assert!(
+            !service
+                .sessions
+                .save_analysis_with_outcome(&replay, &old, &sources)
+                .unwrap(),
+            "事务内必须重查候选两端的来源版本"
+        );
+        replay.state = AnalysisRunState::Cancelled;
+        service.sessions.save_analysis_run(&replay).unwrap();
+        assert!(
+            !service
+                .sessions
+                .save_analysis_with_outcome(&replay, &old, &sources)
+                .unwrap(),
+            "已取消运行的迟到结果不能提交"
+        );
+        assert_eq!(
+            service
+                .sessions
+                .inferred_pair_outcomes("project-test")
+                .unwrap()[0]
+                .input_version,
+            old.input_version
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2751,7 +2862,7 @@ mod tests {
             "insufficientEvidence"
         );
         let chosen = selection(Some(candidate.evidence.pairs[0].id.clone()));
-        let valid = inferred::outcome(
+        let mut valid = inferred::outcome(
             &service,
             "project-test",
             &candidate,
@@ -2760,6 +2871,13 @@ mod tests {
             Some(&chosen),
         )
         .unwrap();
+        valid.jev_identity = Some(JevDecisionIdentity {
+            base_url: "https://api.typesafe.ai".into(),
+            requested_model: "jev-latest".into(),
+            actual_model: "jev-1.13.0".into(),
+            rules_version: RELATION_RULES_VERSION.into(),
+            input_character_limit: 40_000,
+        });
         assert_eq!(valid.status, "valid");
         assert_eq!(valid.relations[0].confidence, 0.55);
         let mut multiple = classification.clone();
@@ -3115,6 +3233,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_refresh_during_jev_call_discards_late_classification() {
+        let root = root("jev-source-refresh");
+        let service = service(&root, "ok", 2).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_jev_post(&mut stream);
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            write_jev_json(
+                &mut stream,
+                200,
+                rejected_relation_response(&request, "jev-1.13.0"),
+            );
+        });
+        service
+            .save_jev(base_url, "jev-1.13.0".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let run = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || started_rx.recv().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut changed = service.sessions.thread("thread-0").unwrap().unwrap();
+        changed.updated_at = 201;
+        service.sessions.save_collection(&[changed], &[]).unwrap();
+        release_tx.send(()).unwrap();
+        let paused = wait_state(&service, &run.id, AnalysisRunState::Paused).await;
+        assert!(paused.pause_reason.unwrap().contains("迟到结果已丢弃"));
+        assert!(service
+            .sessions
+            .inferred_pair_outcomes("project-test")
+            .unwrap()
+            .is_empty());
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn jev_authentication_pauses_and_rate_limit_retry_is_budgeted() {
         for authentication in [true, false] {
             let root = root(if authentication { "jev-401" } else { "jev-429" });
@@ -3261,6 +3428,14 @@ mod tests {
         assert_eq!(pending(&service).await, 0);
         assert_eq!(
             service
+                .project_graph("project-test")
+                .unwrap()
+                .inference_outcomes
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
                 .analysis_preview(
                     "project-test",
                     AnalysisLimits {
@@ -3283,6 +3458,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending(&service).await, 0, "API Key 轮换不改变判断身份");
+        assert_eq!(
+            service
+                .project_graph("project-test")
+                .unwrap()
+                .inference_outcomes
+                .len(),
+            1
+        );
 
         saved.jev_identity.as_mut().unwrap().actual_model = "jev-1.14.0".into();
         service.sessions.save_inferred_pair_outcome(&saved).unwrap();
@@ -3298,6 +3481,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(pending(&service).await, 1);
+        assert!(service
+            .project_graph("project-test")
+            .unwrap()
+            .inference_outcomes
+            .is_empty());
         service
             .save_jev(
                 "http://127.0.0.1:4343".into(),
@@ -3360,6 +3548,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn partial_new_source_excludes_candidates_and_keeps_old_facts() {
+        let root = root("partial-source-candidates");
+        let service = service(&root, "ok", 2).await;
+        assert_eq!(
+            service
+                .candidate_preview("project-test")
+                .unwrap()
+                .candidate_count,
+            1
+        );
+        let old_facts = service.source_facts("thread-0", 0, 100).unwrap().facts;
+        let mut changed = service.sessions.thread("thread-0").unwrap().unwrap();
+        changed.updated_at = 201;
+        service.sessions.save_collection(&[changed], &[]).unwrap();
+        service
+            .sessions
+            .save_history(&HistorySnapshot {
+                coverage: HistoryCoverage {
+                    thread_id: "thread-0".into(),
+                    source_updated_at: 201,
+                    attempted_at_unix_ms: 2,
+                    path: HistoryReadPath::Paginated,
+                    turns_complete: false,
+                    items_complete: false,
+                    turn_pages: 1,
+                    item_pages: 0,
+                    loaded_turns: 0,
+                    loaded_items: 0,
+                    incompatible: false,
+                    error: Some("第二页读取失败".into()),
+                },
+                turns: vec![],
+                items: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            service
+                .source_facts("thread-0", 0, 100)
+                .unwrap()
+                .facts
+                .len(),
+            old_facts.len()
+        );
+        let preview = service.candidate_preview("project-test").unwrap();
+        assert_eq!(preview.unavailable_threads, 1);
+        assert_eq!(preview.candidate_count, 0);
+        assert_eq!(preview.stale_candidates.len(), 1);
+        assert!(preview.stale_candidates[0].reason.contains("来源部分可读"));
+        assert_eq!(
+            service
+                .candidate_preview("project-test")
+                .unwrap()
+                .stale_candidates
+                .len(),
+            1
+        );
+        assert_eq!(
+            service
+                .summary_preview("thread-0")
+                .await
+                .unwrap()
+                .content_available,
+            false
+        );
+        drop(service);
+        let reopened = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .candidate_preview("project-test")
+                .unwrap()
+                .stale_candidates
+                .len(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn alias_probe_pins_one_actual_version_across_multiple_candidates() {
         let root = root("jev-alias-pinned-batch");
         let service = service(&root, "ok", 3).await;
@@ -3367,10 +3637,10 @@ mod tests {
         let base_url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
-            for index in 0..5 {
+            for index in 0..6 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let request = read_jev_post(&mut stream);
-                if index == 0 {
+                if index == 0 || index == 5 {
                     assert_eq!(request["model"], "jev-latest");
                     assert_eq!(request["state"]["ticket"], "合成工单 A");
                     write_jev_json(&mut stream, 200, synthetic_probe_response("jev-1.13.0"));
@@ -3415,8 +3685,18 @@ mod tests {
         assert_eq!(completed.jev_probe_attempts, 1);
         assert_eq!(completed.total_calls, 8); // 三次总结、一次探测、三次分类和一次证据选择
         assert_eq!(completed.total_questions, 50);
+        let reused = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        let reused = wait_state(&service, &reused.id, AnalysisRunState::Complete).await;
+        assert_eq!(
+            reused.total_calls, 1,
+            "新批次只探测别名，实际版本相同时复用三对结果"
+        );
+        assert_eq!(reused.succeeded, 3);
         let requests = server.join().unwrap();
-        assert_eq!(requests.len(), 5);
+        assert_eq!(requests.len(), 6);
         assert_eq!(
             requests[0].to_string().chars().count(),
             JevClient::synthetic_request_characters("jev-latest")

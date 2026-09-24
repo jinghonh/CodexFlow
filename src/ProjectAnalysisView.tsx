@@ -94,7 +94,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
     Number.isInteger(limits.retryLimit) && limits.retryLimit >= 0 && limits.retryLimit <= 2 &&
     Number.isInteger(limits.inputCharacterLimit) && limits.inputCharacterLimit >= 2000;
 
-  return <section className="panel analysis-panel" aria-label="项目分析批次">
+  return <section id="project-analysis" className="panel analysis-panel" aria-label="项目分析批次">
     <div className="panel-kicker">06 / 项目分析</div>
     <h2>预览与批次</h2>
     <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的 Jev 设置；修改后需保存才生效。Codex 负责会话总结，Jev 负责关系判断和证据选择；工作流命名尚未接入。调用次数是上限，不是费用或令牌估计。</p>

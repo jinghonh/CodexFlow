@@ -673,7 +673,20 @@ impl SessionStore {
         let tx = connection
             .transaction()
             .map_err(|_| AppError::store("开始保存会话历史失败。"))?;
-        let mut coverage = snapshot.coverage.clone();
+        let coverage = snapshot.coverage.clone();
+        let indexed_version: Option<i64> = tx
+            .query_row(
+                "SELECT updated_at FROM threads WHERE id=?1",
+                [&coverage.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查会话来源版本失败。"))?;
+        if indexed_version != Some(coverage.source_updated_at) {
+            return Err(AppError::store(
+                "会话来源在读取期间已变化；迟到历史未保存，请重新读取。",
+            ));
+        }
         let previous: Option<String> = tx
             .query_row(
                 "SELECT coverage_json FROM history_coverage WHERE thread_id=?1",
@@ -682,8 +695,9 @@ impl SessionStore {
             )
             .optional()
             .map_err(|_| AppError::store("读取已有历史覆盖范围失败。"))?;
+        let mut content_changed = previous.is_none();
         if let Some(previous) = previous {
-            let previous: HistoryCoverage = serde_json::from_str(&previous)
+            let mut previous: HistoryCoverage = serde_json::from_str(&previous)
                 .map_err(|_| AppError::store("已有历史覆盖范围损坏。"))?;
             if previous.source_updated_at > coverage.source_updated_at {
                 return Ok(previous);
@@ -692,11 +706,86 @@ impl SessionStore {
                 && previous.source_updated_at == coverage.source_updated_at
                 && previous.items_complete
             {
-                coverage.turns_complete = true;
-                coverage.items_complete = true;
-                coverage.loaded_turns = previous.loaded_turns;
-                coverage.loaded_items = previous.loaded_items;
-                coverage.path = previous.path;
+                previous.attempted_at_unix_ms = coverage.attempted_at_unix_ms;
+                previous.error = coverage.error;
+                let json = serde_json::to_string(&previous)
+                    .map_err(|_| AppError::store("序列化历史覆盖范围失败。"))?;
+                tx.execute(
+                    "UPDATE history_coverage SET coverage_json=?1 WHERE thread_id=?2",
+                    params![json, previous.thread_id],
+                )
+                .map_err(|_| AppError::store("记录最近读取状态失败。"))?;
+                let metadata_json: String = tx
+                    .query_row(
+                        "SELECT metadata_json FROM threads WHERE id=?1",
+                        [&previous.thread_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| AppError::store("读取会话元数据失败。"))?;
+                let mut metadata: ThreadMetadata = serde_json::from_str(&metadata_json)
+                    .map_err(|_| AppError::store("会话元数据损坏。"))?;
+                metadata.read_error = previous.error.clone();
+                tx.execute(
+                    "UPDATE threads SET metadata_json=?1 WHERE id=?2",
+                    params![
+                        serde_json::to_string(&metadata)
+                            .map_err(|_| AppError::store("序列化会话元数据失败。"))?,
+                        previous.thread_id
+                    ],
+                )
+                .map_err(|_| AppError::store("记录最近读取错误失败。"))?;
+                tx.commit()
+                    .map_err(|_| AppError::store("提交最近读取状态失败。"))?;
+                return Ok(previous);
+            }
+            content_changed |= previous.source_updated_at != coverage.source_updated_at
+                || previous.turns_complete != coverage.turns_complete
+                || previous.items_complete != coverage.items_complete;
+        }
+        if snapshot.coverage.items_complete {
+            let old_turns: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM history_turns WHERE thread_id=?1",
+                    [&coverage.thread_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| AppError::store("检查回合缓存失败。"))?;
+            let old_items: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM history_items WHERE thread_id=?1",
+                    [&coverage.thread_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| AppError::store("检查条目缓存失败。"))?;
+            content_changed |= old_turns != snapshot.turns.len() as i64
+                || old_items != snapshot.items.len() as i64;
+            for turn in &snapshot.turns {
+                let prior: Option<String> = tx
+                    .query_row(
+                        "SELECT turn_json FROM history_turns WHERE thread_id=?1 AND id=?2",
+                        params![turn.thread_id, turn.id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| AppError::store("检查回合内容失败。"))?;
+                content_changed |= prior.as_deref()
+                    != Some(
+                        serde_json::to_string(turn)
+                            .map_err(|_| AppError::store("序列化回合失败。"))?
+                            .as_str(),
+                    );
+            }
+            for item in &snapshot.items {
+                let prior: Option<String> = tx.query_row(
+                    "SELECT item_json FROM history_items WHERE thread_id=?1 AND turn_id=?2 AND id=?3",
+                    params![item.thread_id, item.turn_id, item.id], |row| row.get(0),
+                ).optional().map_err(|_| AppError::store("检查条目内容失败。"))?;
+                content_changed |= prior.as_deref()
+                    != Some(
+                        serde_json::to_string(item)
+                            .map_err(|_| AppError::store("序列化条目失败。"))?
+                            .as_str(),
+                    );
             }
         }
         if snapshot.coverage.items_complete {
@@ -714,6 +803,17 @@ impl SessionStore {
         for turn in &snapshot.turns {
             let json =
                 serde_json::to_string(turn).map_err(|_| AppError::store("序列化回合失败。"))?;
+            if !snapshot.coverage.items_complete {
+                let prior: Option<String> = tx
+                    .query_row(
+                        "SELECT turn_json FROM history_turns WHERE thread_id=?1 AND id=?2",
+                        params![turn.thread_id, turn.id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|_| AppError::store("检查回合内容失败。"))?;
+                content_changed |= prior.as_deref() != Some(json.as_str());
+            }
             tx.execute("INSERT INTO history_turns (thread_id,id,ordinal,turn_json) VALUES (?1,?2,?3,?4)
                 ON CONFLICT(thread_id,id) DO UPDATE SET ordinal=excluded.ordinal,turn_json=excluded.turn_json",
                 params![turn.thread_id, turn.id, turn.ordinal, json],
@@ -722,6 +822,13 @@ impl SessionStore {
         for item in &snapshot.items {
             let json =
                 serde_json::to_string(item).map_err(|_| AppError::store("序列化条目失败。"))?;
+            if !snapshot.coverage.items_complete {
+                let prior: Option<String> = tx.query_row(
+                    "SELECT item_json FROM history_items WHERE thread_id=?1 AND turn_id=?2 AND id=?3",
+                    params![item.thread_id, item.turn_id, item.id], |row| row.get(0),
+                ).optional().map_err(|_| AppError::store("检查条目内容失败。"))?;
+                content_changed |= prior.as_deref() != Some(json.as_str());
+            }
             tx.execute("INSERT INTO history_items (thread_id,turn_id,id,ordinal,item_json) VALUES (?1,?2,?3,?4,?5)
                 ON CONFLICT(thread_id,turn_id,id) DO UPDATE SET ordinal=excluded.ordinal,item_json=excluded.item_json",
                 params![item.thread_id, item.turn_id, item.id, item.ordinal, json],
@@ -757,12 +864,14 @@ impl SessionStore {
             params![metadata_json, coverage.thread_id],
         )
         .map_err(|_| AppError::store("更新会话完整性失败。"))?;
-        tx.execute(
-            "INSERT INTO history_revisions (thread_id,generation) VALUES (?1,1)
-             ON CONFLICT(thread_id) DO UPDATE SET generation=generation+1",
-            [&coverage.thread_id],
-        )
-        .map_err(|_| AppError::store("更新历史内容版本失败。"))?;
+        if content_changed {
+            tx.execute(
+                "INSERT INTO history_revisions (thread_id,generation) VALUES (?1,1)
+                 ON CONFLICT(thread_id) DO UPDATE SET generation=generation+1",
+                [&coverage.thread_id],
+            )
+            .map_err(|_| AppError::store("更新历史内容版本失败。"))?;
+        }
         tx.commit()
             .map_err(|_| AppError::store("提交会话历史失败，旧缓存已保留。"))?;
         Ok(coverage)
@@ -1616,6 +1725,25 @@ impl SessionStore {
         })
     }
 
+    pub fn automatic_candidates(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<CandidatePreview>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT preview_json FROM automatic_candidate_views WHERE project_id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取旧候选清单失败。"))?;
+        json.map(|json| {
+            serde_json::from_str(&json).map_err(|_| AppError::store("旧候选清单缓存损坏。"))
+        })
+        .transpose()
+    }
+
     pub fn replace_automatic_candidates(
         &self,
         preview: &CandidatePreview,
@@ -1648,7 +1776,8 @@ impl SessionStore {
         &self,
         run: &AnalysisRun,
         result: &InferredPairOutcome,
-    ) -> Result<(), AppError> {
+        expected_sources: &[(String, i64, i64)],
+    ) -> Result<bool, AppError> {
         let run_json =
             serde_json::to_string(run).map_err(|_| AppError::store("序列化分析运行失败。"))?;
         let result_json =
@@ -1657,6 +1786,73 @@ impl SessionStore {
         let transaction = connection
             .transaction()
             .map_err(|_| AppError::store("开始保存分析结果失败。"))?;
+        let latest_id: Option<String> = transaction
+            .query_row(
+                "SELECT id FROM analysis_runs WHERE project_id=?1 ORDER BY rowid DESC LIMIT 1",
+                [&run.project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查最新分析运行失败。"))?;
+        let persisted: Option<String> = transaction
+            .query_row(
+                "SELECT run_json FROM analysis_runs WHERE id=?1",
+                [&run.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查分析运行状态失败。"))?;
+        let active = persisted
+            .and_then(|json| serde_json::from_str::<AnalysisRun>(&json).ok())
+            .is_some_and(|saved| {
+                saved.project_id == run.project_id
+                    && saved.input_version == run.input_version
+                    && saved.jev_base_url == run.jev_base_url
+                    && saved.jev_model == run.jev_model
+                    && saved.jev_config_revision == run.jev_config_revision
+                    && saved.state == AnalysisRunState::Running
+                    && saved.units.iter().any(|unit| {
+                        unit.id == result.candidate_id
+                            && unit.input_version == result.input_version
+                            && unit.state == AnalysisUnitState::Running
+                    })
+            });
+        if latest_id.as_deref() != Some(run.id.as_str()) || !active {
+            return Ok(false);
+        }
+        for (thread_id, updated_at, generation) in expected_sources {
+            let project: Option<String> = transaction
+                .query_row(
+                    "SELECT project_id FROM thread_attributions WHERE thread_id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查候选项目归属失败。"))?
+                .flatten();
+            let actual: Option<i64> = transaction
+                .query_row(
+                    "SELECT updated_at FROM threads WHERE id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查候选来源版本失败。"))?;
+            let current_generation: Option<i64> = transaction
+                .query_row(
+                    "SELECT generation FROM history_revisions WHERE thread_id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查候选历史版本失败。"))?;
+            if project.as_deref() != Some(run.project_id.as_str())
+                || actual != Some(*updated_at)
+                || current_generation.unwrap_or(0) != *generation
+            {
+                return Ok(false);
+            }
+        }
         transaction.execute(
             "INSERT INTO inferred_pair_outcomes(candidate_id,project_id,result_json) VALUES (?1,?2,?3)
              ON CONFLICT(candidate_id) DO UPDATE SET project_id=excluded.project_id,result_json=excluded.result_json",
@@ -1672,7 +1868,7 @@ impl SessionStore {
         transaction
             .commit()
             .map_err(|_| AppError::store("提交分析结果失败，旧数据已保留。"))?;
-        Ok(())
+        Ok(true)
     }
 
     pub fn inferred_pair_outcomes(
@@ -2281,9 +2477,12 @@ mod tests {
         let preview = CandidatePreview {
             project_id: "project".into(),
             thread_count: 2,
+            unavailable_threads: 0,
             neighbor_limit: 10,
             candidate_count: 0,
             candidates: Vec::new(),
+            candidate_versions: std::collections::BTreeMap::new(),
+            stale_candidates: Vec::new(),
         };
         let relation = DerivedRelation {
             id: "derived-one".into(),
@@ -3230,6 +3429,66 @@ mod tests {
         assert_eq!(after.evidence.content_version, "v2");
         assert_eq!(after.item.unwrap().content_version, "v2");
         assert_eq!(after.fact.unwrap().content_version, "v2");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn identical_history_keeps_revision_and_failed_reread_keeps_complete_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-history-revision-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        store
+            .save_collection(&[thread("source", 20, false, 1)], &[])
+            .unwrap();
+        let mut snapshot = HistorySnapshot {
+            coverage: HistoryCoverage {
+                thread_id: "duplicate-thread".into(),
+                source_updated_at: 20,
+                attempted_at_unix_ms: 1,
+                path: HistoryReadPath::FullRead,
+                turns_complete: true,
+                items_complete: true,
+                turn_pages: 0,
+                item_pages: 0,
+                loaded_turns: 0,
+                loaded_items: 0,
+                incompatible: false,
+                error: None,
+            },
+            turns: vec![],
+            items: vec![],
+        };
+        store.save_history(&snapshot).unwrap();
+        assert_eq!(store.history_generation("duplicate-thread").unwrap(), 1);
+        snapshot.coverage.attempted_at_unix_ms = 2;
+        store.save_history(&snapshot).unwrap();
+        assert_eq!(store.history_generation("duplicate-thread").unwrap(), 1);
+        snapshot.coverage.turns_complete = false;
+        snapshot.coverage.items_complete = false;
+        snapshot.coverage.error = Some("临时读取失败".into());
+        let retained = store.save_history(&snapshot).unwrap();
+        assert!(retained.items_complete);
+        assert_eq!(retained.error.as_deref(), Some("临时读取失败"));
+        assert_eq!(store.history_generation("duplicate-thread").unwrap(), 1);
+        drop(store);
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        assert_eq!(reopened.history_generation("duplicate-thread").unwrap(), 1);
+        assert_eq!(
+            reopened
+                .history_coverage("duplicate-thread")
+                .unwrap()
+                .unwrap()
+                .error,
+            Some("临时读取失败".into())
+        );
+        reopened
+            .save_collection(&[thread("new source", 21, false, 3)], &[])
+            .unwrap();
+        assert!(reopened.save_history(&snapshot).is_err());
+        assert_eq!(reopened.history_generation("duplicate-thread").unwrap(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 }

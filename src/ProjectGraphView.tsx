@@ -23,7 +23,7 @@ type InferredRelation = { id: string; projectId: string; candidateId: string; fr
   timeCheck: "verified" | "unverifiable"; explanation: string; inputVersion: string };
 type RelationReview = { relationId: string; projectId: string; decision: "pending" | "confirmed" | "rejected";
   revision: number; confirmedEvidenceVersion: string | null };
-type ReviewedRelation = InferredRelation & { evidenceVersion: string; evidenceValid: boolean; review: RelationReview };
+type ReviewedRelation = InferredRelation & { evidenceVersion: string; evidenceValid: boolean; staleReason?: string | null; review: RelationReview };
 type InferenceOutcome = { candidateId: string; status: string; unknownCount: number };
 type Diagnostic = { threadId: string; sourceField: string; referencedThreadId: string; message: string };
 type ProjectGraph = { project: { id: string; name: string }; nodes: GraphNode[]; relations: Relation[]; derivedRelations?: DerivedRelation[];
@@ -53,7 +53,7 @@ const inferredText: Record<InferredRelation["kind"], string> = {
 
 function reviewedRelations(graph: ProjectGraph): ReviewedRelation[] {
   return graph.reviewedRelations ?? (graph.inferredRelations ?? []).map((relation) => ({
-    ...relation, evidenceVersion: relation.inputVersion, evidenceValid: true,
+    ...relation, evidenceVersion: relation.inputVersion, evidenceValid: true, staleReason: null,
     review: { relationId: relation.id, projectId: relation.projectId, decision: "pending", revision: 0, confirmedEvidenceVersion: null },
   }));
 }
@@ -249,10 +249,10 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
       <div className="graph-summary"><strong>{graph.nodes.filter((node) => !node.referenceOnly).length} 条会话</strong><span>{graph.relations.length} 条观察关系</span><span>{graph.derivedRelations?.length ?? 0} 条规则关系</span><span>{visibleInferred(graph, false).length} 条默认显示的推断关系</span><span>{graph.nodes.filter((node) => node.referenceOnly).length} 个仅有引用的端点</span></div>
       <label className="graph-confidence-toggle"><input type="checkbox" checked={showLowConfidence} onChange={(event) => setShowLowConfidence(event.target.checked)} />查看低于 0.70 的推断关系（{(graph.inferredRelations ?? []).filter((item) => item.confidence < 0.70).length}）</label>
       {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid).length > 0 &&
-        <div className="graph-review-list"><strong>已拒绝或暂不可用的推断关系</strong>
+        <div className="graph-review-list"><strong>已拒绝或过期的推断关系</strong>
           {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid)
             .map((relation) => <button className="browse-button" key={relation.id} onClick={() => setSelection({ type: "edge", id: relation.id })}>
-              {inferredText[relation.kind]} · {reviewStatus(relation)} · {relation.fromThreadId} ↔ {relation.toThreadId}
+              {inferredText[relation.kind]} · {reviewStatus(relation)} · {relation.staleReason ?? "可查看旧证据"} · {relation.fromThreadId} ↔ {relation.toThreadId}
             </button>)}
         </div>}
       {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}，证据不足 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "insufficientEvidence").length}；这些结果不生成图边。</p>}
@@ -278,6 +278,8 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
           </div>)}
         </>}
         {detail?.type === "inferred" && <><h3>推断关系 · {inferredText[detail.relation.kind]}</h3>
+          <p role="status">{detail.relation.evidenceValid ? "当前分析有效" : `旧分析过期：${detail.relation.staleReason ?? "来源证据已变化"}；以下保留旧证据供检查。`}</p>
+          {!detail.relation.evidenceValid && <button className="browse-button" onClick={() => document.getElementById("project-analysis")?.scrollIntoView({ behavior: "smooth" })}>前往重新分析</button>}
           <p><code>{detail.relation.fromThreadId}</code> {["RELATED", "ALTERNATIVE_TO"].includes(detail.relation.kind) ? "↔" : "→"} <code>{detail.relation.toThreadId}</code></p>
           <p>{detail.relation.explanation}</p>
           <dl><dt>来源</dt><dd>Jev · {detail.relation.actualModel}（请求 {detail.relation.requestedModel}）</dd><dt>关系判断置信度</dt><dd>{detail.relation.confidence.toFixed(2)}</dd>

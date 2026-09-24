@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub(crate) const NEIGHBOR_LIMIT: usize = 10;
+pub(crate) const CANDIDATE_RULE_VERSION: &str = "candidate-signals-v2";
 const EVIDENCE_LIMIT: usize = 20;
 
 fn stable_id(prefix: &str, parts: &[&str]) -> String {
@@ -525,9 +526,12 @@ pub(crate) fn build(
     let preview = CandidatePreview {
         project_id: sessions.project.id.clone(),
         thread_count: ids.len() as u64,
+        unavailable_threads: 0,
         neighbor_limit: NEIGHBOR_LIMIT as u32,
         candidate_count: candidates.len() as u64,
         candidates,
+        candidate_versions: std::collections::BTreeMap::new(),
+        stale_candidates: Vec::new(),
     };
     (preview, relations)
 }

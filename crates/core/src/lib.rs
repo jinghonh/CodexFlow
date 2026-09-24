@@ -403,12 +403,21 @@ impl SourceService {
     }
 
     fn ensure_facts(&self, thread_id: &str) -> Result<(), AppError> {
-        if self.sessions.thread(thread_id)?.is_none() {
-            return Err(AppError::codex(
-                ErrorCode::SourceReadFailed,
-                "会话未在本地索引中。",
-                false,
-            ));
+        let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
+            AppError::codex(ErrorCode::SourceReadFailed, "会话未在本地索引中。", false)
+        })?;
+        if !self
+            .sessions
+            .history_coverage(thread_id)?
+            .is_some_and(|coverage| {
+                coverage.source_updated_at == thread.updated_at
+                    && coverage.turns_complete
+                    && coverage.items_complete
+            })
+        {
+            // An incomplete refresh may contain old rows. Keep the prior facts until
+            // the whole current source is available rather than extracting from a mix.
+            return Ok(());
         }
         let generation = self.sessions.history_generation(thread_id)?;
         let index = self.sessions.fact_index(thread_id)?;
@@ -625,6 +634,7 @@ impl SourceService {
         let sessions = self.sessions.project_sessions(project_id)?;
         let relations = self.sessions.observed_relations(project_id)?;
         let (preview, derived) = self.automatic_candidates(&sessions)?;
+        let jev_config = self.store.load()?.jev;
         let mut graph = relations::project_graph(sessions, relations);
         graph.derived_relations = derived;
         let reviews: std::collections::BTreeMap<_, _> = self
@@ -639,10 +649,23 @@ impl SourceService {
                 .candidates
                 .iter()
                 .find(|candidate| candidate.id == result.candidate_id);
-            let current = if let Some(candidate) = candidate {
+            let source_current = if let Some(candidate) = candidate {
                 inferred::candidate_version(self, candidate)? == result.input_version
             } else {
                 false
+            };
+            let config_current = result.jev_identity.as_ref().is_some_and(|identity| {
+                identity.base_url == jev_config.base_url
+                    && identity.requested_model == jev_config.model
+                    && identity.rules_version == codexflow_jev::RELATION_RULES_VERSION
+                    && identity.actual_model.starts_with("jev-")
+            });
+            let stale_reason = if !source_current {
+                Some("候选或来源内容版本已变化，请重新分析关系。".to_owned())
+            } else if !config_current {
+                Some("Jev 服务、模型或分析规则已变化，请重新分析关系。".to_owned())
+            } else {
+                None
             };
             for relation in &result.relations {
                 if relation.project_id != project_id
@@ -669,7 +692,12 @@ impl SourceService {
                         confirmed_evidence_version: None,
                     });
                 let valid = if let Some(candidate) = candidate {
-                    current
+                    source_current
+                        && config_current
+                        && result.jev_identity.as_ref().is_some_and(|identity| {
+                            relation.requested_model == identity.requested_model
+                                && relation.actual_model == identity.actual_model
+                        })
                         && relation.input_version == result.input_version
                         && relation.from_thread_id != relation.to_thread_id
                         && [
@@ -691,6 +719,13 @@ impl SourceService {
                     relation,
                     evidence_version,
                     evidence_valid: valid,
+                    stale_reason: if valid {
+                        None
+                    } else {
+                        stale_reason
+                            .clone()
+                            .or_else(|| Some("来源证据已变化或不可定位。".into()))
+                    },
                     review,
                 };
                 if !reviewed
@@ -700,7 +735,7 @@ impl SourceService {
                     reviewed.insert(entry.relation.id.clone(), entry);
                 }
             }
-            if current {
+            if source_current && config_current {
                 graph.inference_outcomes.push(result);
             }
         }
@@ -740,6 +775,9 @@ impl SourceService {
                     relation,
                     evidence_version,
                     evidence_valid: false,
+                    stale_reason: Some(
+                        "旧关系已不在当前候选结果中，请检查旧证据并重新分析。".into(),
+                    ),
                     review,
                 },
             );
@@ -804,11 +842,81 @@ impl SourceService {
         &self,
         sessions: &ProjectSessions,
     ) -> Result<(CandidatePreview, Vec<codexflow_domain::DerivedRelation>), AppError> {
+        let mut readable = sessions.clone();
+        let mut complete_ids = std::collections::HashSet::new();
         for item in &sessions.threads {
+            if self
+                .sessions
+                .history_coverage(&item.thread.id)?
+                .is_some_and(|coverage| {
+                    coverage.source_updated_at == item.thread.updated_at
+                        && coverage.turns_complete
+                        && coverage.items_complete
+                })
+            {
+                complete_ids.insert(item.thread.id.clone());
+            }
+        }
+        readable
+            .threads
+            .retain(|item| complete_ids.contains(&item.thread.id));
+        for item in &readable.threads {
             self.ensure_facts(&item.thread.id)?;
         }
         let material = self.sessions.project_material(&sessions.project.id)?;
-        let result = candidates::build(sessions, material);
+        let mut result = candidates::build(&readable, material);
+        result.0.unavailable_threads = (sessions.threads.len() - readable.threads.len()) as u64;
+        for candidate in &result.0.candidates {
+            result.0.candidate_versions.insert(
+                candidate.id.clone(),
+                inferred::candidate_version(self, candidate)?,
+            );
+        }
+        let analyzed: std::collections::HashSet<_> = self
+            .sessions
+            .inferred_pair_outcomes(&sessions.project.id)?
+            .into_iter()
+            .filter(|outcome| {
+                result.0.candidate_versions.get(&outcome.candidate_id)
+                    == Some(&outcome.input_version)
+            })
+            .map(|outcome| outcome.candidate_id)
+            .collect();
+        if let Some(previous) = self.sessions.automatic_candidates(&sessions.project.id)? {
+            let mut stale = std::collections::BTreeMap::new();
+            for entry in previous.stale_candidates {
+                if !analyzed.contains(&entry.candidate.id) {
+                    stale.insert(entry.candidate.id.clone(), entry);
+                }
+            }
+            for candidate in previous.candidates {
+                let old_version = previous
+                    .candidate_versions
+                    .get(&candidate.id)
+                    .cloned()
+                    .unwrap_or_default();
+                if result.0.candidate_versions.get(&candidate.id) == Some(&old_version)
+                    || analyzed.contains(&candidate.id)
+                {
+                    continue;
+                }
+                let incomplete = !complete_ids.contains(&candidate.left_thread_id)
+                    || !complete_ids.contains(&candidate.right_thread_id);
+                stale.insert(
+                    candidate.id.clone(),
+                    codexflow_domain::StaleCandidate {
+                        candidate,
+                        input_version: old_version,
+                        reason: if incomplete {
+                            "来源部分可读、读取失败或尚未读取新版内容；旧候选保留供检查。".into()
+                        } else {
+                            "候选材料、来源内容或提取规则已变化；旧候选待重新分析。".into()
+                        },
+                    },
+                );
+            }
+            result.0.stale_candidates = stale.into_values().collect();
+        }
         self.sessions
             .replace_automatic_candidates(&result.0, &result.1)?;
         Ok(result)

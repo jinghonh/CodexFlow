@@ -197,12 +197,22 @@ test("过期证据不能确认，过期写入提示刷新", async () => {
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "get_project_graph") return { project: { id: "project", name: "项目" }, nodes: [], relations: [], diagnostics: [],
       inferredRelations: [], reviewedRelations: [{ ...relation, evidenceVersion: "old-evidence", evidenceValid: false,
+        staleReason: "Jev 服务、模型或分析规则已变化，请重新分析关系。",
         review: { relationId: "stale", projectId: "project", decision: "confirmed", revision: 2, confirmedEvidenceVersion: "old-evidence" } }] };
     if (command === "decide_inferred_relation") throw { code: "CONCURRENT_MODIFICATION", message: "冲突" };
     throw new Error(`unexpected command ${command}`);
   });
   render(<ProjectGraphView projectId="project" refreshVersion={0} />);
   fireEvent.click(await screen.findByRole("button", { name: /修复 · 已确认；当前关系未验证或证据已过期/ }));
+  expect(screen.getByText(/旧分析过期：Jev 服务、模型或分析规则已变化/)).toBeTruthy();
+  const analysis = document.createElement("section");
+  analysis.id = "project-analysis";
+  analysis.scrollIntoView = vi.fn();
+  document.body.append(analysis);
+  fireEvent.click(screen.getByRole("button", { name: "前往重新分析" }));
+  expect(analysis.scrollIntoView).toHaveBeenCalled();
+  analysis.remove();
+  expect(screen.getAllByText("摘录")).toHaveLength(2);
   expect(screen.getByRole("button", { name: "确认关系" }).hasAttribute("disabled")).toBe(true);
   fireEvent.click(screen.getByRole("button", { name: "恢复待裁决" }));
   expect(await screen.findByText(/关系裁决已被更新，请刷新关系图后重试/)).toBeTruthy();
