@@ -1,5 +1,6 @@
 use codexflow_domain::{
-    ParentEndpoint, ProjectGraph, ProjectWorkstreams, UserRelationDecision, Workstream,
+    DerivedRelationKind, ParentEndpoint, ProjectGraph, ProjectWorkstreams, UserRelationDecision,
+    Workstream,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,16 +46,21 @@ pub(crate) fn build(graph: &ProjectGraph, old: &[Workstream]) -> ProjectWorkstre
         }
     }
     for relation in &graph.derived_relations {
-        if !relation.basis.trim().is_empty()
-            && relation
-                .evidence
-                .iter()
-                .any(|item| item.thread_id == relation.from_thread_id)
-            && relation
-                .evidence
-                .iter()
-                .any(|item| item.thread_id == relation.to_thread_id)
-        {
+        let from_has_evidence = relation
+            .evidence
+            .iter()
+            .any(|item| item.thread_id == relation.from_thread_id);
+        let to_has_evidence = relation
+            .evidence
+            .iter()
+            .any(|item| item.thread_id == relation.to_thread_id);
+        let evidence_valid = match relation.kind {
+            DerivedRelationKind::ExplicitReference => from_has_evidence || to_has_evidence,
+            DerivedRelationKind::SharedFile | DerivedRelationKind::SharedArtifact => {
+                from_has_evidence && to_has_evidence
+            }
+        };
+        if !relation.basis.trim().is_empty() && evidence_valid {
             add(
                 &relation.id,
                 &relation.from_thread_id,
@@ -310,6 +316,25 @@ mod tests {
             basis: "共同修改同一文件".into(),
             evidence: vec![evidence(a), evidence(b)],
         });
+    }
+
+    #[test]
+    fn explicit_reference_with_source_only_on_referring_thread_forms_a_group() {
+        let mut input = graph(&["referrer", "referenced"]);
+        input.derived_relations.push(DerivedRelation {
+            id: "explicit".into(),
+            project_id: "project".into(),
+            from_thread_id: "referrer".into(),
+            to_thread_id: "referenced".into(),
+            kind: DerivedRelationKind::ExplicitReference,
+            source: "derived".into(),
+            basis: "来源条目明确引用另一条会话标识。".into(),
+            evidence: vec![evidence("referrer")],
+        });
+        let result = build(&input, &[]);
+        assert_eq!(result.workstreams.len(), 1);
+        assert_eq!(result.workstreams[0].relation_ids, ["explicit"]);
+        assert!(result.ungrouped_thread_ids.is_empty());
     }
 
     fn inferred(

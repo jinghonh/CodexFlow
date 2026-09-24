@@ -185,6 +185,8 @@ impl SourceService {
         &self,
         graph: &codexflow_domain::ProjectGraph,
         stream: &Workstream,
+        codex_model: &str,
+        codex_version: Option<&str>,
         limit: usize,
     ) -> Result<(String, String), AppError> {
         let mut prompt = String::from("请只依据下列已确定的工作流成员与来源事实，给这条工作流起一个简短、具体的中文名称。不得改变成员或推断没有证据的目标。只返回 name 字段。\n");
@@ -195,6 +197,15 @@ impl SourceService {
         ));
         let mut fingerprint = Sha256::new();
         fingerprint.update(stream.algorithm_version.as_bytes());
+        fingerprint.update(b"workstream-name-v2");
+        fingerprint.update((codex_model.len() as u64).to_be_bytes());
+        fingerprint.update(codex_model.as_bytes());
+        fingerprint.update([u8::from(codex_version.is_some())]);
+        if let Some(version) = codex_version {
+            fingerprint.update((version.len() as u64).to_be_bytes());
+            fingerprint.update(version.as_bytes());
+        }
+        fingerprint.update((limit as u64).to_be_bytes());
         for id in &stream.members {
             fingerprint.update(id.as_bytes());
             let title = graph
@@ -349,8 +360,13 @@ impl SourceService {
         let naming_graph = self.project_graph(project_id)?;
         let mut pending_groups = 0;
         for stream in &streams.workstreams {
-            let (version, _) =
-                self.naming_material(&naming_graph, stream, limits.input_character_limit)?;
+            let (version, _) = self.naming_material(
+                &naming_graph,
+                stream,
+                &model,
+                source.version.as_deref(),
+                limits.input_character_limit,
+            )?;
             if stream.name_input_version.as_deref() != Some(&version) {
                 pending_groups += 1;
             }
@@ -786,6 +802,14 @@ impl SourceService {
                 true,
             ));
         }
+        if run.units.iter().any(|unit| {
+            unit.stage != AnalysisStage::Naming && unit.state != AnalysisUnitState::Succeeded
+        }) {
+            // Retried summaries and relations can change both the communities and their
+            // naming input. Keep already saved names only when the replanned version matches.
+            run.units.retain(|unit| unit.stage != AnalysisStage::Naming);
+            run.names_planned = false;
+        }
         let reset_pending_attempts = run.state == AnalysisRunState::Cancelled || run.interrupted;
         for unit in &mut run.units {
             if unit.state == AnalysisUnitState::Failed || unit.state == AnalysisUnitState::Running {
@@ -971,6 +995,8 @@ impl SourceService {
                     let (version, _) = self.naming_material(
                         &naming_graph,
                         &stream,
+                        &run.codex_model,
+                        run.codex_version.as_deref(),
                         run.limits.input_character_limit,
                     )?;
                     if stream.name_input_version.as_deref() == Some(&version) {
@@ -1299,8 +1325,13 @@ impl SourceService {
             ));
             return self.save_analysis(&mut run, &control.update);
         };
-        let (version, prompt) =
-            self.naming_material(&naming_graph, &stream, run.limits.input_character_limit)?;
+        let (version, prompt) = self.naming_material(
+            &naming_graph,
+            &stream,
+            &run.codex_model,
+            run.codex_version.as_deref(),
+            run.limits.input_character_limit,
+        )?;
         if version != run.units[index].input_version {
             run.units[index].state = AnalysisUnitState::Failed;
             run.units[index].error = Some(core_error(
@@ -1412,7 +1443,13 @@ impl SourceService {
                 let latest_graph = self.project_graph(&run.project_id)?;
                 if valid
                     && self
-                        .naming_material(&latest_graph, &stream, run.limits.input_character_limit)?
+                        .naming_material(
+                            &latest_graph,
+                            &stream,
+                            &run.codex_model,
+                            run.codex_version.as_deref(),
+                            run.limits.input_character_limit,
+                        )?
                         .0
                         == version
                 {
@@ -2283,6 +2320,32 @@ mod tests {
         .unwrap()
     }
 
+    fn save_observed_pair(service: &SourceService) {
+        let sessions = service.project_sessions("project-test").unwrap();
+        service
+            .sessions
+            .save_projects_and_attributions(
+                &[sessions.project],
+                &sessions
+                    .threads
+                    .into_iter()
+                    .map(|item| item.attribution)
+                    .collect::<Vec<_>>(),
+                Some(&[codexflow_domain::ObservedRelation {
+                    id: "observed-pair".into(),
+                    project_id: "project-test".into(),
+                    from_thread_id: "thread-0".into(),
+                    to_thread_id: "thread-1".into(),
+                    kind: codexflow_domain::ObservedRelationKind::ForkedFrom,
+                    source: "observed".into(),
+                    source_field: "forkedFromId".into(),
+                    confidence: 1.0,
+                    parent_endpoint: codexflow_domain::ParentEndpoint::InProject,
+                }]),
+            )
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn call_limit_pauses_and_continuation_only_handles_remaining_units() {
         let root = root("budget");
@@ -2903,6 +2966,41 @@ mod tests {
                 .name,
             "测试工作流"
         );
+        let changed_limit = service
+            .analysis_preview(
+                "project-test",
+                AnalysisLimits {
+                    input_character_limit: 20_000,
+                    ..AnalysisLimits::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed_limit.stages[3].pending_items, 1);
+        let stream = service
+            .project_workstreams("project-test")
+            .unwrap()
+            .workstreams
+            .remove(0);
+        let graph = service.project_graph("project-test").unwrap();
+        let version = |model, binary_version, limit| {
+            service
+                .naming_material(&graph, &stream, model, Some(binary_version), limit)
+                .unwrap()
+                .0
+        };
+        assert_ne!(
+            version("model-a", "codex-v1", 40_000),
+            version("model-b", "codex-v1", 40_000)
+        );
+        assert_ne!(
+            version("model-a", "codex-v1", 40_000),
+            version("model-a", "codex-v2", 40_000)
+        );
+        assert_ne!(
+            version("model-a", "codex-v1", 40_000),
+            version("model-a", "codex-v1", 20_000)
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -2951,6 +3049,70 @@ mod tests {
         assert_eq!(after.workstreams[0].id, before.workstreams[0].id);
         assert_eq!(after.workstreams[0].name, before.workstreams[0].name);
         assert!(after.workstreams[0].name_error.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn continuing_failed_summary_replans_name_from_new_material() {
+        let root = root("name-replan-on-continue");
+        let service = service(&root, "flaky", 2).await;
+        save_observed_pair(&service);
+        let started = service
+            .start_project_analysis(
+                "project-test".into(),
+                AnalysisLimits {
+                    retry_limit: 0,
+                    ..AnalysisLimits::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let partial = wait_state(&service, &started.id, AnalysisRunState::Partial).await;
+        assert!(partial.names_planned);
+        assert_eq!(
+            partial
+                .units
+                .iter()
+                .filter(|unit| unit.stage == AnalysisStage::Naming)
+                .count(),
+            1
+        );
+        let first_version = service
+            .project_workstreams("project-test")
+            .unwrap()
+            .workstreams[0]
+            .name_input_version
+            .clone()
+            .unwrap();
+        let resumed = service
+            .continue_analysis_run(&started.id, 100, |_| {})
+            .await
+            .unwrap();
+        assert!(!resumed.names_planned);
+        assert!(resumed
+            .units
+            .iter()
+            .all(|unit| unit.stage != AnalysisStage::Naming));
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(
+            complete
+                .units
+                .iter()
+                .filter(|unit| unit.stage == AnalysisStage::Naming
+                    && unit.state == AnalysisUnitState::Succeeded)
+                .count(),
+            1
+        );
+        let final_version = service
+            .project_workstreams("project-test")
+            .unwrap()
+            .workstreams[0]
+            .name_input_version
+            .clone()
+            .unwrap();
+        assert_ne!(final_version, first_version);
+        assert_eq!(complete.total_calls, partial.total_calls + 2);
         let _ = fs::remove_dir_all(root);
     }
 
