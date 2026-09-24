@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, test, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectWorkstreamsView } from "./ProjectWorkstreamsView";
 
@@ -31,4 +31,64 @@ test("工作流导航保留未分组会话、跨组边和命名失败的分组",
   fireEvent.click(screen.getByRole("button", { name: /旁支/ }));
   expect(onSelectThread).toHaveBeenCalledWith("c");
   expect(screen.getByText(/观察关系 · FORKED_FROM/)).toBeTruthy();
+});
+
+test("改名冲突要求刷新且保留输入，随后可以保存和移动未分组会话", async () => {
+  let revision = 1;
+  let name = "自动名称";
+  let members = ["a", "b"];
+  let ungrouped = ["c"];
+  let conflict = true;
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "get_project_workstreams") return {
+      revision, workstreams: [{ id: "stream", name, members, relationIds: [], nameInputVersion: "v1", nameError: null }],
+      ungroupedThreadIds: ungrouped, crossRelationIds: [],
+      manuallyNamedWorkstreamIds: name === "人工名称" ? ["stream"] : [],
+      manuallyAssignedThreadIds: members.includes("c") ? ["c"] : [],
+    };
+    if (command === "get_project_graph") return {
+      nodes: [{ id: "a", title: "起点" }, { id: "b", title: "实现" }, { id: "c", title: "旁支" }],
+      relations: [], derivedRelations: [], inferredRelations: [],
+    };
+    if (command === "rename_workstream") {
+      if (conflict) { conflict = false; revision = 2; throw { code: "CONCURRENT_MODIFICATION" }; }
+      expect(args).toMatchObject({ expectedRevision: 2, name: "人工名称" });
+      name = "人工名称"; revision = 3; return revision;
+    }
+    if (command === "move_thread_to_workstream") {
+      expect(args).toMatchObject({ expectedRevision: 3, threadId: "c", targetId: "stream" });
+      members = ["a", "b", "c"]; ungrouped = []; revision = 4; return revision;
+    }
+    if (command === "restore_workstream_name") {
+      expect(args).toMatchObject({ expectedRevision: 4, workstreamId: "stream" });
+      name = "自动名称"; revision = 5; return revision;
+    }
+    if (command === "restore_thread_workstream") {
+      expect(args).toMatchObject({ expectedRevision: 5, threadId: "c" });
+      members = ["a", "b"]; ungrouped = ["c"]; revision = 6; return revision;
+    }
+    throw new Error(`未知命令 ${command}`);
+  });
+  render(<ProjectWorkstreamsView projectId="project" refreshVersion={1}
+    onSelectThread={vi.fn()} onSelectEvidence={vi.fn()} />);
+  const input = await screen.findByLabelText("工作流名称") as HTMLInputElement;
+  fireEvent.change(input, { target: { value: "人工名称" } });
+  fireEvent.click(screen.getByRole("button", { name: "保存名称" }));
+  expect(await screen.findByText(/工作流已被更新。请刷新工作流后重试/)).toBeTruthy();
+  expect(input.value).toBe("人工名称");
+  expect(screen.queryByText("已保存。")).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "刷新工作流" }));
+  await waitFor(() => expect(screen.queryByText(/工作流已被更新/)).toBeNull());
+  expect(input.value).toBe("人工名称");
+  fireEvent.click(screen.getByRole("button", { name: "保存名称" }));
+  expect(await screen.findByRole("button", { name: "恢复自动名称" })).toBeTruthy();
+  fireEvent.change(screen.getByLabelText("旁支的主要工作流"), { target: { value: "stream" } });
+  fireEvent.click(screen.getAllByRole("button", { name: "保存归属" }).find((button) => !button.hasAttribute("disabled"))!);
+  await waitFor(() => expect(screen.getByRole("heading", { name: "未分组会话 · 0" })).toBeTruthy());
+  expect(screen.getByRole("button", { name: "恢复自动归属" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "恢复自动名称" }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "恢复自动名称" })).toBeNull());
+  expect(screen.getByRole("heading", { name: "自动名称" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "恢复自动归属" }));
+  await waitFor(() => expect(screen.getByRole("heading", { name: "未分组会话 · 1" })).toBeTruthy());
 });

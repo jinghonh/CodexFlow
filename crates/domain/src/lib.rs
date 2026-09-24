@@ -83,6 +83,17 @@ impl AppError {
             retry_after_ms: None,
         }
     }
+
+    pub fn workstream_conflict() -> Self {
+        Self {
+            code: ErrorCode::ConcurrentModification,
+            message: "工作流已被更新，请刷新后重试。".into(),
+            retryable: true,
+            cache_preserved: true,
+            backend: "store".into(),
+            retry_after_ms: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -814,6 +825,13 @@ pub struct ProjectWorkstreams {
     pub workstreams: Vec<Workstream>,
     pub ungrouped_thread_ids: Vec<String>,
     pub cross_relation_ids: Vec<String>,
+    /// Revision of the whole project workstream view, including automatic changes.
+    #[serde(default)]
+    pub revision: u64,
+    #[serde(default)]
+    pub manually_named_workstream_ids: Vec<String>,
+    #[serde(default)]
+    pub manually_assigned_thread_ids: Vec<String>,
 }
 
 /// 规则只记录来源事实的交集或引用，不表达语义因果关系。

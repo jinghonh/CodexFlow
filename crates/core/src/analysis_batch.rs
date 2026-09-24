@@ -396,7 +396,7 @@ impl SourceService {
             }
         }
         let attempts = u64::from(limits.retry_limit) + 1;
-        let streams = self.project_workstreams(project_id)?;
+        let streams = self.automatic_workstreams(project_id)?;
         let naming_graph = self.project_graph(project_id)?;
         let binary_fingerprint = source
             .resolved_binary
@@ -410,7 +410,11 @@ impl SourceService {
             limit: limits.input_character_limit,
         };
         let mut pending_groups = 0;
-        for stream in &streams.workstreams {
+        for stream in streams
+            .workstreams
+            .iter()
+            .filter(|stream| !stream.members.is_empty())
+        {
             let (version, _) = self.naming_material(&naming_graph, stream, naming_config)?;
             if !reusable_name(stream, &version, naming_config) {
                 pending_groups += 1;
@@ -1054,7 +1058,7 @@ impl SourceService {
                     unit.state == AnalysisUnitState::Pending && unit.stage != AnalysisStage::Naming
                 })
             {
-                let groups = self.project_workstreams(&run.project_id)?;
+                let groups = self.automatic_workstreams(&run.project_id)?;
                 let naming_graph = self.project_graph(&run.project_id)?;
                 let binary_fingerprint = run
                     .codex_binary
@@ -1068,6 +1072,9 @@ impl SourceService {
                     limit: run.limits.input_character_limit,
                 };
                 for stream in groups.workstreams {
+                    if stream.members.is_empty() {
+                        continue;
+                    }
                     let (version, _) =
                         self.naming_material(&naming_graph, &stream, naming_config)?;
                     if reusable_name(&stream, &version, naming_config) {
@@ -1388,7 +1395,7 @@ impl SourceService {
         mut run: AnalysisRun,
     ) -> Result<(), AppError> {
         let stream_id = run.units[index].id.clone();
-        let groups = self.project_workstreams(&run.project_id)?;
+        let groups = self.automatic_workstreams(&run.project_id)?;
         let naming_graph = self.project_graph(&run.project_id)?;
         let binary_fingerprint = run
             .codex_binary
@@ -1517,7 +1524,7 @@ impl SourceService {
         });
         match parsed {
             Ok((name, model)) => {
-                let latest = self.project_workstreams(&run.project_id)?;
+                let latest = self.automatic_workstreams(&run.project_id)?;
                 let valid = latest
                     .workstreams
                     .iter()

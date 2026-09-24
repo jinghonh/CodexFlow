@@ -9,6 +9,7 @@ use codexflow_domain::{
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Write,
     path::PathBuf,
@@ -21,6 +22,45 @@ pub struct PreferenceStore {
 
 pub struct SessionStore {
     path: PathBuf,
+}
+
+/// Human corrections are stored apart from the replaceable automatic groups.
+pub struct WorkstreamCorrections {
+    pub revision: u64,
+    pub names: BTreeMap<String, String>,
+    /// None means explicitly ungrouped; an absent key means use automatic ownership.
+    pub members: BTreeMap<String, Option<String>>,
+}
+
+pub enum WorkstreamChange<'a> {
+    Rename {
+        id: &'a str,
+        name: &'a str,
+    },
+    RestoreName {
+        id: &'a str,
+    },
+    Move {
+        thread_id: &'a str,
+        target_id: Option<&'a str>,
+    },
+    RestoreMember {
+        thread_id: &'a str,
+    },
+}
+
+fn bump_workstream_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    project_id: &str,
+) -> Result<(), AppError> {
+    transaction
+        .execute(
+            "INSERT INTO workstream_revisions(project_id,revision) VALUES (?1,1)
+         ON CONFLICT(project_id) DO UPDATE SET revision=revision+1",
+            [project_id],
+        )
+        .map_err(|_| AppError::store("更新工作流修订号失败。"))?;
+    Ok(())
 }
 
 pub struct ProjectMaterial {
@@ -181,7 +221,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 13 {
+        if version > 14 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -485,6 +525,32 @@ impl SessionStore {
                 )
                 .map_err(|_| AppError::migration("迁移工作流数据库失败，原数据已保留。"))?;
         }
+        if version < 14 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始工作流修正数据库迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS workstream_revisions (
+                    project_id TEXT PRIMARY KEY NOT NULL, revision INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS workstream_name_corrections (
+                    project_id TEXT NOT NULL, workstream_id TEXT NOT NULL, name TEXT NOT NULL,
+                    PRIMARY KEY(project_id,workstream_id)
+                );
+                CREATE TABLE IF NOT EXISTS workstream_member_corrections (
+                    project_id TEXT NOT NULL, thread_id TEXT NOT NULL, workstream_id TEXT,
+                    PRIMARY KEY(project_id,thread_id)
+                );
+                CREATE INDEX IF NOT EXISTS workstream_member_targets
+                    ON workstream_member_corrections(project_id,workstream_id);
+                PRAGMA user_version = 14;",
+                )
+                .map_err(|_| AppError::migration("迁移工作流修正数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交工作流修正数据库迁移失败，原数据已保留。"))?;
+        }
         store.recover_interrupted_runs()?;
         store.recover_interrupted_summary_runs()?;
         store.recover_interrupted_analysis_runs()?;
@@ -516,15 +582,197 @@ impl SessionStore {
         streams
     }
 
+    pub fn workstream_corrections(
+        &self,
+        project_id: &str,
+    ) -> Result<WorkstreamCorrections, AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| AppError::store("读取工作流修正失败。"))?;
+        let corrections = Self::workstream_corrections_in(&transaction, project_id)?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("完成读取工作流修正失败。"))?;
+        Ok(corrections)
+    }
+
+    /// Read the automatic groups and corrections from one SQLite snapshot.
+    pub fn workstream_snapshot(
+        &self,
+        project_id: &str,
+    ) -> Result<(Vec<Workstream>, WorkstreamCorrections), AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| AppError::store("读取工作流快照失败。"))?;
+        let streams = {
+            let mut statement = transaction
+                .prepare("SELECT stream_json FROM workstreams WHERE project_id=?1 ORDER BY id")
+                .map_err(|_| AppError::store("读取工作流失败。"))?;
+            let rows = statement
+                .query_map([project_id], |row| row.get::<_, String>(0))
+                .map_err(|_| AppError::store("读取工作流失败。"))?;
+            rows.map(|row| {
+                let json = row.map_err(|_| AppError::store("读取工作流失败。"))?;
+                serde_json::from_str(&json).map_err(|_| AppError::store("解析工作流失败。"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let corrections = Self::workstream_corrections_in(&transaction, project_id)?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("完成读取工作流快照失败。"))?;
+        Ok((streams, corrections))
+    }
+
+    fn workstream_corrections_in(
+        transaction: &rusqlite::Transaction<'_>,
+        project_id: &str,
+    ) -> Result<WorkstreamCorrections, AppError> {
+        let revision: i64 = transaction
+            .query_row(
+                "SELECT revision FROM workstream_revisions WHERE project_id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取工作流修订号失败。"))?
+            .unwrap_or(0);
+        let names = {
+            let mut query = transaction.prepare(
+                "SELECT workstream_id,name FROM workstream_name_corrections WHERE project_id=?1"
+            ).map_err(|_| AppError::store("读取工作流名称修正失败。"))?;
+            let entries = query
+                .query_map([project_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|_| AppError::store("读取工作流名称修正失败。"))?
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map_err(|_| AppError::store("读取工作流名称修正失败。"))?;
+            entries
+        };
+        let members = {
+            let mut query = transaction.prepare(
+                "SELECT thread_id,workstream_id FROM workstream_member_corrections WHERE project_id=?1"
+            ).map_err(|_| AppError::store("读取会话归属修正失败。"))?;
+            let entries = query
+                .query_map([project_id], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .map_err(|_| AppError::store("读取会话归属修正失败。"))?
+                .collect::<Result<BTreeMap<_, _>, _>>()
+                .map_err(|_| AppError::store("读取会话归属修正失败。"))?;
+            entries
+        };
+        Ok(WorkstreamCorrections {
+            revision: revision as u64,
+            names,
+            members,
+        })
+    }
+
+    pub fn save_workstream_correction(
+        &self,
+        project_id: &str,
+        expected_revision: u64,
+        change: WorkstreamChange<'_>,
+    ) -> Result<u64, AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AppError::store("开始保存工作流修正失败。"))?;
+        let current: i64 = transaction
+            .query_row(
+                "SELECT revision FROM workstream_revisions WHERE project_id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取工作流修订号失败。"))?
+            .unwrap_or(0);
+        if current != i64::try_from(expected_revision).unwrap_or(-1) {
+            return Err(AppError::workstream_conflict());
+        }
+        match change {
+            WorkstreamChange::Rename { id, name } => {
+                let exists: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workstreams WHERE id=?1 AND project_id=?2)",
+                        params![id, project_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| AppError::store("检查工作流失败。"))?;
+                if !exists {
+                    return Err(AppError::workstream_conflict());
+                }
+                transaction.execute(
+                    "INSERT INTO workstream_name_corrections(project_id,workstream_id,name) VALUES (?1,?2,?3)
+                     ON CONFLICT(project_id,workstream_id) DO UPDATE SET name=excluded.name",
+                    params![project_id,id,name]
+                ).map_err(|_| AppError::store("保存工作流名称修正失败。"))?;
+            }
+            WorkstreamChange::RestoreName { id } => {
+                transaction.execute(
+                    "DELETE FROM workstream_name_corrections WHERE project_id=?1 AND workstream_id=?2",
+                    params![project_id,id]
+                ).map_err(|_| AppError::store("恢复自动工作流名称失败。"))?;
+            }
+            WorkstreamChange::Move {
+                thread_id,
+                target_id,
+            } => {
+                if let Some(target_id) = target_id {
+                    let exists: bool = transaction.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM workstreams WHERE id=?1 AND project_id=?2)",
+                        params![target_id, project_id], |row| row.get(0)
+                    ).map_err(|_| AppError::store("检查目标工作流失败。"))?;
+                    if !exists {
+                        return Err(AppError::workstream_conflict());
+                    }
+                }
+                transaction.execute(
+                    "INSERT INTO workstream_member_corrections(project_id,thread_id,workstream_id) VALUES (?1,?2,?3)
+                     ON CONFLICT(project_id,thread_id) DO UPDATE SET workstream_id=excluded.workstream_id",
+                    params![project_id,thread_id,target_id]
+                ).map_err(|_| AppError::store("保存会话归属修正失败。"))?;
+            }
+            WorkstreamChange::RestoreMember { thread_id } => {
+                transaction.execute(
+                    "DELETE FROM workstream_member_corrections WHERE project_id=?1 AND thread_id=?2",
+                    params![project_id,thread_id]
+                ).map_err(|_| AppError::store("恢复自动会话归属失败。"))?;
+            }
+        }
+        bump_workstream_revision(&transaction, project_id)?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交工作流修正失败。"))?;
+        Ok(expected_revision.saturating_add(1))
+    }
+
     pub fn replace_workstreams(
         &self,
         project_id: &str,
+        expected_revision: u64,
         streams: &[Workstream],
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AppError::store("开始保存工作流失败。"))?;
+        let current: i64 = transaction
+            .query_row(
+                "SELECT revision FROM workstream_revisions WHERE project_id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取工作流修订号失败。"))?
+            .unwrap_or(0);
+        if current != i64::try_from(expected_revision).unwrap_or(-1) {
+            return Ok(false);
+        }
         transaction
             .execute("DELETE FROM workstreams WHERE project_id=?1", [project_id])
             .map_err(|_| AppError::store("清理旧工作流失败。"))?;
@@ -541,9 +789,11 @@ impl SessionStore {
                 )
                 .map_err(|_| AppError::store("保存工作流失败。"))?;
         }
+        bump_workstream_revision(&transaction, project_id)?;
         transaction
             .commit()
-            .map_err(|_| AppError::store("提交工作流失败。"))
+            .map_err(|_| AppError::store("提交工作流失败。"))?;
+        Ok(true)
     }
 
     pub fn save_workstream_name(
@@ -584,6 +834,7 @@ impl SessionStore {
                 params![json, id, project_id],
             )
             .map_err(|_| AppError::store("保存工作流名称失败。"))?;
+        bump_workstream_revision(&transaction, project_id)?;
         transaction
             .commit()
             .map_err(|_| AppError::store("提交工作流名称失败。"))?;
@@ -622,6 +873,7 @@ impl SessionStore {
                         params![json, id],
                     )
                     .map_err(|_| AppError::store("保存命名错误失败。"))?;
+                bump_workstream_revision(&transaction, project_id)?;
             }
         }
         transaction
@@ -684,6 +936,7 @@ impl SessionStore {
                 params![stream_json, id],
             )
             .map_err(|_| AppError::store("保存工作流名称失败。"))?;
+        bump_workstream_revision(&transaction, &run.project_id)?;
         transaction
             .execute(
                 "UPDATE analysis_runs SET run_json=?1 WHERE id=?2",
@@ -2612,7 +2865,7 @@ mod tests {
             predecessor_ids: Vec::new(),
         };
         store
-            .replace_workstreams("project", &[stream.clone()])
+            .replace_workstreams("project", 0, &[stream.clone()])
             .unwrap();
         store
             .save_workstream_name_error("project", "stream", &stream.members, "模型失败")
@@ -2639,6 +2892,75 @@ mod tests {
     }
 
     #[test]
+    fn workstream_correction_revision_rejects_a_stale_concurrent_write() {
+        use std::sync::{Arc, Barrier};
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-workstream-cas-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let store = Arc::new(SessionStore::new(dir.clone()).unwrap());
+        store
+            .replace_workstreams(
+                "project",
+                0,
+                &[Workstream {
+                    id: "stream".into(),
+                    project_id: "project".into(),
+                    name: "自动名称".into(),
+                    members: vec!["a".into(), "b".into()],
+                    relation_ids: vec![],
+                    algorithm_version: "test".into(),
+                    name_input_version: None,
+                    name_actual_model: None,
+                    name_error: None,
+                    predecessor_ids: vec![],
+                }],
+            )
+            .unwrap();
+        let gate = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = ["名称甲", "名称乙"]
+            .into_iter()
+            .map(|name| {
+                let store = Arc::clone(&store);
+                let gate = Arc::clone(&gate);
+                std::thread::spawn(move || {
+                    gate.wait();
+                    store.save_workstream_correction(
+                        "project",
+                        1,
+                        WorkstreamChange::Rename { id: "stream", name },
+                    )
+                })
+            })
+            .collect();
+        gate.wait();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| matches!(error.code, ErrorCode::ConcurrentModification)))
+                .count(),
+            1
+        );
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        let corrections = reopened.workstream_corrections("project").unwrap();
+        assert_eq!(corrections.revision, 2);
+        assert!(matches!(
+            corrections.names.get("stream").map(String::as_str),
+            Some("名称甲" | "名称乙")
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn newer_database_is_not_replaced_with_an_empty_list() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2649,7 +2971,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 14;")
+            .execute_batch("PRAGMA user_version = 15;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -2660,7 +2982,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2796,7 +3118,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 13);
+            assert_eq!(version, 14);
             for table in [
                 "automatic_candidate_views",
                 "thread_summaries",
@@ -3153,7 +3475,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -3214,7 +3536,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -3375,7 +3697,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (13, 1));
+        assert_eq!((version, count), (14, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -3408,7 +3730,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -3511,7 +3833,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 13);
+            assert_eq!(version, 14);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",
