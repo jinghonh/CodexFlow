@@ -223,7 +223,7 @@ async fn refresh_session_list(state: tauri::State<'_, AppState>) -> Result<Sessi
 }
 
 #[tauri::command]
-fn start_index_run(
+async fn start_index_run(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
     project_id: Option<String>,

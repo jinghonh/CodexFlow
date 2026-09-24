@@ -92,3 +92,37 @@ test("改名冲突要求刷新且保留输入，随后可以保存和移动未�
   fireEvent.click(screen.getByRole("button", { name: "恢复自动归属" }));
   await waitFor(() => expect(screen.getByRole("heading", { name: "未分组会话 · 1" })).toBeTruthy());
 });
+
+test("大工作流的成员与关系列表逐页显示且可继续查看", async () => {
+  const members = Array.from({ length: 81 }, (_, index) => `thread-${index}`);
+  const relations = Array.from({ length: 81 }, (_, index) => ({
+    id: `relation-${index}`, fromThreadId: members[index], toThreadId: members[(index + 1) % members.length],
+    kind: "FORKED_FROM", source: "observed",
+  }));
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_project_workstreams") return {
+      workstreams: [{ id: "stream", name: "大型工作流", members, relationIds: relations.map((item) => item.id),
+        nameInputVersion: null, nameError: null }],
+      ungroupedThreadIds: [], crossRelationIds: [], revision: 1,
+      manuallyNamedWorkstreamIds: [], manuallyAssignedThreadIds: [],
+    };
+    if (command === "get_project_graph") return {
+      nodes: members.map((id) => ({ id, title: id, referenceOnly: false })),
+      relations, derivedRelations: [], inferredRelations: [],
+    };
+    throw new Error(`未知命令 ${command}`);
+  });
+  render(<ProjectWorkstreamsView projectId="project" refreshVersion={1}
+    onSelectThread={vi.fn()} onSelectEvidence={vi.fn()} />);
+  await screen.findByRole("heading", { name: "大型工作流" });
+  expect(document.querySelectorAll(".workstream-thread")).toHaveLength(40);
+  expect(document.querySelectorAll(".workstream-relations > div")).toHaveLength(40);
+  fireEvent.click(screen.getByRole("button", { name: "显示更多成员（40 / 81）" }));
+  fireEvent.click(screen.getByRole("button", { name: "显示更多内部关系（40 / 81）" }));
+  expect(document.querySelectorAll(".workstream-thread")).toHaveLength(80);
+  expect(document.querySelectorAll(".workstream-relations > div")).toHaveLength(80);
+  fireEvent.click(screen.getByRole("button", { name: "显示更多成员（80 / 81）" }));
+  fireEvent.click(screen.getByRole("button", { name: "显示更多内部关系（80 / 81）" }));
+  expect(document.querySelectorAll(".workstream-thread")).toHaveLength(81);
+  expect(document.querySelectorAll(".workstream-relations > div")).toHaveLength(81);
+});

@@ -11,6 +11,7 @@ type Evidence = { threadId: string; turnId: string; itemId: string };
 type Relation = { id: string; fromThreadId: string; toThreadId: string; kind: string;
   source: string; basis?: string; evidence?: Evidence[] | { left: Evidence; right: Evidence } };
 type Graph = { nodes: Node[]; relations: Relation[]; derivedRelations: Relation[]; inferredRelations: Relation[] };
+const PAGE_SIZE = 40;
 
 export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThread, onSelectEvidence, activeWorkstreamId = "", onFilterWorkstream, onChanged }: {
   projectId: string; refreshVersion: number; onSelectThread: (id: string) => void;
@@ -27,6 +28,10 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
   const [targetDrafts, setTargetDrafts] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState("");
   const [saved, setSaved] = useState("");
+  const [memberLimit, setMemberLimit] = useState(PAGE_SIZE);
+  const [relationLimit, setRelationLimit] = useState(PAGE_SIZE);
+  const [ungroupedLimit, setUngroupedLimit] = useState(PAGE_SIZE);
+  const [crossLimit, setCrossLimit] = useState(PAGE_SIZE);
   useEffect(() => {
     let active = true;
     if (loadedProjectId.current !== projectId) {
@@ -42,6 +47,8 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
     return () => { active = false; };
   }, [projectId, refreshVersion]);
   const selected = view?.workstreams.find((item) => item.id === selectedId) ?? view?.workstreams[0];
+  useEffect(() => { setMemberLimit(PAGE_SIZE); setRelationLimit(PAGE_SIZE); }, [projectId, selected?.id]);
+  useEffect(() => { setUngroupedLimit(PAGE_SIZE); setCrossLimit(PAGE_SIZE); }, [projectId]);
   useEffect(() => {
     if (!editingName) setNameDraft(selected?.name ?? "");
   }, [selected?.id, selected?.name, editingName]);
@@ -121,22 +128,24 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
               () => setEditingName(false))}>恢复自动名称</button>}
         </div>
         {selected.nameError && <p className="page-error" role="status">命名未完成：{selected.nameError}。分组与来源关系已保留。</p>}
-        <div className="workstream-members"><strong>成员</strong>{selected.members.map(threadRow)}</div>
-        <div className="workstream-relations"><strong>内部来源关系</strong>{selected.relationIds.map((id) => {
+        <div className="workstream-members"><strong>成员 · {selected.members.length}</strong>{selected.members.slice(0, memberLimit).map(threadRow)}
+          {memberLimit < selected.members.length && <button className="browse-button" onClick={() => setMemberLimit((limit) => limit + PAGE_SIZE)}>显示更多成员（{Math.min(memberLimit, selected.members.length)} / {selected.members.length}）</button>}</div>
+        <div className="workstream-relations"><strong>内部来源关系 · {selected.relationIds.length}</strong>{selected.relationIds.slice(0, relationLimit).map((id) => {
           const item = relation(id);
           return item && <div key={id}><span>{sourceName(item)} · {item.kind} · {title(item.fromThreadId)} → {title(item.toThreadId)}</span>
             {item.basis && <small>{item.basis}</small>}
             {evidence(item) && <button className="plain-button" onClick={() => onSelectEvidence(evidence(item)!)}>查看来源</button>}
           </div>;
-        })}</div>
+        })}{relationLimit < selected.relationIds.length && <button className="browse-button" onClick={() => setRelationLimit((limit) => limit + PAGE_SIZE)}>显示更多内部关系（{Math.min(relationLimit, selected.relationIds.length)} / {selected.relationIds.length}）</button>}</div>
       </div>}
       <div className="workstream-ungrouped"><h3>未分组会话 · {view.ungroupedThreadIds.length}</h3>
-        {view.ungroupedThreadIds.map(threadRow)}
+        {view.ungroupedThreadIds.slice(0, ungroupedLimit).map(threadRow)}
+        {ungroupedLimit < view.ungroupedThreadIds.length && <button className="browse-button" onClick={() => setUngroupedLimit((limit) => limit + PAGE_SIZE)}>显示更多未分组会话（{Math.min(ungroupedLimit, view.ungroupedThreadIds.length)} / {view.ungroupedThreadIds.length}）</button>}
       </div>
       {view.crossRelationIds.length > 0 && <div className="workstream-cross"><h3>跨工作流关系</h3>
-        {view.crossRelationIds.map((id) => { const item = relation(id);
+        {view.crossRelationIds.slice(0, crossLimit).map((id) => { const item = relation(id);
           return item && <div key={id}>{sourceName(item)} · {item.kind} · {title(item.fromThreadId)} → {title(item.toThreadId)}</div>;
-        })}</div>}
+        })}{crossLimit < view.crossRelationIds.length && <button className="browse-button" onClick={() => setCrossLimit((limit) => limit + PAGE_SIZE)}>显示更多跨工作流关系（{Math.min(crossLimit, view.crossRelationIds.length)} / {view.crossRelationIds.length}）</button>}</div>}
     </>}
   </section>;
 }

@@ -21,13 +21,13 @@ vi.mock("@xyflow/react", () => ({
   Handle: () => null,
   Background: () => null,
   Controls: () => null,
-  ReactFlow: ({ nodes, edges, onNodeClick, onEdgeClick, onPaneClick }: {
+  ReactFlow: ({ nodes, edges, onNodeClick, onEdgeClick, onPaneClick, fitView, onlyRenderVisibleElements }: {
     nodes: { id: string; data: { referenceOnly: boolean } }[];
     edges: { id: string; source: string; target: string; label: string; style: { strokeDasharray?: string } }[];
     onNodeClick: (event: MouseEvent, node: { id: string }) => void;
     onEdgeClick: (event: MouseEvent, edge: { id: string }) => void;
-    onPaneClick: () => void;
-  }) => <div>
+    onPaneClick: () => void; fitView: boolean; onlyRenderVisibleElements: boolean;
+  }) => <div data-fit-view={fitView} data-viewport-rendering={onlyRenderVisibleElements}>
     {nodes.map((node) => <button key={node.id} onClick={(event) => onNodeClick(event.nativeEvent, node)}>{node.id}{node.data.referenceOnly ? "（引用）" : ""}</button>)}
     {edges.map((edge) => <button key={edge.id} data-source={edge.source} data-target={edge.target}
       data-dashed={Boolean(edge.style.strokeDasharray)} onClick={(event) => onEdgeClick(event.nativeEvent, edge)}>{edge.label}</button>)}
@@ -35,7 +35,61 @@ vi.mock("@xyflow/react", () => ({
   </div>,
 }));
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); layoutControl.fail = false; layoutControl.edgeCount = 0; });
+afterEach(() => { cleanup(); vi.clearAllMocks(); vi.unstubAllGlobals(); layoutControl.fail = false; layoutControl.edgeCount = 0; });
+
+test("布局 Worker 不兼容时仍完成节点布局并保留关系", async () => {
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { callback(0); return 0; });
+  vi.stubGlobal("Worker", class {
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: ErrorEvent) => void) | null = null;
+    postMessage() { this.onerror?.({ message: "Worker 中 ELK 不可用" } as ErrorEvent); }
+    terminate() {}
+  });
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: [{ id: "a", title: "甲", referenceOnly: false }, { id: "b", title: "乙", referenceOnly: false }],
+    relations: [{ id: "ab", projectId: "project", fromThreadId: "a", toThreadId: "b",
+      kind: "FORKED_FROM", source: "observed", sourceField: "forkedFromId", confidence: 1,
+      parentEndpoint: "inProject" }], diagnostics: [],
+  });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  await screen.findByRole("button", { name: "观察 · 派生 · 1.0" });
+  await waitFor(() => expect(layoutControl.edgeCount).toBe(1));
+  expect(screen.queryByText(/自动布局未完成/)).toBeNull();
+});
+
+test("筛选变化会终止旧布局 Worker", async () => {
+  let terminated = 0;
+  vi.stubGlobal("Worker", class {
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: ErrorEvent) => void) | null = null;
+    postMessage() {}
+    terminate() { terminated += 1; }
+  });
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: [{ id: "a", title: "甲", referenceOnly: false }], relations: [], diagnostics: [],
+  });
+  const { rerender } = render(<ProjectGraphView projectId="project" refreshVersion={0} relationSource="all" />);
+  await screen.findByText("正在布局关系图…");
+  rerender(<ProjectGraphView projectId="project" refreshVersion={0} relationSource="observed" />);
+  await waitFor(() => expect(terminated).toBeGreaterThanOrEqual(1));
+});
+
+test("大图默认仅绘制当前视口并保留全部关系输入", async () => {
+  const ids = Array.from({ length: 81 }, (_, index) => `thread-${index}`);
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: ids.map((id) => ({ id, title: id, referenceOnly: false })),
+    relations: ids.slice(1).map((id, index) => ({ id: `relation-${index}`, projectId: "project",
+      fromThreadId: ids[index], toThreadId: id, kind: "FORKED_FROM", source: "observed",
+      sourceField: "forkedFromId", confidence: 1, parentEndpoint: "inProject" })), diagnostics: [],
+  });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  await screen.findByText(/图中保留全部 81 个节点、80 条关系/);
+  await screen.findByText("关系图布局完成");
+  const canvas = document.querySelector(".graph-canvas > div") as HTMLElement;
+  expect(canvas.dataset.fitView).toBe("false");
+  expect(canvas.dataset.viewportRendering).toBe("true");
+  expect(document.querySelectorAll("[data-source]")).toHaveLength(80);
+});
 
 test("密集关系使用结构骨架定位且保留全部可见关系", async () => {
   const edge = (id: string, fromThreadId: string, toThreadId: string) => ({
@@ -101,7 +155,7 @@ test("布局器失败时仍显示全部结构关系", async () => {
   const edge = await screen.findByRole("button", { name: "观察 · 子代理 · 1.0" });
   expect(edge.dataset.source).toBe("second");
   expect(edge.dataset.target).toBe("first");
-  expect(screen.getByText("自动布局未完成，已按固定顺序展示全部会话和关系。")).toBeTruthy();
+  expect(screen.getByText(/自动布局未完成，已按固定顺序展示全部会话和关系。/)).toBeTruthy();
 });
 
 test("同一项目图刷新失败时保留已加载关系和缓存提示", async () => {

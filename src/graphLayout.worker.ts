@@ -17,7 +17,7 @@ self.onmessage = async (event: MessageEvent<{ nodes: string[]; edges: { id: stri
       edges: edges.map(({ id, source, target }) => ({ id, sources: [source], targets: [target] })),
     });
     self.postMessage({ positions: result.children?.map(({ id, x, y }) => ({ id, x, y })) ?? [] });
-  } catch {
-    self.postMessage({ error: true });
+  } catch (cause) {
+    self.postMessage({ error: cause instanceof Error ? cause.message : String(cause) });
   }
 };

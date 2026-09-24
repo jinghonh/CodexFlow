@@ -75,3 +75,29 @@ test("通过公开应用查询联动时间线、关系图和详情，过滤后�
   await screen.findByText(/STORAGE_FAILED：项目会话查询失败/);
   expect(screen.getByRole("button", { name: "查看会话 t2 的历史" })).toBeTruthy();
 });
+
+test("大项目会话列表逐页展示且过滤仍覆盖全部会话", async () => {
+  const ids = Array.from({ length: 81 }, (_, index) => `thread-${index}`);
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "get_settings") return { theme: "system", source };
+    if (command === "connect_source" || command === "get_source_status") return source;
+    if (command === "get_project_catalog") return { projects: [project], selectedProjectId: "project", recentProjectIds: ["project"], unassigned: [], scopes: [] };
+    if (command === "get_project_sessions") return { project, workspaces: ["/repo"], threads: ids.map(attributed), scopes: [] };
+    if (command === "get_latest_index_run" || command === "get_latest_analysis_run") return null;
+    if (command === "get_jev_status") return { config: { baseUrl: "https://api.typesafe.ai", model: "jev-latest" }, credentialConfigured: false, credentialError: null };
+    if (command === "get_project_workstreams") return { workstreams: [], ungroupedThreadIds: ids, revision: 1 };
+    if (command === "query_project_threads") {
+      const needle = (args as { query: { text: string } }).query.text;
+      return { total: ids.length, matches: ids.filter((id) => id.includes(needle)).map((threadId) => ({ threadId, summary: null })) };
+    }
+    throw new Error(`未知接口 ${command}`);
+  });
+  render(<App />);
+  await waitFor(() => expect(document.querySelectorAll(".thread-row")).toHaveLength(40));
+  expect(screen.getByRole("button", { name: "显示更多会话（40 / 81）" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "显示更多会话（40 / 81）" }));
+  expect(document.querySelectorAll(".thread-row")).toHaveLength(80);
+  fireEvent.change(screen.getByPlaceholderText("标题、预览、Thread ID 或已生成总结"), { target: { value: "thread-80" } });
+  await waitFor(() => expect(document.querySelectorAll(".thread-row")).toHaveLength(1));
+  expect(screen.getByRole("button", { name: "查看会话 thread-80 的历史" })).toBeTruthy();
+});

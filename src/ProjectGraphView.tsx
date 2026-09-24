@@ -177,7 +177,7 @@ async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{
       parent.set(right, left);
       return true;
     });
-    if (typeof Worker === "undefined") {
+    const layoutOnMain = async () => {
       const { default: ELK } = await import("elkjs/lib/elk.bundled.js");
       const result = await new ELK().layout({
         id: "project",
@@ -186,26 +186,37 @@ async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{
         children: nodes.map((id) => ({ id, width: nodeWidth, height: nodeHeight })),
         edges: edges.map(({ id, source, target }) => ({ id, sources: [source], targets: [target] })),
       });
-      coordinates = new Map(result.children?.map((node) => [node.id, node]));
+      return result.children?.map((node) => ({ id: node.id, x: node.x, y: node.y })) ?? [];
+    };
+    if (typeof Worker === "undefined") {
+      coordinates = new Map((await layoutOnMain()).map((node) => [node.id, node]));
     } else {
       const positions = await new Promise<{ id: string; x?: number; y?: number }[]>((resolve, reject) => {
         const worker = new Worker(new URL("./graphLayout.worker.ts", import.meta.url), { type: "module" });
         const abort = () => { worker.terminate(); reject(new Error("布局已取消")); };
         if (signal?.aborted) { abort(); return; }
         signal?.addEventListener("abort", abort, { once: true });
-        worker.onmessage = (event: MessageEvent<{ positions?: { id: string; x?: number; y?: number }[]; error?: boolean }>) => {
+        worker.onmessage = (event: MessageEvent<{ positions?: { id: string; x?: number; y?: number }[]; error?: string }>) => {
           signal?.removeEventListener("abort", abort);
           worker.terminate();
-          if (event.data.error) reject(new Error("布局失败"));
+          if (event.data.error) reject(new Error(event.data.error));
           else resolve(event.data.positions ?? []);
         };
-        worker.onerror = () => { signal?.removeEventListener("abort", abort); worker.terminate(); reject(new Error("布局线程失败")); };
+        worker.onerror = (event) => { signal?.removeEventListener("abort", abort); worker.terminate(); reject(new Error(event.message || "布局线程失败")); };
         worker.postMessage({ nodes, edges });
+      }).catch((cause) => {
+        if (signal?.aborted) throw cause;
+        // Some WebKit builds cannot construct ELK inside a module Worker.
+        // The spanning forest keeps the fallback layout short enough to run
+        // after yielding the UI for a frame.
+        return new Promise<{ id: string; x?: number; y?: number }[]>((resolve, reject) => {
+          requestAnimationFrame(() => { void layoutOnMain().then(resolve, reject); });
+        });
       });
       coordinates = new Map(positions.map((node) => [node.id, node]));
     }
-  } catch {
-    warning = "自动布局未完成，已按固定顺序展示全部会话和关系。";
+  } catch (cause) {
+    warning = `自动布局未完成，已按固定顺序展示全部会话和关系。原因：${cause instanceof Error ? cause.message : String(cause)}`;
   }
   const nodes: Node<GraphNodeData>[] = graph.nodes.map((node, index) => ({
     id: node.id,
@@ -224,6 +235,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   const loadedProjectId = useRef(projectId);
   const [graph, setGraph] = useState<ProjectGraph | null>(null);
   const [layout, setLayout] = useState<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }>({ nodes: [], edges: [], warning: "" });
+  const [layoutPending, setLayoutPending] = useState(false);
   const [selection, setSelection] = useState<Selection>(null);
   const [error, setError] = useState("");
   const [decisionError, setDecisionError] = useState("");
@@ -242,6 +254,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
     invoke<ProjectGraph>("get_project_graph", { projectId })
       .then((next) => {
         if (!active) return;
+        setLayoutPending(true);
         setGraph(next);
         setSelection((current) => current &&
           (current.type === "edge" ? [...next.relations, ...(next.derivedRelations ?? []), ...reviewedRelations(next)].some((relation) => relation.id === current.id) : next.nodes.some((node) => node.id === current.id))
@@ -259,9 +272,10 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
     if (!visibleGraph) return;
     let active = true;
     const controller = new AbortController();
+    setLayoutPending(true);
     setLayout((current) => ({ ...current, edges: graphEdges(visibleGraph) }));
     layoutGraph(visibleGraph, controller.signal)
-      .then((positioned) => { if (active) setLayout(positioned); });
+      .then((positioned) => { if (active) { setLayout(positioned); setLayoutPending(false); } });
     return () => { active = false; controller.abort(); };
   }, [visibleGraph]);
 
@@ -309,10 +323,12 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
 
   async function refreshGraph() {
     setDecisionError("");
+    setLayoutPending(true);
     try {
       const next = await invoke<ProjectGraph>("get_project_graph", { projectId });
       setGraph(next);
     } catch (cause) {
+      setLayoutPending(false);
       setDecisionError(formatAppError(cause, "刷新关系图失败。"));
     }
   }
@@ -336,9 +352,11 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
         </div>}
       {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}，证据不足 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "insufficientEvidence").length}；这些结果不生成图边。</p>}
       <button className="browse-button" onClick={() => void refreshGraph()}>自动布局</button>
+      <p className="graph-layout-status" role="status">{layoutPending ? "正在布局关系图…" : "关系图布局完成"}</p>
       {layout.warning && <div className="graph-layout-warning" role="status">{layout.warning}</div>}
+      {visibleNodes.length > 80 && <p className="analysis-note">大图先显示当前视口；平移或缩放可浏览其余会话和关系。图中保留全部 {visibleNodes.length} 个节点、{visibleEdges.length} 条关系。</p>}
       {visibleNodes.length ? <div className="graph-canvas" aria-label="项目结构关系图">
-        <ReactFlow nodes={visibleNodes.map((node) => ({ ...node, selected: node.id === selectedThreadId }))} edges={visibleEdges} nodeTypes={nodeTypes} fitView fitViewOptions={{ padding: 0.18 }}
+        <ReactFlow nodes={visibleNodes.map((node) => ({ ...node, selected: node.id === selectedThreadId }))} edges={visibleEdges} nodeTypes={nodeTypes} fitView={visibleNodes.length <= 80} onlyRenderVisibleElements fitViewOptions={{ padding: 0.18 }}
           nodesDraggable={false} onNodeClick={(_, node) => { setSelection({ type: "node", id: node.id }); if (!node.data.referenceOnly) onSelectThread?.(node.id); }}
           onEdgeClick={(_, edge) => setSelection({ type: "edge", id: edge.id })}
           onPaneClick={() => setSelection(null)} minZoom={0.15} maxZoom={2}>

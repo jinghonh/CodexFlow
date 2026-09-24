@@ -1,0 +1,32 @@
+run=0 visible_relations=2999 catalog=0.327 sessions=1.033 timeline=18.460 graph=384.699 workstreams=681.304 candidate_preview=346.947 query=52.554 filter=47.334 evidence_turns_first_page=0.269 evidence_items_first_page=0.228 facts_first_page=0.595
+run=1 visible_relations=2999 catalog=0.361 sessions=0.926 timeline=12.671 graph=345.919 workstreams=669.495 candidate_preview=350.798 query=48.469 filter=47.392 evidence_turns_first_page=0.251 evidence_items_first_page=0.297 facts_first_page=0.744
+run=2 visible_relations=2999 catalog=0.370 sessions=0.936 timeline=12.788 graph=354.016 workstreams=678.697 candidate_preview=342.981 query=51.121 filter=48.127 evidence_turns_first_page=0.250 evidence_items_first_page=0.230 facts_first_page=0.595
+run=3 visible_relations=2999 catalog=0.375 sessions=0.964 timeline=20.082 graph=356.741 workstreams=688.969 candidate_preview=360.664 query=49.150 filter=49.265 evidence_turns_first_page=0.248 evidence_items_first_page=0.231 facts_first_page=0.612
+run=4 visible_relations=2999 catalog=0.418 sessions=0.949 timeline=12.444 graph=365.885 workstreams=697.353 candidate_preview=347.158 query=48.284 filter=49.757 evidence_turns_first_page=0.275 evidence_items_first_page=0.386 facts_first_page=0.675
+run=5 visible_relations=2999 catalog=0.433 sessions=0.964 timeline=12.565 graph=361.469 workstreams=676.716 candidate_preview=354.570 query=50.179 filter=48.526 evidence_turns_first_page=0.253 evidence_items_first_page=0.226 facts_first_page=0.584
+run=6 visible_relations=2999 catalog=0.499 sessions=0.971 timeline=13.148 graph=352.398 workstreams=669.980 candidate_preview=345.250 query=47.694 filter=47.234 evidence_turns_first_page=0.245 evidence_items_first_page=0.229 facts_first_page=0.601
+run=7 visible_relations=2999 catalog=0.362 sessions=0.952 timeline=12.197 graph=354.981 workstreams=742.213 candidate_preview=369.429 query=48.933 filter=49.237 evidence_turns_first_page=0.244 evidence_items_first_page=0.232 facts_first_page=0.593
+run=8 visible_relations=2999 catalog=0.483 sessions=0.902 timeline=12.332 graph=359.127 workstreams=696.539 candidate_preview=378.355 query=59.773 filter=50.479 evidence_turns_first_page=0.258 evidence_items_first_page=0.251 facts_first_page=0.638
+run=9 visible_relations=2999 catalog=0.487 sessions=1.035 timeline=13.009 graph=378.646 workstreams=685.056 candidate_preview=378.622 query=48.645 filter=49.236 evidence_turns_first_page=0.298 evidence_items_first_page=0.441 facts_first_page=0.643
+run=10 visible_relations=2999 catalog=0.370 sessions=0.917 timeline=12.080 graph=352.833 workstreams=671.307 candidate_preview=348.198 query=48.136 filter=48.136 evidence_turns_first_page=0.253 evidence_items_first_page=0.269 facts_first_page=0.796
+run=11 visible_relations=2999 catalog=0.367 sessions=0.930 timeline=11.857 graph=348.142 workstreams=677.006 candidate_preview=342.839 query=48.087 filter=47.094 evidence_turns_first_page=0.246 evidence_items_first_page=0.218 facts_first_page=0.601
+run=12 visible_relations=2999 catalog=0.375 sessions=0.949 timeline=11.943 graph=366.513 workstreams=683.114 candidate_preview=344.575 query=47.817 filter=47.220 evidence_turns_first_page=0.246 evidence_items_first_page=0.224 facts_first_page=0.597
+run=13 visible_relations=2999 catalog=0.434 sessions=0.989 timeline=12.454 graph=347.862 workstreams=668.367 candidate_preview=340.839 query=47.281 filter=47.070 evidence_turns_first_page=0.304 evidence_items_first_page=0.224 facts_first_page=0.584
+run=14 visible_relations=2999 catalog=0.353 sessions=0.899 timeline=11.703 graph=351.857 workstreams=663.624 candidate_preview=345.368 query=60.782 filter=50.337 evidence_turns_first_page=0.258 evidence_items_first_page=0.231 facts_first_page=0.646
+run=15 visible_relations=2999 catalog=0.481 sessions=0.998 timeline=12.125 graph=348.904 workstreams=695.102 candidate_preview=351.592 query=48.815 filter=48.758 evidence_turns_first_page=0.248 evidence_items_first_page=0.227 facts_first_page=0.603
+run=16 visible_relations=2999 catalog=0.533 sessions=1.044 timeline=12.695 graph=351.896 workstreams=669.656 candidate_preview=344.239 query=47.807 filter=47.839 evidence_turns_first_page=0.252 evidence_items_first_page=0.224 facts_first_page=0.591
+run=17 visible_relations=2999 catalog=0.469 sessions=1.042 timeline=12.229 graph=345.505 workstreams=670.981 candidate_preview=342.546 query=47.715 filter=47.052 evidence_turns_first_page=0.257 evidence_items_first_page=0.415 facts_first_page=0.787
+run=18 visible_relations=2999 catalog=0.376 sessions=0.942 timeline=12.794 graph=350.347 workstreams=667.518 candidate_preview=349.297 query=47.368 filter=48.267 evidence_turns_first_page=0.302 evidence_items_first_page=0.233 facts_first_page=0.622
+run=19 visible_relations=2999 catalog=0.441 sessions=0.957 timeline=12.037 graph=344.313 workstreams=669.748 candidate_preview=339.981 query=47.810 filter=51.187 evidence_turns_first_page=0.251 evidence_items_first_page=0.234 facts_first_page=0.610
+startup_ms=19.209 dataset=issue-30-v1 runs=20
+catalog: min=0.327 median=0.418 p95=0.499 max=0.533
+sessions: min=0.899 median=0.957 p95=1.042 max=1.044
+timeline: min=11.703 median=12.454 p95=18.460 max=20.082
+graph: min=344.313 median=352.833 p95=378.646 max=384.699
+workstreams: min=663.624 median=677.006 p95=697.353 max=742.213
+candidate_preview: min=339.981 median=347.158 p95=378.355 max=378.622
+query: min=47.281 median=48.469 p95=59.773 max=60.782
+filter: min=47.052 median=48.267 p95=50.479 max=51.187
+evidence_turns_first_page: min=0.244 median=0.253 p95=0.302 max=0.304
+evidence_items_first_page: min=0.218 median=0.231 p95=0.415 max=0.441
+facts_first_page: min=0.584 median=0.610 p95=0.787 max=0.796
