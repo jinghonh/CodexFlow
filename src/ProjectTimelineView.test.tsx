@@ -113,3 +113,13 @@ test("同一项目刷新遇到存储故障时保留已加载时间线", async ()
   expect(document.querySelectorAll(".timeline-segment")).toHaveLength(2);
   expect(screen.getByText(/已有缓存保留。下一步：修复数据目录后重试/)).toBeTruthy();
 });
+
+test("工作流泳道按主要归属显示，同一会话只出现一次", async () => {
+  vi.mocked(invoke).mockResolvedValue(timeline);
+  render(<ProjectTimelineView projectId="project" refreshVersion="0" connected={false} onSelectThread={vi.fn()}
+    visibleThreadIds={new Set(["thread", "unknown"])} workstreams={[{ id: "stream", name: "实现功能", members: ["thread"] }]} />);
+  await screen.findByText("实现功能");
+  expect(document.querySelectorAll(".timeline-row")).toHaveLength(2);
+  expect(screen.getByText("未分组会话")).toBeTruthy();
+  expect(screen.getAllByRole("button", { name: /恢复的会话.*已知时长/ })).toHaveLength(1);
+});

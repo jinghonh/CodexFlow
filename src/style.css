@@ -331,3 +331,20 @@ button:disabled { cursor: wait; opacity: .6; }
 .workstream-thread > button:first-child { width: 100%; }
 .workstream-thread label { display: grid; gap: 4px; font-size: 10px; }
 .workstream-thread .browse-button, .workstream-thread .plain-button { align-self: start; }
+.explorer-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 12px 0 16px; }
+.explorer-filters label { display: grid; gap: 5px; color: var(--muted); font-size: 10px; }
+.explorer-filters select { max-width: 240px; min-height: 30px; padding: 4px 8px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); }
+.selection-hidden { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-left: 3px solid var(--green); background: var(--green-soft); font-size: 11px; }
+.thread-row.selected { box-shadow: inset 3px 0 var(--green); }
+.project-view-switch { display: flex; gap: 6px; margin: 18px 0 0; }
+.project-view-switch button { padding: 9px 17px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); cursor: pointer; }
+.project-view-switch button[aria-pressed="true"] { border-color: var(--green); background: var(--green-soft); color: var(--green); font-weight: 700; }
+.timeline-group { display: grid; grid-template-columns: 238px 1fr; gap: 0; min-height: 28px; border-bottom: 1px solid var(--line); background: var(--green-soft); color: var(--green); font-size: 10px; }
+.timeline-group strong { position: sticky; left: 0; display: flex; align-items: center; padding-left: 13px; border-right: 1px solid var(--line); background: var(--green-soft); }
+.timeline-group span { padding: 7px 13px; }
+.thread-detail dl { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 8px 14px; font-size: 11px; }
+.thread-detail dt { color: var(--muted); }
+.thread-detail dd { margin: 0; overflow-wrap: anywhere; }
+.thread-detail-relation { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; padding: 10px; border: 1px solid var(--line); font-size: 11px; }
+.thread-detail-relation p { width: 100%; margin: 0; }
+.project-state { padding: 10px 12px; border-left: 3px solid var(--green); background: var(--green-soft); color: var(--ink); font-size: 11px; }

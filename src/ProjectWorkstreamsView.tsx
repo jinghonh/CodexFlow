@@ -12,9 +12,10 @@ type Relation = { id: string; fromThreadId: string; toThreadId: string; kind: st
   source: string; basis?: string; evidence?: Evidence[] | { left: Evidence; right: Evidence } };
 type Graph = { nodes: Node[]; relations: Relation[]; derivedRelations: Relation[]; inferredRelations: Relation[] };
 
-export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThread, onSelectEvidence }: {
+export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThread, onSelectEvidence, activeWorkstreamId = "", onFilterWorkstream, onChanged }: {
   projectId: string; refreshVersion: number; onSelectThread: (id: string) => void;
   onSelectEvidence: (evidence: { threadId: string; turnId: string; itemId: string }) => void;
+  activeWorkstreamId?: string; onFilterWorkstream?: (id: string) => void; onChanged?: () => void;
 }) {
   const loadedProjectId = useRef(projectId);
   const [view, setView] = useState<View | null>(null);
@@ -65,7 +66,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
     try {
       await invoke(command, { projectId, expectedRevision: view.revision, ...args });
       const next = await invoke<View>("get_project_workstreams", { projectId });
-      setView(next); done(); setSaved("已保存。");
+      setView(next); done(); setSaved("已保存。"); onChanged?.();
     } catch (caught) { setError(failureMessage(caught)); }
     finally { setSaving(""); }
   }
@@ -105,7 +106,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
     {view && <>
       <div className="workstream-navigation">
         {view.workstreams.map((item) => <button key={item.id} className={selected?.id === item.id ? "selected" : ""}
-          onClick={() => { setSelectedId(item.id); setEditingName(false); setSaved(""); }}><strong>{item.name}</strong><small>{item.members.length} 条会话{view.manuallyNamedWorkstreamIds?.includes(item.id) ? " · 人工命名" : item.nameInputVersion ? " · 自动命名" : " · 暂用名"}</small></button>)}
+          onClick={() => { setSelectedId(item.id); onFilterWorkstream?.(activeWorkstreamId === item.id ? "" : item.id); setEditingName(false); setSaved(""); }}><strong>{item.name}</strong><small>{item.members.length} 条会话{view.manuallyNamedWorkstreamIds?.includes(item.id) ? " · 人工命名" : item.nameInputVersion ? " · 自动命名" : " · 暂用名"}</small></button>)}
         {view.workstreams.length === 0 && <p>当前没有可形成工作流的关系。</p>}
       </div>
       {selected && <div className="workstream-detail"><h3>{selected.name}</h3>
