@@ -19,6 +19,30 @@ use std::{
 use tokio_util::sync::CancellationToken;
 
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
+const DEFAULT_CODEX_MODEL: &str = "Codex 默认模型（启动后确认）";
+
+#[derive(Clone, Copy)]
+struct NamingConfig<'a> {
+    model: &'a str,
+    binary_path: Option<&'a str>,
+    binary_version: Option<&'a str>,
+    binary_fingerprint: Option<&'a str>,
+    limit: usize,
+}
+
+fn reusable_name(stream: &Workstream, version: &str, config: NamingConfig<'_>) -> bool {
+    // A moving or unknown model cannot be checked against the saved response at preview time.
+    let model = config.model.to_ascii_lowercase();
+    let unresolved_model = config.model == DEFAULT_CODEX_MODEL
+        || model.contains("latest")
+        || model.contains("default")
+        || model == "auto";
+    !unresolved_model
+        && config.binary_path.is_some()
+        && config.binary_fingerprint.is_some()
+        && stream.name_input_version.as_deref() == Some(version)
+        && stream.name_actual_model.as_deref() == Some(config.model)
+}
 
 enum JevUnitResult {
     Classification(codexflow_domain::JevRelationClassification),
@@ -185,10 +209,9 @@ impl SourceService {
         &self,
         graph: &codexflow_domain::ProjectGraph,
         stream: &Workstream,
-        codex_model: &str,
-        codex_version: Option<&str>,
-        limit: usize,
+        config: NamingConfig<'_>,
     ) -> Result<(String, String), AppError> {
+        let limit = config.limit;
         let mut prompt = String::from("请只依据下列已确定的工作流成员与来源事实，给这条工作流起一个简短、具体的中文名称。不得改变成员或推断没有证据的目标。只返回 name 字段。\n");
         prompt.push_str(&format!(
             "成员数：{}；算法：{}。\n",
@@ -197,13 +220,19 @@ impl SourceService {
         ));
         let mut fingerprint = Sha256::new();
         fingerprint.update(stream.algorithm_version.as_bytes());
-        fingerprint.update(b"workstream-name-v2");
-        fingerprint.update((codex_model.len() as u64).to_be_bytes());
-        fingerprint.update(codex_model.as_bytes());
-        fingerprint.update([u8::from(codex_version.is_some())]);
-        if let Some(version) = codex_version {
-            fingerprint.update((version.len() as u64).to_be_bytes());
-            fingerprint.update(version.as_bytes());
+        fingerprint.update(b"workstream-name-v3");
+        fingerprint.update((config.model.len() as u64).to_be_bytes());
+        fingerprint.update(config.model.as_bytes());
+        for value in [
+            config.binary_path,
+            config.binary_version,
+            config.binary_fingerprint,
+        ] {
+            fingerprint.update([u8::from(value.is_some())]);
+            if let Some(value) = value {
+                fingerprint.update((value.len() as u64).to_be_bytes());
+                fingerprint.update(value.as_bytes());
+            }
         }
         fingerprint.update((limit as u64).to_be_bytes());
         for id in &stream.members {
@@ -320,7 +349,7 @@ impl SourceService {
             }
         }
         let model = codexflow_codex::configured_summary_model()
-            .unwrap_or_else(|| "Codex 默认模型（启动后确认）".into());
+            .unwrap_or_else(|| DEFAULT_CODEX_MODEL.into());
         let codex_available =
             matches!(
                 source.capabilities.codex_summary.state,
@@ -358,16 +387,21 @@ impl SourceService {
         let attempts = u64::from(limits.retry_limit) + 1;
         let streams = self.project_workstreams(project_id)?;
         let naming_graph = self.project_graph(project_id)?;
+        let binary_fingerprint = source
+            .resolved_binary
+            .as_deref()
+            .and_then(|path| self.binary_fingerprint(path));
+        let naming_config = NamingConfig {
+            model: &model,
+            binary_path: source.resolved_binary.as_deref(),
+            binary_version: source.version.as_deref(),
+            binary_fingerprint: binary_fingerprint.as_deref(),
+            limit: limits.input_character_limit,
+        };
         let mut pending_groups = 0;
         for stream in &streams.workstreams {
-            let (version, _) = self.naming_material(
-                &naming_graph,
-                stream,
-                &model,
-                source.version.as_deref(),
-                limits.input_character_limit,
-            )?;
-            if stream.name_input_version.as_deref() != Some(&version) {
+            let (version, _) = self.naming_material(&naming_graph, stream, naming_config)?;
+            if !reusable_name(stream, &version, naming_config) {
                 pending_groups += 1;
             }
         }
@@ -991,15 +1025,21 @@ impl SourceService {
             {
                 let groups = self.project_workstreams(&run.project_id)?;
                 let naming_graph = self.project_graph(&run.project_id)?;
+                let binary_fingerprint = run
+                    .codex_binary
+                    .as_deref()
+                    .and_then(|path| self.binary_fingerprint(path));
+                let naming_config = NamingConfig {
+                    model: &run.codex_model,
+                    binary_path: run.codex_binary.as_deref(),
+                    binary_version: run.codex_version.as_deref(),
+                    binary_fingerprint: binary_fingerprint.as_deref(),
+                    limit: run.limits.input_character_limit,
+                };
                 for stream in groups.workstreams {
-                    let (version, _) = self.naming_material(
-                        &naming_graph,
-                        &stream,
-                        &run.codex_model,
-                        run.codex_version.as_deref(),
-                        run.limits.input_character_limit,
-                    )?;
-                    if stream.name_input_version.as_deref() == Some(&version) {
+                    let (version, _) =
+                        self.naming_material(&naming_graph, &stream, naming_config)?;
+                    if reusable_name(&stream, &version, naming_config) {
                         continue;
                     }
                     run.units.push(AnalysisUnit {
@@ -1312,6 +1352,17 @@ impl SourceService {
         let stream_id = run.units[index].id.clone();
         let groups = self.project_workstreams(&run.project_id)?;
         let naming_graph = self.project_graph(&run.project_id)?;
+        let binary_fingerprint = run
+            .codex_binary
+            .as_deref()
+            .and_then(|path| self.binary_fingerprint(path));
+        let naming_config = NamingConfig {
+            model: &run.codex_model,
+            binary_path: run.codex_binary.as_deref(),
+            binary_version: run.codex_version.as_deref(),
+            binary_fingerprint: binary_fingerprint.as_deref(),
+            limit: run.limits.input_character_limit,
+        };
         let Some(stream) = groups
             .workstreams
             .into_iter()
@@ -1325,13 +1376,7 @@ impl SourceService {
             ));
             return self.save_analysis(&mut run, &control.update);
         };
-        let (version, prompt) = self.naming_material(
-            &naming_graph,
-            &stream,
-            &run.codex_model,
-            run.codex_version.as_deref(),
-            run.limits.input_character_limit,
-        )?;
+        let (version, prompt) = self.naming_material(&naming_graph, &stream, naming_config)?;
         if version != run.units[index].input_version {
             run.units[index].state = AnalysisUnitState::Failed;
             run.units[index].error = Some(core_error(
@@ -1341,7 +1386,7 @@ impl SourceService {
             ));
             return self.save_analysis(&mut run, &control.update);
         }
-        if stream.name_input_version.as_deref() == Some(&version) {
+        if reusable_name(&stream, &version, naming_config) {
             run.units[index].state = AnalysisUnitState::Succeeded;
             run.units[index].error = None;
             return self.save_analysis(&mut run, &control.update);
@@ -1372,7 +1417,7 @@ impl SourceService {
         });
         let result = analyze_workstream_name(
             run.codex_binary.as_deref(),
-            Some(&run.codex_model),
+            (run.codex_model != DEFAULT_CODEX_MODEL).then_some(run.codex_model.as_str()),
             self.analysis_auth_home.as_deref(),
             prompt,
             call_cancel,
@@ -1441,20 +1486,25 @@ impl SourceService {
                     .find(|item| item.id == stream_id)
                     .is_some_and(|item| item.members == stream.members);
                 let latest_graph = self.project_graph(&run.project_id)?;
+                let latest_binary_fingerprint = run
+                    .codex_binary
+                    .as_deref()
+                    .and_then(|path| self.binary_fingerprint(path));
+                let latest_config = NamingConfig {
+                    model: &run.codex_model,
+                    binary_path: run.codex_binary.as_deref(),
+                    binary_version: run.codex_version.as_deref(),
+                    binary_fingerprint: latest_binary_fingerprint.as_deref(),
+                    limit: run.limits.input_character_limit,
+                };
                 if valid
                     && self
-                        .naming_material(
-                            &latest_graph,
-                            &stream,
-                            &run.codex_model,
-                            run.codex_version.as_deref(),
-                            run.limits.input_character_limit,
-                        )?
+                        .naming_material(&latest_graph, &stream, latest_config)?
                         .0
                         == version
                 {
                     current.units[index].state = AnalysisUnitState::Succeeded;
-                    current.units[index].actual_model = Some(model);
+                    current.units[index].actual_model = Some(model.clone());
                     current.units[index].error = None;
                     let saved = {
                         let _guard = self.analysis_update_lock.lock().unwrap();
@@ -1466,6 +1516,7 @@ impl SourceService {
                                 &stream.members,
                                 &name,
                                 &version,
+                                &model,
                             )?;
                         if saved {
                             (control.update)(current.clone());
@@ -2966,6 +3017,22 @@ mod tests {
                 .name,
             "测试工作流"
         );
+        assert_eq!(
+            service
+                .project_workstreams("project-test")
+                .unwrap()
+                .workstreams[0]
+                .name_actual_model
+                .as_deref(),
+            Some("test-model")
+        );
+        let reopened = codexflow_store::SessionStore::new(root.join("data")).unwrap();
+        assert_eq!(
+            reopened.workstreams("project-test").unwrap()[0]
+                .name_actual_model
+                .as_deref(),
+            Some("test-model")
+        );
         let changed_limit = service
             .analysis_preview(
                 "project-test",
@@ -2983,24 +3050,90 @@ mod tests {
             .workstreams
             .remove(0);
         let graph = service.project_graph("project-test").unwrap();
-        let version = |model, binary_version, limit| {
-            service
-                .naming_material(&graph, &stream, model, Some(binary_version), limit)
-                .unwrap()
-                .0
+        let version = |config| service.naming_material(&graph, &stream, config).unwrap().0;
+        let stable = NamingConfig {
+            model: "model-a",
+            binary_path: Some("/binary/a"),
+            binary_version: Some("codex-v1"),
+            binary_fingerprint: Some("digest-a"),
+            limit: 40_000,
         };
+        let stable_version = version(stable);
+        let mut named = stream.clone();
+        named.name_input_version = Some(stable_version.clone());
+        named.name_actual_model = Some("model-a".into());
+        assert!(reusable_name(&named, &stable_version, stable));
         assert_ne!(
-            version("model-a", "codex-v1", 40_000),
-            version("model-b", "codex-v1", 40_000)
+            stable_version,
+            version(NamingConfig {
+                model: "model-b",
+                ..stable
+            })
         );
         assert_ne!(
-            version("model-a", "codex-v1", 40_000),
-            version("model-a", "codex-v2", 40_000)
+            stable_version,
+            version(NamingConfig {
+                binary_version: Some("codex-v2"),
+                ..stable
+            })
         );
         assert_ne!(
-            version("model-a", "codex-v1", 40_000),
-            version("model-a", "codex-v1", 20_000)
+            stable_version,
+            version(NamingConfig {
+                binary_path: Some("/binary/b"),
+                ..stable
+            })
         );
+        assert_ne!(
+            stable_version,
+            version(NamingConfig {
+                binary_fingerprint: Some("digest-b"),
+                ..stable
+            })
+        );
+        assert_ne!(
+            stable_version,
+            version(NamingConfig {
+                limit: 20_000,
+                ..stable
+            })
+        );
+        named.name_actual_model = Some("model-b".into());
+        assert!(!reusable_name(&named, &stable_version, stable));
+        named.name_actual_model = None;
+        assert!(!reusable_name(&named, &stable_version, stable));
+        named.name_actual_model = Some("model-a".into());
+        assert!(!reusable_name(
+            &named,
+            &stable_version,
+            NamingConfig {
+                binary_fingerprint: None,
+                ..stable
+            }
+        ));
+        let alias = NamingConfig {
+            model: "model-latest",
+            ..stable
+        };
+        named.name_input_version = Some(version(alias));
+        named.name_actual_model = Some("model-latest".into());
+        assert!(!reusable_name(
+            &named,
+            named.name_input_version.as_deref().unwrap(),
+            alias
+        ));
+        let binary = root.join("fake-analysis-ok.py");
+        let binary_path = binary.to_str().unwrap();
+        let before = service.binary_fingerprint(binary_path).unwrap();
+        use std::io::Write as _;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&binary)
+            .unwrap()
+            .write_all(b"\n# changed binary\n")
+            .unwrap();
+        let after = service.binary_fingerprint(binary_path).unwrap();
+        assert_ne!(before, after);
         let _ = fs::remove_dir_all(root);
     }
 

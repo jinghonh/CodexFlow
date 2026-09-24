@@ -20,7 +20,9 @@ use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
 };
 use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore};
+use sha2::{Digest, Sha256};
 use std::{
+    io::Read,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -54,6 +56,7 @@ pub struct SourceService {
     analysis_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     model_slots: Arc<tokio::sync::Semaphore>,
     analysis_auth_home: Option<PathBuf>,
+    binary_fingerprint_cache: std::sync::Mutex<Option<(String, u64, SystemTime, String)>>,
 }
 
 struct State {
@@ -62,6 +65,34 @@ struct State {
 }
 
 impl SourceService {
+    fn binary_fingerprint(&self, path: &str) -> Option<String> {
+        let before = std::fs::metadata(path).ok()?;
+        let modified = before.modified().ok()?;
+        let mut cached = self.binary_fingerprint_cache.lock().unwrap();
+        if let Some((saved_path, size, saved_modified, digest)) = cached.as_ref() {
+            if saved_path == path && *size == before.len() && *saved_modified == modified {
+                return Some(digest.clone());
+            }
+        }
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let after = std::fs::metadata(path).ok()?;
+        if after.len() != before.len() || after.modified().ok()? != modified {
+            return None;
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        *cached = Some((path.to_owned(), before.len(), modified, digest.clone()));
+        Some(digest)
+    }
+
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
         Self::with_credentials(app_data_dir, system_credentials())
     }
@@ -94,6 +125,7 @@ impl SourceService {
             analysis_clock: Arc::new(|| now_ms() as i64),
             model_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             analysis_auth_home: None,
+            binary_fingerprint_cache: std::sync::Mutex::new(None),
         };
         service.reconcile_projects()?;
         Ok(service)
