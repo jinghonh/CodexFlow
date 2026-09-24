@@ -11,6 +11,58 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::{Emitter, Manager};
 
+#[cfg(feature = "perf-probe")]
+static PERF_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+#[tauri::command]
+fn record_perf_sample(
+    app: tauri::AppHandle,
+    kind: String,
+    elapsed_ms: Option<f64>,
+) -> Result<(), String> {
+    #[cfg(feature = "perf-probe")]
+    {
+        use std::io::Write;
+        const KINDS: &[&str] = &[
+            "startup",
+            "query",
+            "filter",
+            "evidence_turns",
+            "evidence_items",
+            "evidence_facts",
+        ];
+        if !KINDS.contains(&kind.as_str()) {
+            return Err("未知性能样本".into());
+        }
+        let elapsed = if kind == "startup" {
+            PERF_STARTED
+                .get()
+                .ok_or("缺少启动时间")?
+                .elapsed()
+                .as_secs_f64()
+                * 1_000.0
+        } else {
+            elapsed_ms
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .ok_or("无效性能样本")?
+        };
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("perf-samples.txt"))
+            .map_err(|error| error.to_string())?;
+        writeln!(file, "{kind}={elapsed:.3}").map_err(|error| error.to_string())?;
+    }
+    #[cfg(not(feature = "perf-probe"))]
+    let _ = (app, kind, elapsed_ms);
+    Ok(())
+}
+
 struct AppState {
     service: Result<Arc<SourceService>, AppError>,
 }
@@ -473,6 +525,8 @@ fn choose_existing_project(
 }
 
 fn main() {
+    #[cfg(feature = "perf-probe")]
+    let _ = PERF_STARTED.set(std::time::Instant::now());
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -484,6 +538,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
+            record_perf_sample,
             get_source_status,
             connect_source,
             set_display_theme,

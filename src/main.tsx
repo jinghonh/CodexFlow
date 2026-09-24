@@ -11,6 +11,7 @@ import { ProjectWorkstreamsView } from "./ProjectWorkstreamsView";
 import { ThreadHistoryView } from "./ThreadHistoryView";
 import { formatAppError } from "./appError";
 import { ProjectThreadDetailsView } from "./ProjectThreadDetailsView";
+import { finishResponse, recordStartupReady, startEvidence, startResponse } from "./performanceProbe";
 import "./style.css";
 
 type Theme = "system" | "light" | "dark";
@@ -105,6 +106,7 @@ export function App() {
   const [indexRun, setIndexRun] = useState<IndexRun | null>(null);
   const refreshing = indexRun?.state === "queued" || indexRun?.state === "running";
   const [query, setQuery] = useState("");
+  const previousQuery = useRef(query);
   const [workstreamFilter, setWorkstreamFilter] = useState("");
   const [workspaceFilter, setWorkspaceFilter] = useState("");
   const [archiveFilter, setArchiveFilter] = useState("all");
@@ -154,6 +156,8 @@ export function App() {
     let active = true;
     const queryKey = JSON.stringify([projectId, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, workstreams?.revision ?? null]);
     setQueryError(null);
+    const textChanged = previousQuery.current !== query;
+    previousQuery.current = query;
     const timer = window.setTimeout(() => {
       invoke<ThreadMatches>("query_project_threads", { projectId, query: {
         text: query, workstreamId: workstreamFilter || null, workspaceRoot: workspaceFilter || null,
@@ -161,7 +165,7 @@ export function App() {
         complete: completeFilter === "all" ? null : completeFilter === "complete",
       } }).then((value) => { if (active) { setThreadMatches({ queryKey, value }); setQueryError(null); } })
         .catch((error) => { if (active) setQueryError({ queryKey, message: errorText(error) }); });
-    }, 180);
+    }, textChanged ? 180 : 0);
     return () => { active = false; window.clearTimeout(timer); };
   }, [projectSessions?.project.id, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, graphVersion, workstreams?.revision]);
 
@@ -435,6 +439,8 @@ export function App() {
   const threadQueryKey = JSON.stringify([projectSessions?.project.id ?? null, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, workstreams?.revision ?? null]);
   useEffect(() => { setThreadLimit(40); }, [threadQueryKey]);
   const currentThreadMatches = threadMatches?.queryKey === threadQueryKey ? threadMatches.value : null;
+  useEffect(() => { if (projectSessions && !showUnassigned) recordStartupReady(); }, [projectSessions, showUnassigned]);
+  useEffect(() => { if (currentThreadMatches) finishResponse(); }, [currentThreadMatches]);
   const currentQueryError = queryError?.queryKey === threadQueryKey ? queryError.message : "";
   const visibleIds = React.useMemo(() => new Set(currentThreadMatches?.matches.map((item) => item.threadId) ?? []), [currentThreadMatches]);
   const visibleThreads = (showUnassigned ? projectCatalog?.unassigned ?? [] : projectSessions?.threads ?? []).filter(({ thread }) =>
@@ -551,17 +557,17 @@ export function App() {
           {!showUnassigned && <p className="project-state" role="status">{projectState}</p>}
           {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "已归档" : "未归档"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "上次列表完整" : "最近读取未完成"}</span><small>{scope.completedAtUnixMs ? `上次完整读取 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整读取记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}
           {listError && <div className="page-error" role="alert">{listError} 已保存的会话仍可浏览。</div>}
-          <label className="session-search">查找会话<input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="标题、预览、Thread ID 或已生成总结" /></label>
+          <label className="session-search">查找会话<input value={query} onChange={(event) => { startResponse("query"); setQuery(event.target.value); }} placeholder="标题、预览、Thread ID 或已生成总结" /></label>
           {!showUnassigned && projectSessions && <div className="explorer-filters" aria-label="会话过滤">
             <label>工作流<select aria-label="按工作流过滤" value={workstreamFilter} onChange={(event) => setWorkstreamFilter(event.target.value)}><option value="">全部工作流</option>{workstreams?.workstreams.map((stream) => <option key={stream.id} value={stream.id}>{stream.name}</option>)}<option value="ungrouped">未分组</option></select></label>
             <label>工作区<select aria-label="按工作区过滤" value={workspaceFilter} onChange={(event) => setWorkspaceFilter(event.target.value)}><option value="">全部工作区</option>{projectSessions.workspaces.map((root) => <option key={root} value={root}>{root}</option>)}</select></label>
-            <label>归档<select aria-label="按归档过滤" value={archiveFilter} onChange={(event) => setArchiveFilter(event.target.value)}><option value="all">全部</option><option value="active">未归档</option><option value="archived">已归档</option></select></label>
+            <label>归档<select aria-label="按归档过滤" value={archiveFilter} onChange={(event) => { startResponse("filter"); setArchiveFilter(event.target.value); }}><option value="all">全部</option><option value="active">未归档</option><option value="archived">已归档</option></select></label>
             <label>完整性<select aria-label="按完整性过滤" value={completeFilter} onChange={(event) => setCompleteFilter(event.target.value)}><option value="all">全部</option><option value="complete">完整</option><option value="incomplete">不完整</option></select></label>
             <button className="browse-button" onClick={clearFilters}>清除过滤</button>
           </div>}
           {workstreamError && <p className="page-error" role="alert">{workstreamError}</p>}{currentQueryError && <p className="page-error" role="alert">{currentQueryError}</p>}
           {selectedThread && selectionHidden && <div className="selection-hidden" role="status">当前选择的会话被过滤条件隐藏；详情仍可查看。<button className="browse-button" onClick={clearFilters}>清除过滤</button></div>}
-          <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{!showUnassigned && !currentThreadMatches && !currentQueryError ? "正在查找会话…" : query || workstreamFilter || workspaceFilter || archiveFilter !== "all" || completeFilter !== "all" ? "没有匹配的会话；可以清除过滤。" : refreshing ? "正在刷新；缓存中暂无会话。" : !connected && attempted ? "来源当前不可用；缓存中暂无会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : shownThreads.map(({ thread, attribution }) => <article className={`thread-row ${selectedThreadId === thread.id ? "selected" : ""}`} key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><button className="browse-button history-open" onClick={() => setSelectedThreadId(thread.id)} aria-label={`查看会话 ${thread.id} 的历史`}>查看回合与条目</button><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.missingFromSource && <span className="thread-warning">完整列表中未再次出现</span>}{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>元数据 / 回合 / 条目 / 内容</span><code>{thread.metadataComplete ? "完整" : "不完整"} / {thread.turnsComplete ? "完整" : "待采集"} / {thread.itemsComplete ? "完整" : "待采集"} / {thread.contentComplete ? "完整" : "不完整"}</code></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
+          <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{!showUnassigned && !currentThreadMatches && !currentQueryError ? "正在查找会话…" : query || workstreamFilter || workspaceFilter || archiveFilter !== "all" || completeFilter !== "all" ? "没有匹配的会话；可以清除过滤。" : refreshing ? "正在刷新；缓存中暂无会话。" : !connected && attempted ? "来源当前不可用；缓存中暂无会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : shownThreads.map(({ thread, attribution }) => <article className={`thread-row ${selectedThreadId === thread.id ? "selected" : ""}`} key={thread.id}><div className="thread-main"><strong>{thread.title || thread.preview || thread.id}</strong><button className="browse-button history-open" onClick={() => { startEvidence(thread.id); setSelectedThreadId(thread.id); }} aria-label={`查看会话 ${thread.id} 的历史`}>查看回合与条目</button><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.missingFromSource && <span className="thread-warning">完整列表中未再次出现</span>}{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>元数据 / 回合 / 条目 / 内容</span><code>{thread.metadataComplete ? "完整" : "不完整"} / {thread.turnsComplete ? "完整" : "待采集"} / {thread.itemsComplete ? "完整" : "待采集"} / {thread.contentComplete ? "完整" : "不完整"}</code></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
           {threadLimit < visibleThreads.length && <button className="browse-button" onClick={() => setThreadLimit((limit) => limit + 40)}>显示更多会话（{shownThreads.length} / {visibleThreads.length}）</button>}
         </section>
         {!showUnassigned && projectSessions && <ProjectWorkstreamsView projectId={projectSessions.project.id}

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ThreadSummaryView } from "./ThreadSummaryView";
 import { formatAppError } from "./appError";
+import { finishEvidence } from "./performanceProbe";
 
 type Coverage = {
   threadId: string; sourceUpdatedAt: number; attemptedAtUnixMs: number;
@@ -69,6 +70,7 @@ function SourceFactsView({ threadId, updatedAt, coverage, revision, onLocate }: 
       const sources = await invoke<EvidencePage>("get_source_evidence", { threadId, offset, limit: FACT_LIMIT });
       if (!active) return;
       setPage(facts); setEvidence(sources);
+      finishEvidence("evidence_facts", threadId);
       const results = await Promise.all(facts.facts.map(async (fact) => {
         try { return [fact.evidenceId, await invoke<EvidenceCheck>("validate_source_evidence", { evidenceId: fact.evidenceId })] as const; }
         catch (caught) { return [fact.evidenceId, { state: "missingItem", message: errorText(caught), location: null }] as const; }
@@ -155,6 +157,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoa
         let page = await invoke<TurnPage>("get_history_turns", { threadId, offset: 0, limit: TURN_LIMIT });
         if (!active) return;
         setTurns(page);
+        finishEvidence("evidence_turns", threadId);
         setSelectedTurnId(page.turns[0]?.id ?? null);
         if ((!page.coverage || page.coverage.sourceUpdatedAt !== updatedAt) && connected) {
           setLoading(true);
@@ -178,7 +181,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoa
     let active = true;
     if (!selectedTurnId) { setItems(null); return; }
     invoke<ItemPage>("get_history_items", { threadId, turnId: selectedTurnId, offset: itemOffset, limit: ITEM_LIMIT })
-      .then((page) => { if (active) setItems(page); })
+      .then((page) => { if (active) { setItems(page); finishEvidence("evidence_items", threadId); } })
       .catch((caught) => { if (active) setError(errorText(caught)); });
     return () => { active = false; };
   }, [threadId, selectedTurnId, itemOffset, revision]);

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
+[features]
+perf-probe = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
