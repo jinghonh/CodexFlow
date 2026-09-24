@@ -37,3 +37,18 @@ test("无双侧来源条目时明确显示证据不足", async () => {
   fireEvent.click(await screen.findByRole("button", { name: /thread-a ↔ thread-b/ }));
   expect(screen.getByText(/证据不足：至少一侧没有可定位的来源条目/)).toBeTruthy();
 });
+
+test("部分来源留下旧候选和过期原因供检查", async () => {
+  vi.mocked(invoke).mockResolvedValue({ projectId: "project", threadCount: 1, unavailableThreads: 1,
+    neighborLimit: 10, candidateCount: 0, candidates: [], staleCandidates: [{ inputVersion: "old-version",
+      reason: "来源部分可读、读取失败或尚未读取新版内容；旧候选保留供检查。",
+      candidate: { id: "old", leftThreadId: "thread-a", rightThreadId: "thread-b", score: 4,
+        reasons: [{ signal: "branch", detail: "同一分支：main" }],
+        evidence: { leftAvailable: 0, rightAvailable: 0, combinationsAvailable: 0, combinationsShown: 0,
+          leftSampled: 0, rightSampled: 0, samplingRule: "稳定排序", pairs: [] } } }] });
+  render(<CandidatePreviewView projectId="project" refreshVersion="1" onSelectEvidence={vi.fn()} />);
+  expect(await screen.findByText(/1 条会话内容部分可读/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /旧输入版本 old-version/ }));
+  expect(screen.getByRole("heading", { name: "旧候选依据" })).toBeTruthy();
+  expect(screen.getByText(/以下是旧版双侧来源摘录/)).toBeTruthy();
+});

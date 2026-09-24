@@ -234,6 +234,8 @@ pub struct AnalysisRun {
     pub pause_reason: Option<String>,
     pub input_version: String,
     pub codex_binary: Option<String>,
+    #[serde(default)]
+    pub codex_binary_fingerprint: Option<String>,
     pub codex_version: Option<String>,
     pub codex_model: String,
     pub jev_base_url: String,
@@ -492,6 +494,12 @@ pub struct ThreadSummary {
     pub evidence_refs: Vec<ThreadSummaryEvidence>,
     pub model: String,
     #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    #[serde(default)]
+    pub binary_fingerprint: Option<String>,
+    #[serde(default)]
     pub binary_version: Option<String>,
     pub input_digest: String,
     pub source_updated_at: i64,
@@ -537,9 +545,13 @@ pub struct SummaryPreview {
     pub turns_complete: bool,
     pub items_complete: bool,
     pub source_current: bool,
+    #[serde(default)]
+    pub read_error: Option<String>,
     pub content_available: bool,
     pub cached_summary: Option<ThreadSummary>,
     pub cache_current: bool,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
     pub analysis_blocked_reason: Option<String>,
 }
 
@@ -869,9 +881,23 @@ pub struct RelationCandidate {
 pub struct CandidatePreview {
     pub project_id: String,
     pub thread_count: u64,
+    #[serde(default)]
+    pub unavailable_threads: u64,
     pub neighbor_limit: u32,
     pub candidate_count: u64,
     pub candidates: Vec<RelationCandidate>,
+    #[serde(default)]
+    pub candidate_versions: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub stale_candidates: Vec<StaleCandidate>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StaleCandidate {
+    pub candidate: RelationCandidate,
+    pub input_version: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1020,6 +1046,8 @@ pub struct ReviewedInferredRelation {
     pub relation: InferredRelation,
     pub evidence_version: String,
     pub evidence_valid: bool,
+    #[serde(default)]
+    pub stale_reason: Option<String>,
     pub review: RelationReview,
 }
 

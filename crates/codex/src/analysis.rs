@@ -211,9 +211,11 @@ fn isolated_workspace(override_home: Option<&Path>) -> Result<AnalysisWorkspace,
 }
 
 pub fn configured_summary_model() -> Option<String> {
-    let home = env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))?;
+    configured_summary_model_at(None)
+}
+
+pub fn configured_summary_model_at(override_home: Option<&Path>) -> Option<String> {
+    let home = original_codex_home(override_home)?;
     let config = fs::read_to_string(home.join("config.toml")).ok()?;
     let parsed: toml::Value = toml::from_str(&config).ok()?;
     parsed

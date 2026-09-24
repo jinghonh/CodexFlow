@@ -2,7 +2,7 @@ mod analysis;
 mod history;
 pub use analysis::{
     analysis_isolation_issue, analyze_summary, analyze_workstream_name, configured_summary_model,
-    AnalysisEvent, AnalysisOutput,
+    configured_summary_model_at, AnalysisEvent, AnalysisOutput,
 };
 
 use codexflow_domain::{

@@ -373,6 +373,7 @@ mod tests {
             relation,
             evidence_version: "ev1".into(),
             evidence_valid: valid,
+            stale_reason: (!valid).then(|| "来源证据已变化".into()),
             review: RelationReview {
                 relation_id: id.into(),
                 project_id: "project".into(),

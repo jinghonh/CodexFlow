@@ -7,7 +7,8 @@ type Candidate = { id: string; leftThreadId: string; rightThreadId: string; scor
   reasons: { signal: string; detail: string }[];
   evidence: { leftAvailable: number; rightAvailable: number; combinationsAvailable: number;
     combinationsShown: number; leftSampled: number; rightSampled: number; samplingRule: string; pairs: Pair[] } };
-type Preview = { projectId: string; threadCount: number; neighborLimit: number; candidateCount: number; candidates: Candidate[] };
+type Preview = { projectId: string; threadCount: number; unavailableThreads?: number; neighborLimit: number; candidateCount: number;
+  candidates: Candidate[]; staleCandidates?: { candidate: Candidate; inputVersion: string; reason: string }[] };
 const PAGE_SIZE = 25;
 
 export function CandidatePreviewView({ projectId, refreshVersion, onSelectEvidence }: {
@@ -25,7 +26,8 @@ export function CandidatePreviewView({ projectId, refreshVersion, onSelectEviden
       .catch((caught) => { if (active) setError(typeof caught?.message === "string" ? caught.message : "候选清单读取失败。"); });
     return () => { active = false; };
   }, [projectId, refreshVersion]);
-  const selected = preview?.candidates.find((candidate) => candidate.id === selectedId);
+  const selectedStale = preview?.staleCandidates?.find((entry) => selectedId === `stale:${entry.candidate.id}`);
+  const selected = selectedStale?.candidate ?? preview?.candidates.find((candidate) => candidate.id === selectedId);
   return <section className="panel candidate-panel" aria-label="关系候选预览">
     <div className="panel-kicker">05 / 关系候选预览</div>
     <h2>待分析候选</h2>
@@ -34,6 +36,7 @@ export function CandidatePreviewView({ projectId, refreshVersion, onSelectEviden
     {!preview && !error && <p>正在计算候选…</p>}
     {preview && <>
       <div className="candidate-summary"><strong>{preview.candidateCount} 对候选</strong><span>{preview.threadCount} 条会话</span><span>每条会话最多选取 {preview.neighborLimit} 个邻居；无序候选对去重</span></div>
+      {!!preview.unavailableThreads && <p className="thread-warning">{preview.unavailableThreads} 条会话内容部分可读、读取失败或来源已更新，暂不参与新候选；旧关系证据仍可在关系图中检查。</p>}
       {preview.candidateCount === 0 && <p className="empty-list">当前没有具备筛选信号的候选。</p>}
       <div className="candidate-list">
         {preview.candidates.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((candidate) => <button key={candidate.id}
@@ -42,10 +45,19 @@ export function CandidatePreviewView({ projectId, refreshVersion, onSelectEviden
           <small>{candidate.reasons.map((reason) => reason.detail).join("；")}</small>
         </button>)}
       </div>
+      {!!preview.staleCandidates?.length && <div className="candidate-list"><strong>过期候选 · {preview.staleCandidates.length} 对</strong>
+        {preview.staleCandidates.map((entry) => <button key={`stale:${entry.candidate.id}`}
+          className={`candidate-row ${selectedId === `stale:${entry.candidate.id}` ? "selected" : ""}`}
+          onClick={() => setSelectedId(`stale:${entry.candidate.id}`)}>
+          <strong>{entry.candidate.leftThreadId} ↔ {entry.candidate.rightThreadId}</strong>
+          <small>{entry.reason} · 旧输入版本 {entry.inputVersion.slice(0, 12) || "未记录"}</small>
+        </button>)}
+      </div>}
       {preview.candidateCount > PAGE_SIZE && <div className="history-pager"><button disabled={page === 0} onClick={() => setPage(page - 1)}>上一页</button>
         <span>{page * PAGE_SIZE + 1}–{Math.min((page + 1) * PAGE_SIZE, preview.candidateCount)} / {preview.candidateCount}</span>
         <button disabled={(page + 1) * PAGE_SIZE >= preview.candidateCount} onClick={() => setPage(page + 1)}>下一页</button></div>}
-      {selected && <div className="candidate-detail"><h3>候选依据</h3>
+      {selected && <div className="candidate-detail"><h3>{selectedStale ? "旧候选依据" : "候选依据"}</h3>
+        {selectedStale && <p className="thread-warning">{selectedStale.reason} 以下是旧版双侧来源摘录。</p>}
         {selected.reasons.map((reason, index) => <p key={`${reason.signal}-${index}`}><strong>{reason.signal}</strong>：{reason.detail}</p>)}
         <h3>双侧来源证据组合 {selected.evidence.combinationsShown} / {selected.evidence.combinationsAvailable}</h3>
         <p>{selected.evidence.samplingRule} 左侧 {selected.evidence.leftSampled} / {selected.evidence.leftAvailable} 条；右侧 {selected.evidence.rightSampled} / {selected.evidence.rightAvailable} 条。</p>

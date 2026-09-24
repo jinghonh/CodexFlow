@@ -20,7 +20,9 @@ use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
 };
 use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore};
+use sha2::{Digest, Sha256};
 use std::{
+    io::Read,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -54,6 +56,7 @@ pub struct SourceService {
     analysis_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     model_slots: Arc<tokio::sync::Semaphore>,
     analysis_auth_home: Option<PathBuf>,
+    binary_fingerprint_cache: std::sync::Mutex<Option<(String, u64, SystemTime, String)>>,
 }
 
 struct State {
@@ -62,6 +65,34 @@ struct State {
 }
 
 impl SourceService {
+    fn binary_fingerprint(&self, path: &str) -> Option<String> {
+        let before = std::fs::metadata(path).ok()?;
+        let modified = before.modified().ok()?;
+        let mut cached = self.binary_fingerprint_cache.lock().unwrap();
+        if let Some((saved_path, size, saved_modified, digest)) = cached.as_ref() {
+            if saved_path == path && *size == before.len() && *saved_modified == modified {
+                return Some(digest.clone());
+            }
+        }
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let after = std::fs::metadata(path).ok()?;
+        if after.len() != before.len() || after.modified().ok()? != modified {
+            return None;
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        *cached = Some((path.to_owned(), before.len(), modified, digest.clone()));
+        Some(digest)
+    }
+
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
         Self::with_credentials(app_data_dir, system_credentials())
     }
@@ -94,6 +125,7 @@ impl SourceService {
             analysis_clock: Arc::new(|| now_ms() as i64),
             model_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             analysis_auth_home: None,
+            binary_fingerprint_cache: std::sync::Mutex::new(None),
         };
         service.reconcile_projects()?;
         Ok(service)
@@ -404,12 +436,28 @@ impl SourceService {
     }
 
     fn ensure_facts(&self, thread_id: &str) -> Result<(), AppError> {
-        if self.sessions.thread(thread_id)?.is_none() {
-            return Err(AppError::codex(
+        let changed = || {
+            AppError::codex(
                 ErrorCode::SourceReadFailed,
-                "会话未在本地索引中。",
-                false,
-            ));
+                "事实提取期间来源版本或完整性已变化；旧事实保留，请重新读取。",
+                true,
+            )
+        };
+        let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
+            AppError::codex(ErrorCode::SourceReadFailed, "会话未在本地索引中。", false)
+        })?;
+        if !self
+            .sessions
+            .history_coverage(thread_id)?
+            .is_some_and(|coverage| {
+                coverage.source_updated_at == thread.updated_at
+                    && coverage.turns_complete
+                    && coverage.items_complete
+            })
+        {
+            // An incomplete refresh may contain old rows. Keep the prior facts until
+            // the whole current source is available rather than extracting from a mix.
+            return Ok(());
         }
         let generation = self.sessions.history_generation(thread_id)?;
         let index = self.sessions.fact_index(thread_id)?;
@@ -424,17 +472,31 @@ impl SourceService {
             .as_ref()
             .is_some_and(|(saved, rule, _)| saved == &digest && rule == facts::RULE_VERSION)
         {
-            return self.sessions.mark_fact_index_current(thread_id, generation);
+            return self
+                .sessions
+                .mark_fact_index_current(
+                    thread_id,
+                    thread.updated_at,
+                    generation,
+                    &digest,
+                    facts::RULE_VERSION,
+                )?
+                .then_some(())
+                .ok_or_else(changed);
         }
         let (facts, evidence) = facts::extract(&items);
-        self.sessions.replace_automatic_facts(
-            thread_id,
-            &digest,
-            facts::RULE_VERSION,
-            generation,
-            &facts,
-            &evidence,
-        )
+        self.sessions
+            .replace_automatic_facts(
+                thread_id,
+                thread.updated_at,
+                &digest,
+                facts::RULE_VERSION,
+                generation,
+                &facts,
+                &evidence,
+            )?
+            .then_some(())
+            .ok_or_else(changed)
     }
 
     pub fn source_facts(
@@ -626,6 +688,7 @@ impl SourceService {
         let sessions = self.sessions.project_sessions(project_id)?;
         let relations = self.sessions.observed_relations(project_id)?;
         let (preview, derived) = self.automatic_candidates(&sessions)?;
+        let jev_config = self.store.load()?.jev;
         let mut graph = relations::project_graph(sessions, relations);
         graph.derived_relations = derived;
         let reviews: std::collections::BTreeMap<_, _> = self
@@ -640,10 +703,23 @@ impl SourceService {
                 .candidates
                 .iter()
                 .find(|candidate| candidate.id == result.candidate_id);
-            let current = if let Some(candidate) = candidate {
-                inferred::candidate_version(self, candidate)? == result.input_version
+            let source_current = if let Some(candidate) = candidate {
+                preview.candidate_versions.get(&candidate.id) == Some(&result.input_version)
             } else {
                 false
+            };
+            let config_current = result.jev_identity.as_ref().is_some_and(|identity| {
+                identity.base_url == jev_config.base_url
+                    && identity.requested_model == jev_config.model
+                    && identity.rules_version == codexflow_jev::RELATION_RULES_VERSION
+                    && identity.actual_model.starts_with("jev-")
+            });
+            let stale_reason = if !source_current {
+                Some("候选或来源内容版本已变化，请重新分析关系。".to_owned())
+            } else if !config_current {
+                Some("Jev 服务、模型或分析规则已变化，请重新分析关系。".to_owned())
+            } else {
+                None
             };
             for relation in &result.relations {
                 if relation.project_id != project_id
@@ -670,7 +746,12 @@ impl SourceService {
                         confirmed_evidence_version: None,
                     });
                 let valid = if let Some(candidate) = candidate {
-                    current
+                    source_current
+                        && config_current
+                        && result.jev_identity.as_ref().is_some_and(|identity| {
+                            relation.requested_model == identity.requested_model
+                                && relation.actual_model == identity.actual_model
+                        })
                         && relation.input_version == result.input_version
                         && relation.from_thread_id != relation.to_thread_id
                         && [
@@ -692,6 +773,13 @@ impl SourceService {
                     relation,
                     evidence_version,
                     evidence_valid: valid,
+                    stale_reason: if valid {
+                        None
+                    } else {
+                        stale_reason
+                            .clone()
+                            .or_else(|| Some("来源证据已变化或不可定位。".into()))
+                    },
                     review,
                 };
                 if !reviewed
@@ -701,7 +789,7 @@ impl SourceService {
                     reviewed.insert(entry.relation.id.clone(), entry);
                 }
             }
-            if current {
+            if source_current && config_current {
                 graph.inference_outcomes.push(result);
             }
         }
@@ -741,6 +829,9 @@ impl SourceService {
                     relation,
                     evidence_version,
                     evidence_valid: false,
+                    stale_reason: Some(
+                        "旧关系已不在当前候选结果中，请检查旧证据并重新分析。".into(),
+                    ),
                     review,
                 },
             );
@@ -817,13 +908,113 @@ impl SourceService {
         &self,
         sessions: &ProjectSessions,
     ) -> Result<(CandidatePreview, Vec<codexflow_domain::DerivedRelation>), AppError> {
+        let mut readable = sessions.clone();
+        let mut complete_ids = std::collections::HashSet::new();
         for item in &sessions.threads {
+            if self
+                .sessions
+                .history_coverage(&item.thread.id)?
+                .is_some_and(|coverage| {
+                    coverage.source_updated_at == item.thread.updated_at
+                        && coverage.turns_complete
+                        && coverage.items_complete
+                })
+            {
+                complete_ids.insert(item.thread.id.clone());
+            }
+        }
+        readable
+            .threads
+            .retain(|item| complete_ids.contains(&item.thread.id));
+        for item in &readable.threads {
             self.ensure_facts(&item.thread.id)?;
         }
-        let material = self.sessions.project_material(&sessions.project.id)?;
-        let result = candidates::build(sessions, material);
-        self.sessions
-            .replace_automatic_candidates(&result.0, &result.1)?;
+        let expected: Vec<_> = readable
+            .threads
+            .iter()
+            .map(|item| {
+                Ok((
+                    item.thread.id.clone(),
+                    item.thread.updated_at,
+                    self.sessions.history_generation(&item.thread.id)?,
+                ))
+            })
+            .collect::<Result<_, AppError>>()?;
+        let material = self
+            .sessions
+            .project_material(&sessions.project.id, &expected, facts::RULE_VERSION)?
+            .ok_or_else(|| {
+                AppError::codex(
+                    ErrorCode::SourceReadFailed,
+                    "候选读取期间来源完整性或版本已变化，请刷新后重试。",
+                    true,
+                )
+            })?;
+        let mut result = candidates::build(&readable, material);
+        result.0.unavailable_threads = (sessions.threads.len() - readable.threads.len()) as u64;
+        for candidate in &result.0.candidates {
+            result.0.candidate_versions.insert(
+                candidate.id.clone(),
+                inferred::candidate_version_at(candidate, &expected)?,
+            );
+        }
+        let analyzed: std::collections::HashSet<_> = self
+            .sessions
+            .inferred_pair_outcomes(&sessions.project.id)?
+            .into_iter()
+            .filter(|outcome| {
+                result.0.candidate_versions.get(&outcome.candidate_id)
+                    == Some(&outcome.input_version)
+            })
+            .map(|outcome| outcome.candidate_id)
+            .collect();
+        if let Some(previous) = self.sessions.automatic_candidates(&sessions.project.id)? {
+            let mut stale = std::collections::BTreeMap::new();
+            for entry in previous.stale_candidates {
+                if !analyzed.contains(&entry.candidate.id) {
+                    stale.insert(entry.candidate.id.clone(), entry);
+                }
+            }
+            for candidate in previous.candidates {
+                let old_version = previous
+                    .candidate_versions
+                    .get(&candidate.id)
+                    .cloned()
+                    .unwrap_or_default();
+                if result.0.candidate_versions.get(&candidate.id) == Some(&old_version)
+                    || analyzed.contains(&candidate.id)
+                {
+                    continue;
+                }
+                let incomplete = !complete_ids.contains(&candidate.left_thread_id)
+                    || !complete_ids.contains(&candidate.right_thread_id);
+                stale.insert(
+                    candidate.id.clone(),
+                    codexflow_domain::StaleCandidate {
+                        candidate,
+                        input_version: old_version,
+                        reason: if incomplete {
+                            "来源部分可读、读取失败或尚未读取新版内容；旧候选保留供检查。".into()
+                        } else {
+                            "候选材料、来源内容或提取规则已变化；旧候选待重新分析。".into()
+                        },
+                    },
+                );
+            }
+            result.0.stale_candidates = stale.into_values().collect();
+        }
+        if !self.sessions.replace_automatic_candidates_if_current(
+            &result.0,
+            &result.1,
+            &expected,
+            facts::RULE_VERSION,
+        )? {
+            return Err(AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "候选保存前来源完整性或版本已变化，旧候选保留，请刷新后重试。",
+                true,
+            ));
+        }
         Ok(result)
     }
 
@@ -2441,6 +2632,12 @@ mod tests {
             .sessions
             .replace_automatic_facts(
                 &thread.id,
+                reopened
+                    .sessions
+                    .thread(&thread.id)
+                    .unwrap()
+                    .unwrap()
+                    .updated_at,
                 &digest,
                 &rule,
                 generation,

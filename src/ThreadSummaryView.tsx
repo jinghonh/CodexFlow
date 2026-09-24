@@ -3,11 +3,12 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
 type Summary = { content: { goal: string; activity: string; outcome: string; decisions: string; issues: string };
-  evidenceIds: string[]; model: string; createdAtUnixMs: number; sourceUpdatedAt: number };
+  evidenceIds: string[]; model: string; createdAtUnixMs: number; sourceUpdatedAt: number; inputDigest?: string };
 type Preview = { model: string; characterLimit: number; characterCount: number; totalFacts: number;
   includedFacts: number; totalMessages: number; includedMessages: number; truncated: boolean;
   turnsComplete: boolean; itemsComplete: boolean; sourceCurrent: boolean; contentAvailable: boolean;
-  cachedSummary: Summary | null; cacheCurrent: boolean; analysisBlockedReason: string | null };
+  readError?: string | null;
+  cachedSummary: Summary | null; cacheCurrent: boolean; staleReason?: string | null; analysisBlockedReason: string | null };
 type Run = { id: string; state: "running" | "cancelling" | "complete" | "failed" | "cancelled";
   model: string; temporaryThreadId: string | null; turnId: string | null; reusedCache: boolean;
   error: { message: string } | null };
@@ -122,7 +123,7 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
   const labels = { goal: "目标", activity: "活动", outcome: "结果", decisions: "决定", issues: "问题" };
   return <section className="thread-summary" aria-label="会话总结">
     <div className="history-heading"><div><h3>AI 会话总结</h3><small>由 Codex 临时分析会话生成；下列文字是模型解释，来源执行状态以结构化事实为准。</small></div>
-      <div className="summary-actions"><button className="browse-button" disabled={!connected || !preview?.contentAvailable || !preview.sourceCurrent || !!preview.analysisBlockedReason || running || busy} onClick={() => void generate()}>
+      <div className="summary-actions"><button className="browse-button" disabled={!connected || !preview?.contentAvailable || !preview.sourceCurrent || !preview.turnsComplete || !preview.itemsComplete || !!preview.analysisBlockedReason || running || busy} onClick={() => void generate()}>
         {busy ? "正在启动…" : summary ? "重新生成" : "手动生成"}</button>
         {running && <button className="browse-button" disabled={run?.state === "cancelling"} onClick={() => void cancel()}>{run?.state === "cancelling" ? "取消中…" : "取消分析"}</button>}
       </div></div>
@@ -132,11 +133,12 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
       <span>输入：{preview.characterCount.toLocaleString()} / {preview.characterLimit.toLocaleString()} 字符</span>
       <span>事实：{preview.includedFacts} / {preview.totalFacts}；消息：{preview.includedMessages} / {preview.totalMessages}</span>
       {preview.truncated && <em>已截断或抽样，部分内容未发送</em>}
-      {(!preview.turnsComplete || !preview.itemsComplete) && <em>来源历史不完整，总结只能覆盖已取得内容</em>}
+      {(!preview.turnsComplete || !preview.itemsComplete) && <em>部分内容；旧总结保留，完整读取后再分析</em>}
+      {preview.readError && <em>读取失败：{preview.readError}</em>}
       {!preview.sourceCurrent && <em>来源已有更新，请重新读取历史</em>}
-      {!preview.contentAvailable && <em>没有可用会话内容，请先读取历史</em>}
+      {!preview.contentAvailable && preview.turnsComplete && preview.itemsComplete && <em>没有可用会话内容，请先读取历史</em>}
       {preview.analysisBlockedReason && <em role="alert">{preview.analysisBlockedReason}</em>}
-      {summary && !preview.cacheCurrent && <em>旧总结基于先前输入，当前来源需重新分析</em>}
+      {summary && <em>{preview.cacheCurrent ? "总结有效" : `总结过期：${preview.staleReason ?? "分析输入已变化"}`}</em>}
     </div>}
     {run && <p className="history-lookup-message" role="status">{run.state === "running" ? "分析中" : run.state === "cancelling" ? "取消中，等待回合终态或专用进程退出" : run.state === "complete" ? run.reusedCache ? "已复用有效缓存" : "总结已保存" : run.state === "cancelled" ? "已取消，旧总结保留" : "分析失败，旧总结保留"}{run.error ? `：${run.error.message}` : ""}</p>}
     {error && <p className="page-error" role="alert">{error}</p>}
@@ -149,7 +151,7 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
           {check && <small className={check.state === "valid" ? "" : "thread-warning"}>{check.message}</small>}
           {check?.excerpt && <blockquote>{check.excerpt}</blockquote>}</div>;
       })}{evidenceMessage && <p role="status">{evidenceMessage}</p>}</div>
-      <small>模型 {summary.model} · 保存于 {new Date(summary.createdAtUnixMs).toLocaleString("zh-CN")}</small></div>
-      : <p className="empty-list">尚无已保存的 AI 总结。点击“手动生成”后才会调用 Codex。</p>}
+      <small>模型 {summary.model} · 来源更新版本 {summary.sourceUpdatedAt} · 输入版本 {summary.inputDigest?.slice(0, 12) ?? "旧版未记录"} · 保存于 {new Date(summary.createdAtUnixMs).toLocaleString("zh-CN")}</small></div>
+      : <p className="empty-list">待分析：尚无已保存的 AI 总结。点击“手动生成”后才会调用 Codex。</p>}
   </section>;
 }
