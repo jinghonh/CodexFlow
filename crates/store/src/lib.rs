@@ -68,6 +68,67 @@ fn locate_history_item_in(
     Ok(location)
 }
 
+fn complete_history_at_revision(
+    connection: &Connection,
+    thread_id: &str,
+    source_updated_at: i64,
+    generation: i64,
+    fact_rule: Option<&str>,
+) -> Result<bool, AppError> {
+    let indexed_at: Option<i64> = connection
+        .query_row(
+            "SELECT updated_at FROM threads WHERE id=?1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| AppError::store("检查会话来源版本失败。"))?;
+    let coverage: Option<String> = connection
+        .query_row(
+            "SELECT coverage_json FROM history_coverage WHERE thread_id=?1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| AppError::store("检查历史完整性失败。"))?;
+    let coverage = coverage
+        .map(|json| {
+            serde_json::from_str::<HistoryCoverage>(&json)
+                .map_err(|_| AppError::store("历史覆盖范围损坏。"))
+        })
+        .transpose()?;
+    let current_generation: Option<i64> = connection
+        .query_row(
+            "SELECT generation FROM history_revisions WHERE thread_id=?1",
+            [thread_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| AppError::store("检查历史代次失败。"))?;
+    let source_current = indexed_at == Some(source_updated_at)
+        && current_generation.unwrap_or(0) == generation
+        && coverage.is_some_and(|coverage| {
+            coverage.source_updated_at == source_updated_at
+                && coverage.turns_complete
+                && coverage.items_complete
+        });
+    if !source_current {
+        return Ok(false);
+    }
+    if let Some(rule) = fact_rule {
+        let fact_generation: Option<i64> = connection
+            .query_row(
+                "SELECT history_generation FROM fact_index WHERE thread_id=?1 AND rule_version=?2",
+                params![thread_id, rule],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查事实提取版本失败。"))?;
+        return Ok(fact_generation == Some(generation));
+    }
+    Ok(true)
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1089,16 +1150,20 @@ impl SessionStore {
     pub fn replace_automatic_facts(
         &self,
         thread_id: &str,
+        source_updated_at: i64,
         content_digest: &str,
         rule_version: &str,
         generation: i64,
         facts: &[SourceFact],
         evidence: &[SourceEvidence],
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let mut connection = self.connection()?;
         let tx = connection
             .transaction()
             .map_err(|_| AppError::store("开始更新自动事实失败。"))?;
+        if !complete_history_at_revision(&tx, thread_id, source_updated_at, generation, None)? {
+            return Ok(false);
+        }
         tx.execute(
             "DELETE FROM source_evidence WHERE thread_id=?1",
             [thread_id],
@@ -1127,21 +1192,32 @@ impl SessionStore {
             params![thread_id, content_digest, rule_version, generation])
             .map_err(|_| AppError::store("保存事实提取版本失败。"))?;
         tx.commit()
-            .map_err(|_| AppError::store("提交自动事实失败。"))
+            .map_err(|_| AppError::store("提交自动事实失败。"))?;
+        Ok(true)
     }
 
     pub fn mark_fact_index_current(
         &self,
         thread_id: &str,
+        source_updated_at: i64,
         generation: i64,
-    ) -> Result<(), AppError> {
-        self.connection()?
-            .execute(
-                "UPDATE fact_index SET history_generation=?2 WHERE thread_id=?1",
-                params![thread_id, generation],
-            )
-            .map_err(|_| AppError::store("更新事实索引版本失败。"))?;
-        Ok(())
+        content_digest: &str,
+        rule_version: &str,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始更新事实索引失败。"))?;
+        if !complete_history_at_revision(&tx, thread_id, source_updated_at, generation, None)? {
+            return Ok(false);
+        }
+        let changed = tx.execute(
+            "UPDATE fact_index SET history_generation=?2 WHERE thread_id=?1 AND content_digest=?3 AND rule_version=?4",
+            params![thread_id, generation, content_digest, rule_version],
+        ).map_err(|_| AppError::store("更新事实索引版本失败。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交事实索引版本失败。"))?;
+        Ok(changed == 1)
     }
 
     pub fn facts(&self, thread_id: &str, offset: u64, limit: u32) -> Result<FactPage, AppError> {
@@ -1696,11 +1772,37 @@ impl SessionStore {
         .collect()
     }
 
-    pub fn project_material(&self, project_id: &str) -> Result<ProjectMaterial, AppError> {
+    pub fn project_material(
+        &self,
+        project_id: &str,
+        expected: &[(String, i64, i64)],
+        fact_rule: &str,
+    ) -> Result<Option<ProjectMaterial>, AppError> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction()
             .map_err(|_| AppError::store("开始读取项目来源材料失败。"))?;
+        for (thread_id, source_updated_at, generation) in expected {
+            let owner: Option<Option<String>> = transaction
+                .query_row(
+                    "SELECT project_id FROM thread_attributions WHERE thread_id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查候选项目归属失败。"))?;
+            if owner.flatten().as_deref() != Some(project_id)
+                || !complete_history_at_revision(
+                    &transaction,
+                    thread_id,
+                    *source_updated_at,
+                    *generation,
+                    Some(fact_rule),
+                )?
+            {
+                return Ok(None);
+            }
+        }
         fn read<T: serde::de::DeserializeOwned>(
             connection: &Connection,
             sql: &str,
@@ -1718,11 +1820,11 @@ impl SessionStore {
             })
             .collect()
         }
-        Ok(ProjectMaterial {
+        Ok(Some(ProjectMaterial {
             facts: read(&transaction, "SELECT f.fact_json FROM source_facts f JOIN thread_attributions a ON a.thread_id=f.thread_id WHERE a.project_id=?1 ORDER BY f.thread_id,f.ordinal,f.id", project_id)?,
             evidence: read(&transaction, "SELECT e.evidence_json FROM source_evidence e JOIN thread_attributions a ON a.thread_id=e.thread_id WHERE a.project_id=?1 ORDER BY e.thread_id,e.ordinal,e.id", project_id)?,
             items: read(&transaction, "SELECT i.item_json FROM history_items i JOIN history_turns t ON t.thread_id=i.thread_id AND t.id=i.turn_id JOIN thread_attributions a ON a.thread_id=i.thread_id WHERE a.project_id=?1 ORDER BY i.thread_id,t.ordinal,i.ordinal,i.id", project_id)?,
-        })
+        }))
     }
 
     pub fn automatic_candidates(
@@ -1759,6 +1861,52 @@ impl SessionStore {
             params![preview.project_id, preview_json, relations_json],
         ).map_err(|_| AppError::store("保存规则关系和候选清单失败。"))?;
         Ok(())
+    }
+
+    pub fn replace_automatic_candidates_if_current(
+        &self,
+        preview: &CandidatePreview,
+        relations: &[DerivedRelation],
+        expected: &[(String, i64, i64)],
+        fact_rule: &str,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始保存候选清单失败。"))?;
+        for (thread_id, source_updated_at, generation) in expected {
+            let owner: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT project_id FROM thread_attributions WHERE thread_id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查候选项目归属失败。"))?;
+            if owner.flatten().as_deref() != Some(preview.project_id.as_str())
+                || !complete_history_at_revision(
+                    &tx,
+                    thread_id,
+                    *source_updated_at,
+                    *generation,
+                    Some(fact_rule),
+                )?
+            {
+                return Ok(false);
+            }
+        }
+        let preview_json =
+            serde_json::to_string(preview).map_err(|_| AppError::store("序列化候选清单失败。"))?;
+        let relations_json = serde_json::to_string(relations)
+            .map_err(|_| AppError::store("序列化规则关系失败。"))?;
+        tx.execute(
+            "INSERT INTO automatic_candidate_views (project_id,preview_json,relations_json) VALUES (?1,?2,?3)
+             ON CONFLICT(project_id) DO UPDATE SET preview_json=excluded.preview_json,relations_json=excluded.relations_json",
+            params![preview.project_id, preview_json, relations_json],
+        ).map_err(|_| AppError::store("保存规则关系和候选清单失败。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交规则关系和候选清单失败。"))?;
+        Ok(true)
     }
 
     pub fn save_inferred_pair_outcome(&self, result: &InferredPairOutcome) -> Result<(), AppError> {
@@ -3374,6 +3522,7 @@ mod tests {
         store
             .replace_automatic_facts(
                 "duplicate-thread",
+                100,
                 "v1",
                 "test",
                 store.history_generation("duplicate-thread").unwrap(),

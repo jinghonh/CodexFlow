@@ -1,8 +1,8 @@
 mod analysis;
 mod history;
 pub use analysis::{
-    analysis_isolation_issue, analyze_summary, configured_summary_model, AnalysisEvent,
-    AnalysisOutput,
+    analysis_isolation_issue, analyze_summary, configured_summary_model,
+    configured_summary_model_at, AnalysisEvent, AnalysisOutput,
 };
 
 use codexflow_domain::{

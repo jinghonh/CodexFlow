@@ -40,26 +40,21 @@ pub(crate) fn evidence_version(pair: &EvidencePair) -> Result<String, AppError> 
     Ok(format!("{:x}", hash.finalize()))
 }
 
-pub(crate) fn candidate_version(
-    service: &SourceService,
+pub(crate) fn candidate_version_at(
     candidate: &RelationCandidate,
+    revisions: &[(String, i64, i64)],
 ) -> Result<String, AppError> {
     let mut hash = Sha256::new();
     hash.update(super::candidates::CANDIDATE_RULE_VERSION);
     hash.update(super::facts::RULE_VERSION);
     hash.update(serde_json::to_vec(candidate).map_err(|_| AppError::store("候选版本计算失败。"))?);
     for thread_id in [&candidate.left_thread_id, &candidate.right_thread_id] {
-        let thread = service
-            .sessions
-            .thread(thread_id)?
-            .ok_or_else(|| AppError::store("候选会话不存在。"))?;
-        hash.update(thread.updated_at.to_be_bytes());
-        hash.update(
-            service
-                .sessions
-                .history_generation(thread_id)?
-                .to_be_bytes(),
-        );
+        let (_, updated_at, generation) = revisions
+            .iter()
+            .find(|(id, _, _)| id == thread_id)
+            .ok_or_else(|| AppError::store("候选来源版本缺失。"))?;
+        hash.update(updated_at.to_be_bytes());
+        hash.update(generation.to_be_bytes());
     }
     Ok(format!("{:x}", hash.finalize()))
 }

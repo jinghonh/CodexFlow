@@ -234,6 +234,8 @@ pub struct AnalysisRun {
     pub pause_reason: Option<String>,
     pub input_version: String,
     pub codex_binary: Option<String>,
+    #[serde(default)]
+    pub codex_binary_fingerprint: Option<String>,
     pub codex_version: Option<String>,
     pub codex_model: String,
     pub jev_base_url: String,
@@ -489,6 +491,12 @@ pub struct ThreadSummary {
     #[serde(default)]
     pub evidence_refs: Vec<ThreadSummaryEvidence>,
     pub model: String,
+    #[serde(default)]
+    pub requested_model: Option<String>,
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    #[serde(default)]
+    pub binary_fingerprint: Option<String>,
     #[serde(default)]
     pub binary_version: Option<String>,
     pub input_digest: String,

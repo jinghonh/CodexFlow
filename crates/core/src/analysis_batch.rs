@@ -220,8 +220,9 @@ impl SourceService {
                 Err(_) => unavailable += 1,
             }
         }
-        let model = codexflow_codex::configured_summary_model()
-            .unwrap_or_else(|| "Codex 默认模型（启动后确认）".into());
+        let model =
+            codexflow_codex::configured_summary_model_at(self.analysis_auth_home.as_deref())
+                .unwrap_or_else(|| "Codex 默认模型（启动后确认）".into());
         let codex_available =
             matches!(
                 source.capabilities.codex_summary.state,
@@ -242,12 +243,15 @@ impl SourceService {
         let existing = self.sessions.inferred_pair_outcomes(project_id)?;
         let mut pending_candidates = 0;
         for pair in &candidate.candidates {
-            let version = inferred::candidate_version(self, pair)?;
+            let version = candidate
+                .candidate_versions
+                .get(&pair.id)
+                .ok_or_else(|| AppError::store("候选输入版本缺失。"))?;
             if !existing.iter().any(|result| {
                 reusable_jev_outcome(
                     result,
                     &pair.id,
-                    &version,
+                    version,
                     &jev.config.base_url,
                     &jev.config.model,
                     None,
@@ -485,6 +489,10 @@ impl SourceService {
                 relation_classification: None,
             })
             .collect();
+        let codex_binary_fingerprint = source
+            .resolved_binary
+            .as_deref()
+            .and_then(|path| self.binary_fingerprint(path));
         let mut run = AnalysisRun {
             id,
             project_id: project_id.clone(),
@@ -492,6 +500,7 @@ impl SourceService {
             pause_reason: None,
             input_version: preview.input_version,
             codex_binary: source.resolved_binary,
+            codex_binary_fingerprint,
             codex_version: source.version,
             codex_model: preview.stages[0].model.clone(),
             jev_base_url: jev.jev.base_url,
@@ -649,6 +658,11 @@ impl SourceService {
         let jev_revision = self.preferences.lock().await.jev_revision;
         if preview.input_version != run.input_version
             || source.resolved_binary != run.codex_binary
+            || source
+                .resolved_binary
+                .as_deref()
+                .and_then(|path| self.binary_fingerprint(path))
+                != run.codex_binary_fingerprint
             || source.version != run.codex_version
             || preview.stages[0].model != run.codex_model
             || jev_revision != run.jev_config_revision
@@ -833,12 +847,15 @@ impl SourceService {
                     let preview = self.candidate_preview(&run.project_id)?;
                     let existing = self.sessions.inferred_pair_outcomes(&run.project_id)?;
                     for pair in &preview.candidates {
-                        let version = inferred::candidate_version(self, pair)?;
+                        let version = preview
+                            .candidate_versions
+                            .get(&pair.id)
+                            .ok_or_else(|| AppError::store("候选输入版本缺失。"))?;
                         if existing.iter().any(|result| {
                             reusable_jev_outcome(
                                 result,
                                 &pair.id,
-                                &version,
+                                version,
                                 &run.jev_base_url,
                                 &run.jev_model,
                                 None,
@@ -850,7 +867,7 @@ impl SourceService {
                         run.units.push(AnalysisUnit {
                             id: pair.id.clone(),
                             stage: AnalysisStage::Relation,
-                            input_version: version,
+                            input_version: version.clone(),
                             state: AnalysisUnitState::Pending,
                             attempts: 0,
                             active_summary_run_id: None,
@@ -914,9 +931,15 @@ impl SourceService {
             }
             let source = self.status().await;
             let jev_revision = self.preferences.lock().await.jev_revision;
-            let model = codexflow_codex::configured_summary_model()
-                .unwrap_or_else(|| "Codex 默认模型（启动后确认）".into());
+            let model =
+                codexflow_codex::configured_summary_model_at(self.analysis_auth_home.as_deref())
+                    .unwrap_or_else(|| "Codex 默认模型（启动后确认）".into());
             if source.resolved_binary != run.codex_binary
+                || source
+                    .resolved_binary
+                    .as_deref()
+                    .and_then(|path| self.binary_fingerprint(path))
+                    != run.codex_binary_fingerprint
                 || source.version != run.codex_version
                 || model != run.codex_model
                 || jev_revision != run.jev_config_revision
@@ -995,6 +1018,7 @@ impl SourceService {
                         input_version: &run.units[index].input_version,
                         model: &run.codex_model,
                         binary: run.codex_binary.as_deref(),
+                        binary_fingerprint: run.codex_binary_fingerprint.as_deref(),
                         binary_version: run.codex_version.as_deref(),
                     },
                     run.limits.concurrency_limit,
@@ -1323,11 +1347,34 @@ impl SourceService {
             self.save_analysis(&mut run, &control.update)?;
             return Ok(());
         };
-        if inferred::candidate_version(self, candidate)? != run.units[index].input_version {
+        if preview.candidate_versions.get(&candidate.id) != Some(&run.units[index].input_version) {
             run.units[index].state = AnalysisUnitState::Failed;
             run.units[index].error = Some(core_error(
                 ErrorCode::SourceReadFailed,
                 "候选材料版本已变化，请启动新运行。",
+                true,
+            ));
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        }
+        let mut expected_sources = Vec::with_capacity(2);
+        for thread_id in [&candidate.left_thread_id, &candidate.right_thread_id] {
+            let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
+                core_error(ErrorCode::SourceReadFailed, "候选来源会话已消失。", true)
+            })?;
+            expected_sources.push((
+                thread_id.clone(),
+                thread.updated_at,
+                self.sessions.history_generation(thread_id)?,
+            ));
+        }
+        if inferred::candidate_version_at(candidate, &expected_sources)?
+            != run.units[index].input_version
+        {
+            run.units[index].state = AnalysisUnitState::Failed;
+            run.units[index].error = Some(core_error(
+                ErrorCode::SourceReadFailed,
+                "候选读取后来源版本已变化，请启动新运行。",
                 true,
             ));
             self.save_analysis(&mut run, &control.update)?;
@@ -1357,17 +1404,6 @@ impl SourceService {
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
             }
-        }
-        let mut expected_sources = Vec::with_capacity(2);
-        for thread_id in [&candidate.left_thread_id, &candidate.right_thread_id] {
-            let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
-                core_error(ErrorCode::SourceReadFailed, "候选来源会话已消失。", true)
-            })?;
-            expected_sources.push((
-                thread_id.clone(),
-                thread.updated_at,
-                self.sessions.history_generation(thread_id)?,
-            ));
         }
         let phase = run.units[index].stage;
         let supported = run.units[index]
@@ -1478,17 +1514,10 @@ impl SourceService {
             self.save_analysis(&mut current, &control.update)?;
             return Ok(());
         }
-        let latest = self
-            .candidate_preview(&current.project_id)?
-            .candidates
-            .into_iter()
-            .find(|pair| pair.id == candidate.id);
-        let latest_version = latest
-            .as_ref()
-            .map(|pair| inferred::candidate_version(self, pair))
-            .transpose()?;
+        let latest = self.candidate_preview(&current.project_id)?;
+        let latest_version = latest.candidate_versions.get(&candidate.id);
         if self.preferences.lock().await.jev_revision != current.jev_config_revision
-            || latest_version.as_deref() != Some(current.units[index].input_version.as_str())
+            || latest_version != Some(&current.units[index].input_version)
             || current.jev_pinned_model.as_deref() != Some(model.as_str())
             || current.jev_rules_version != RELATION_RULES_VERSION
         {
@@ -1877,6 +1906,7 @@ mod tests {
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
         let home = root.join("safe-auth-home");
         fs::create_dir_all(&home).unwrap();
+        fs::write(home.join("config.toml"), "model = \"test-model\"\n").unwrap();
         let mut service = SourceService::with_credentials(
             root.join("data"),
             Arc::new(TestCredentials::default()),
@@ -2716,12 +2746,9 @@ mod tests {
         };
         let root = root("inferred-validation");
         let service = service(&root, "ok", 2).await;
-        let candidate = service
-            .candidate_preview("project-test")
-            .unwrap()
-            .candidates
-            .remove(0);
-        let version = inferred::candidate_version(&service, &candidate).unwrap();
+        let mut preview = service.candidate_preview("project-test").unwrap();
+        let candidate = preview.candidates.remove(0);
+        let version = preview.candidate_versions.remove(&candidate.id).unwrap();
         let answer = |choice: &str, confidence| JevChoiceAnswer {
             choice: choice.into(),
             confidence,
@@ -3394,12 +3421,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let candidate = service
-            .candidate_preview("project-test")
-            .unwrap()
-            .candidates
-            .remove(0);
-        let input_version = inferred::candidate_version(&service, &candidate).unwrap();
+        let mut preview = service.candidate_preview("project-test").unwrap();
+        let candidate = preview.candidates.remove(0);
+        let input_version = preview.candidate_versions.remove(&candidate.id).unwrap();
         let mut saved = InferredPairOutcome {
             candidate_id: candidate.id.clone(),
             project_id: "project-test".into(),
@@ -3559,6 +3583,18 @@ mod tests {
             1
         );
         let old_facts = service.source_facts("thread-0", 0, 100).unwrap().facts;
+        let old_generation = service.sessions.history_generation("thread-0").unwrap();
+        let expected: Vec<_> = ["thread-0", "thread-1"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.to_owned(),
+                    200,
+                    service.sessions.history_generation(id).unwrap(),
+                )
+            })
+            .collect();
+        let old_preview = service.candidate_preview("project-test").unwrap();
         let mut changed = service.sessions.thread("thread-0").unwrap().unwrap();
         changed.updated_at = 201;
         service.sessions.save_collection(&[changed], &[]).unwrap();
@@ -3583,6 +3619,41 @@ mod tests {
                 items: vec![],
             })
             .unwrap();
+        assert!(
+            service
+                .sessions
+                .project_material("project-test", &expected, crate::facts::RULE_VERSION)
+                .unwrap()
+                .is_none(),
+            "旧完整性检查不能授权读取新的部分历史"
+        );
+        assert!(
+            !service
+                .sessions
+                .replace_automatic_candidates_if_current(
+                    &old_preview,
+                    &[],
+                    &expected,
+                    crate::facts::RULE_VERSION,
+                )
+                .unwrap(),
+            "旧候选不能在来源变化后提交"
+        );
+        assert!(
+            !service
+                .sessions
+                .replace_automatic_facts(
+                    "thread-0",
+                    200,
+                    "old-content",
+                    crate::facts::RULE_VERSION,
+                    old_generation,
+                    &[],
+                    &[],
+                )
+                .unwrap(),
+            "旧提取运行不能在部分历史上替换事实"
+        );
         assert_eq!(
             service
                 .source_facts("thread-0", 0, 100)

@@ -19,7 +19,9 @@ use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
 };
 use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore};
+use sha2::{Digest, Sha256};
 use std::{
+    io::Read,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -53,6 +55,7 @@ pub struct SourceService {
     analysis_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     model_slots: Arc<tokio::sync::Semaphore>,
     analysis_auth_home: Option<PathBuf>,
+    binary_fingerprint_cache: std::sync::Mutex<Option<(String, u64, SystemTime, String)>>,
 }
 
 struct State {
@@ -61,6 +64,34 @@ struct State {
 }
 
 impl SourceService {
+    fn binary_fingerprint(&self, path: &str) -> Option<String> {
+        let before = std::fs::metadata(path).ok()?;
+        let modified = before.modified().ok()?;
+        let mut cached = self.binary_fingerprint_cache.lock().unwrap();
+        if let Some((saved_path, size, saved_modified, digest)) = cached.as_ref() {
+            if saved_path == path && *size == before.len() && *saved_modified == modified {
+                return Some(digest.clone());
+            }
+        }
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer).ok()?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let after = std::fs::metadata(path).ok()?;
+        if after.len() != before.len() || after.modified().ok()? != modified {
+            return None;
+        }
+        let digest = format!("{:x}", hasher.finalize());
+        *cached = Some((path.to_owned(), before.len(), modified, digest.clone()));
+        Some(digest)
+    }
+
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
         Self::with_credentials(app_data_dir, system_credentials())
     }
@@ -93,6 +124,7 @@ impl SourceService {
             analysis_clock: Arc::new(|| now_ms() as i64),
             model_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             analysis_auth_home: None,
+            binary_fingerprint_cache: std::sync::Mutex::new(None),
         };
         service.reconcile_projects()?;
         Ok(service)
@@ -403,6 +435,13 @@ impl SourceService {
     }
 
     fn ensure_facts(&self, thread_id: &str) -> Result<(), AppError> {
+        let changed = || {
+            AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "事实提取期间来源版本或完整性已变化；旧事实保留，请重新读取。",
+                true,
+            )
+        };
         let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
             AppError::codex(ErrorCode::SourceReadFailed, "会话未在本地索引中。", false)
         })?;
@@ -432,17 +471,31 @@ impl SourceService {
             .as_ref()
             .is_some_and(|(saved, rule, _)| saved == &digest && rule == facts::RULE_VERSION)
         {
-            return self.sessions.mark_fact_index_current(thread_id, generation);
+            return self
+                .sessions
+                .mark_fact_index_current(
+                    thread_id,
+                    thread.updated_at,
+                    generation,
+                    &digest,
+                    facts::RULE_VERSION,
+                )?
+                .then_some(())
+                .ok_or_else(changed);
         }
         let (facts, evidence) = facts::extract(&items);
-        self.sessions.replace_automatic_facts(
-            thread_id,
-            &digest,
-            facts::RULE_VERSION,
-            generation,
-            &facts,
-            &evidence,
-        )
+        self.sessions
+            .replace_automatic_facts(
+                thread_id,
+                thread.updated_at,
+                &digest,
+                facts::RULE_VERSION,
+                generation,
+                &facts,
+                &evidence,
+            )?
+            .then_some(())
+            .ok_or_else(changed)
     }
 
     pub fn source_facts(
@@ -650,7 +703,7 @@ impl SourceService {
                 .iter()
                 .find(|candidate| candidate.id == result.candidate_id);
             let source_current = if let Some(candidate) = candidate {
-                inferred::candidate_version(self, candidate)? == result.input_version
+                preview.candidate_versions.get(&candidate.id) == Some(&result.input_version)
             } else {
                 false
             };
@@ -863,13 +916,33 @@ impl SourceService {
         for item in &readable.threads {
             self.ensure_facts(&item.thread.id)?;
         }
-        let material = self.sessions.project_material(&sessions.project.id)?;
+        let expected: Vec<_> = readable
+            .threads
+            .iter()
+            .map(|item| {
+                Ok((
+                    item.thread.id.clone(),
+                    item.thread.updated_at,
+                    self.sessions.history_generation(&item.thread.id)?,
+                ))
+            })
+            .collect::<Result<_, AppError>>()?;
+        let material = self
+            .sessions
+            .project_material(&sessions.project.id, &expected, facts::RULE_VERSION)?
+            .ok_or_else(|| {
+                AppError::codex(
+                    ErrorCode::SourceReadFailed,
+                    "候选读取期间来源完整性或版本已变化，请刷新后重试。",
+                    true,
+                )
+            })?;
         let mut result = candidates::build(&readable, material);
         result.0.unavailable_threads = (sessions.threads.len() - readable.threads.len()) as u64;
         for candidate in &result.0.candidates {
             result.0.candidate_versions.insert(
                 candidate.id.clone(),
-                inferred::candidate_version(self, candidate)?,
+                inferred::candidate_version_at(candidate, &expected)?,
             );
         }
         let analyzed: std::collections::HashSet<_> = self
@@ -917,8 +990,18 @@ impl SourceService {
             }
             result.0.stale_candidates = stale.into_values().collect();
         }
-        self.sessions
-            .replace_automatic_candidates(&result.0, &result.1)?;
+        if !self.sessions.replace_automatic_candidates_if_current(
+            &result.0,
+            &result.1,
+            &expected,
+            facts::RULE_VERSION,
+        )? {
+            return Err(AppError::codex(
+                ErrorCode::SourceReadFailed,
+                "候选保存前来源完整性或版本已变化，旧候选保留，请刷新后重试。",
+                true,
+            ));
+        }
         Ok(result)
     }
 
@@ -2536,6 +2619,12 @@ mod tests {
             .sessions
             .replace_automatic_facts(
                 &thread.id,
+                reopened
+                    .sessions
+                    .thread(&thread.id)
+                    .unwrap()
+                    .unwrap()
+                    .updated_at,
                 &digest,
                 &rule,
                 generation,
