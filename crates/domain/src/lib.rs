@@ -859,6 +859,8 @@ pub struct ObservedRelation {
 pub struct GraphNode {
     pub id: String,
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
     pub reference_only: bool,
 }
 

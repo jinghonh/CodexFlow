@@ -5,9 +5,10 @@ import {
 } from "@xyflow/react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatAppError } from "./appError";
+import { threadDisplayTitle } from "./threadDisplay";
 import "@xyflow/react/dist/style.css";
 
-type GraphNode = { id: string; title: string | null; referenceOnly: boolean };
+type GraphNode = { id: string; title: string | null; sourceKind?: string | null; referenceOnly: boolean };
 type Relation = {
   id: string; projectId: string; fromThreadId: string; toThreadId: string;
   kind: "FORKED_FROM" | "SUBAGENT_OF"; source: "observed"; sourceField: string;
@@ -231,7 +232,7 @@ async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{
     id: node.id,
     type: "thread",
     position: { x: coordinates.get(node.id)?.x ?? (index % 4) * 320, y: coordinates.get(node.id)?.y ?? Math.floor(index / 4) * 150 },
-    data: { title: node.title || node.id, id: node.id, referenceOnly: node.referenceOnly },
+    data: { title: node.referenceOnly ? node.title || node.id : threadDisplayTitle({ title: node.title, sourceKind: node.sourceKind ?? "" }), id: node.id, referenceOnly: node.referenceOnly },
     draggable: false,
   }));
   return { nodes, edges: graphEdges(graph), warning };
@@ -375,7 +376,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
       </div> : <p className="empty-list">{graph.nodes.length ? "当前条件没有可见会话；已选会话详情仍会保留。" : "当前项目没有会话。"}</p>}
       <div className="graph-details" aria-live="polite">
         {!detail && <p>选择节点或关系以查看来源详情。</p>}
-        {detail?.type === "node" && <><h3>{detail.node.referenceOnly ? "仅有引用的端点" : "会话"}</h3><strong>{detail.node.title ?? detail.node.id}</strong><code>{detail.node.id}</code>{detail.node.referenceOnly && <p>来源记录了此会话 ID，当前项目图没有可展示的会话内容。</p>}</>}
+        {detail?.type === "node" && <><h3>{detail.node.referenceOnly ? "仅有引用的端点" : "会话"}</h3><strong>{detail.node.referenceOnly ? detail.node.title ?? detail.node.id : threadDisplayTitle({ title: detail.node.title, sourceKind: detail.node.sourceKind ?? "" })}</strong><code>{detail.node.id}</code>{detail.node.referenceOnly && <p>来源记录了此会话 ID，当前项目图没有可展示的会话内容。</p>}</>}
         {detail?.type === "derived" && <><h3>规则关系 · {derivedText[detail.relation.kind]}</h3>
           <p><code>{detail.relation.fromThreadId}</code> ↔ <code>{detail.relation.toThreadId}</code></p>
           <p>{detail.relation.basis}</p><p>这是来源事实计算结果，不是模型判断或概率。</p>

@@ -73,9 +73,8 @@ pub(crate) fn project_graph(
                 item.thread.id.clone(),
                 GraphNode {
                     id: item.thread.id.clone(),
-                    title: item.thread.title.clone().or_else(|| {
-                        (!item.thread.preview.is_empty()).then(|| item.thread.preview.clone())
-                    }),
+                    title: item.thread.title.clone(),
+                    source_kind: Some(item.thread.source_kind.clone()),
                     reference_only: false,
                 },
             )
@@ -101,6 +100,7 @@ pub(crate) fn project_graph(
                 .or_insert_with(|| GraphNode {
                     id: relation.from_thread_id.clone(),
                     title: None,
+                    source_kind: None,
                     reference_only: true,
                 });
         }

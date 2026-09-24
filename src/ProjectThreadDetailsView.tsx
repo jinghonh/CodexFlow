@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatAppError } from "./appError";
+import { threadDisplayTitle, threadPreviewExcerpt } from "./threadDisplay";
 
 type Evidence = { threadId: string; turnId: string; itemId: string; excerpt: string };
 type Relation = { id: string; source: string; kind: string; fromThreadId: string; toThreadId: string;
@@ -44,9 +45,9 @@ export function ProjectThreadDetailsView({ projectId, thread, attribution, refre
     : relation.evidence ? [relation.evidence.left, relation.evidence.right] : [];
   const related = (relation: Relation) => relation.fromThreadId === thread.id ? relation.toThreadId : relation.fromThreadId;
   return <section id="thread-detail" className="panel thread-detail" aria-label="会话详情">
-    <div className="panel-kicker">会话详情</div><h2>{thread.title || thread.preview || thread.id}</h2>
+    <div className="panel-kicker">会话详情</div><h2>{threadDisplayTitle(thread)}</h2>
     {hidden && <p className="selection-hidden">此会话被当前过滤条件隐藏，详情仍可检查。</p>}
-    <p>{thread.preview || "来源没有提供预览。"}</p>
+    <p>{thread.preview ? `预览：${threadPreviewExcerpt(thread.preview)}` : "来源没有提供预览。"}</p>
     <dl><dt>会话标识</dt><dd><code>{thread.id}</code></dd><dt>Session 标识</dt><dd><code>{thread.sessionId}</code></dd>
       <dt>来源</dt><dd>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}{thread.threadSource ? ` · ${thread.threadSource}` : ""}</dd>
       <dt>来源项目标识</dt><dd><code>{attribution.sourceProjectId ?? "未提供"}</code></dd>

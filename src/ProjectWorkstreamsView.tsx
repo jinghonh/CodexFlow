@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatAppError } from "./appError";
+import { threadDisplayTitle } from "./threadDisplay";
 
 type Stream = { id: string; name: string; members: string[]; relationIds: string[];
   nameInputVersion: string | null; nameError: string | null };
 type View = { workstreams: Stream[]; ungroupedThreadIds: string[]; crossRelationIds: string[];
   revision: number; manuallyNamedWorkstreamIds: string[]; manuallyAssignedThreadIds: string[] };
-type Node = { id: string; title: string | null; referenceOnly: boolean };
+type Node = { id: string; title: string | null; sourceKind?: string | null; referenceOnly: boolean };
 type Evidence = { threadId: string; turnId: string; itemId: string };
 type Relation = { id: string; fromThreadId: string; toThreadId: string; kind: string;
   source: string; basis?: string; evidence?: Evidence[] | { left: Evidence; right: Evidence } };
@@ -77,7 +78,12 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
     } catch (caught) { setError(failureMessage(caught)); }
     finally { setSaving(""); }
   }
-  const title = (id: string) => graph?.nodes.find((node) => node.id === id)?.title || id;
+  const title = (id: string) => {
+    const node = graph?.nodes.find((item) => item.id === id);
+    if (!node) return id;
+    if (node.referenceOnly) return node.title || id;
+    return threadDisplayTitle({ title: node.title, sourceKind: node.sourceKind ?? "" });
+  };
   const relations = [...(graph?.relations ?? []), ...(graph?.derivedRelations ?? []), ...(graph?.inferredRelations ?? [])];
   const relation = (id: string) => relations.find((item) => item.id === id);
   const evidence = (item: Relation): Evidence | undefined => Array.isArray(item.evidence)

@@ -374,6 +374,7 @@ mod tests {
                 .map(|id| GraphNode {
                     id: (*id).into(),
                     title: None,
+                    source_kind: None,
                     reference_only: false,
                 })
                 .collect(),
