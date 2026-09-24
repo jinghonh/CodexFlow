@@ -109,3 +109,17 @@ test("工作流泳道按主要归属显示，同一会话只出现一次", async
   expect(screen.getByText("未分组会话")).toBeTruthy();
   expect(screen.getAllByRole("button", { name: /恢复的会话.*已知时长/ })).toHaveLength(1);
 });
+
+test("大项目时间线按页展示会话且可继续查看", async () => {
+  vi.mocked(invoke).mockResolvedValue({ projectId: "project", threads: Array.from({ length: 81 }, (_, index) => ({
+    ...timeline.threads[0], threadId: `thread-${index}`, title: `会话 ${index}`,
+    lastActivityAtUnixMs: first + index * 1_000,
+  })) });
+  render(<ProjectTimelineView projectId="project" refreshVersion="0" connected={false} onSelectThread={vi.fn()} />);
+  await screen.findByText("未分组会话");
+  expect(document.querySelectorAll(".timeline-row")).toHaveLength(40);
+  fireEvent.click(screen.getByRole("button", { name: /显示更多会话（已显示 40 \/ 81）/ }));
+  expect(document.querySelectorAll(".timeline-row")).toHaveLength(80);
+  fireEvent.click(screen.getByRole("button", { name: /显示更多会话（已显示 80 \/ 81）/ }));
+  expect(document.querySelectorAll(".timeline-row")).toHaveLength(81);
+});

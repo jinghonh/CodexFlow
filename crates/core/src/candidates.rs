@@ -525,6 +525,7 @@ pub(crate) fn build(
     relations.sort_by(|a, b| a.id.cmp(&b.id));
     let preview = CandidatePreview {
         project_id: sessions.project.id.clone(),
+        input_version: String::new(),
         thread_count: ids.len() as u64,
         unavailable_threads: 0,
         neighbor_limit: NEIGHBOR_LIMIT as u32,

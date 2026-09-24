@@ -6,6 +6,7 @@ use std::{
     process::Command,
 };
 
+#[derive(Clone)]
 struct GitWorkspace {
     root: PathBuf,
     common_dir: PathBuf,
@@ -119,21 +120,32 @@ pub fn reconcile(
         .collect();
     let mut results = Vec::with_capacity(threads.len());
     let mut missing_paths = BTreeSet::new();
+    // Many sessions share a worktree. Resolve each path once per reconciliation,
+    // especially the Git subprocess used to establish shared worktree identity.
+    let mut resolved_paths: BTreeMap<&str, (Option<PathBuf>, Option<GitWorkspace>, bool)> =
+        BTreeMap::new();
 
     for thread in threads {
         let old = previous_by_thread.get(thread.id.as_str()).copied();
-        let real = if Path::new(&thread.cwd).is_absolute() {
-            fs::canonicalize(&thread.cwd)
-                .ok()
-                .filter(|path| path.is_dir())
-        } else {
-            None
-        };
+        let (real, workspace, git_marker) =
+            resolved_paths.entry(&thread.cwd).or_insert_with(|| {
+                let real = Path::new(&thread.cwd)
+                    .is_absolute()
+                    .then(|| {
+                        fs::canonicalize(&thread.cwd)
+                            .ok()
+                            .filter(|path| path.is_dir())
+                    })
+                    .flatten();
+                let workspace = real.as_deref().and_then(git_workspace);
+                let git_marker = real.as_deref().is_some_and(has_git_marker);
+                (real, workspace, git_marker)
+            });
         if real.is_none() {
             missing_paths.insert(thread.id.clone());
         }
         let direct = real.as_ref().and_then(|path| {
-            if let Some(workspace) = git_workspace(path) {
+            if let Some(workspace) = workspace {
                 let project = git_project(&workspace);
                 let id = project.id.clone();
                 projects.entry(id.clone()).or_insert(project);
@@ -145,7 +157,7 @@ pub fn reconcile(
                     format!("共享 Git 目录：{}", path_text(&workspace.common_dir)),
                 ));
             }
-            if has_git_marker(path) {
+            if *git_marker {
                 return None;
             }
             projects
@@ -203,7 +215,7 @@ pub fn reconcile(
                             "来源工作目录不是绝对路径，无法确认本地归属。".into()
                         } else if real.is_none() {
                             "工作目录不存在或无法读取，尚无可复用的已验证归属。".into()
-                        } else if real.as_deref().is_some_and(has_git_marker) {
+                        } else if *git_marker {
                             "检测到 Git 工作区，但无法验证仓库身份；保持未归属。".into()
                         } else {
                             "工作目录不属于已选择的非 Git 项目；请选择其真实根目录。".into()

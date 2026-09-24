@@ -900,6 +900,9 @@ pub struct RelationCandidate {
 #[serde(rename_all = "camelCase")]
 pub struct CandidatePreview {
     pub project_id: String,
+    /// Digest of project metadata and complete history revisions used to build this view.
+    #[serde(default)]
+    pub input_version: String,
     pub thread_count: u64,
     #[serde(default)]
     pub unavailable_threads: u64,

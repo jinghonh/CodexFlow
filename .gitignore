@@ -9,4 +9,5 @@ docs/*
 !docs/ORCHESTRATOR_PROMPT.md
 !docs/adr/
 !docs/agents/
+!docs/performance/
 .codexflow-orchestration/

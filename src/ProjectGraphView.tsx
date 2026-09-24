@@ -4,7 +4,6 @@ import {
   type NodeProps,
 } from "@xyflow/react";
 import { invoke } from "@tauri-apps/api/core";
-import ELK from "elkjs/lib/elk.bundled.js";
 import "@xyflow/react/dist/style.css";
 
 type GraphNode = { id: string; title: string | null; referenceOnly: boolean };
@@ -31,7 +30,6 @@ type ProjectGraph = { project: { id: string; name: string }; nodes: GraphNode[];
 type GraphNodeData = { title: string; id: string; referenceOnly: boolean };
 type Selection = { type: "node" | "edge"; id: string } | null;
 
-const elk = new ELK();
 const nodeWidth = 224;
 const nodeHeight = 82;
 const endpointText: Record<Relation["parentEndpoint"], string> = {
@@ -110,35 +108,8 @@ function filteredGraph(graph: ProjectGraph, visibleThreadIds: Set<string> | unde
   };
 }
 
-async function layoutGraph(graph: ProjectGraph): Promise<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }> {
+function graphEdges(graph: ProjectGraph): Edge[] {
   const visibleRelations = graph.inferredRelations ?? [];
-  let coordinates = new Map<string, { x?: number; y?: number }>();
-  let warning = "";
-  try {
-    const result = await elk.layout({
-      id: "project",
-      layoutOptions: {
-        "elk.algorithm": "layered",
-        "elk.direction": "RIGHT",
-        "elk.spacing.nodeNode": "58",
-        "elk.layered.spacing.nodeNodeBetweenLayers": "105",
-      },
-      children: graph.nodes.map((node) => ({ id: node.id, width: nodeWidth, height: nodeHeight })),
-      edges: [...graph.relations, ...(graph.derivedRelations ?? []), ...visibleRelations].map((relation) => ({
-        id: relation.id, sources: [relation.fromThreadId], targets: [relation.toThreadId],
-      })),
-    });
-    coordinates = new Map(result.children?.map((node) => [node.id, node]));
-  } catch {
-    warning = "自动布局未完成，已按固定顺序展示全部会话和关系。";
-  }
-  const nodes: Node<GraphNodeData>[] = graph.nodes.map((node, index) => ({
-    id: node.id,
-    type: "thread",
-    position: { x: coordinates.get(node.id)?.x ?? (index % 4) * 320, y: coordinates.get(node.id)?.y ?? Math.floor(index / 4) * 150 },
-    data: { title: node.title || node.id, id: node.id, referenceOnly: node.referenceOnly },
-    draggable: false,
-  }));
   const edges: Edge[] = graph.relations.map((relation) => {
     const fork = relation.kind === "FORKED_FROM";
     const color = fork ? "#287047" : "#456d9a";
@@ -177,7 +148,72 @@ async function layoutGraph(graph: ProjectGraph): Promise<{ nodes: Node<GraphNode
       ...(["RELATED", "ALTERNATIVE_TO"].includes(relation.kind) ? {} : { markerEnd: { type: MarkerType.ArrowClosed, color } }),
     });
   }
-  return { nodes, edges, warning };
+  return edges;
+}
+
+async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }> {
+  const visibleRelations = graph.inferredRelations ?? [];
+  let coordinates = new Map<string, { x?: number; y?: number }>();
+  let warning = "";
+  try {
+    const nodes = graph.nodes.map((node) => node.id);
+    const allEdges = [...graph.relations, ...(graph.derivedRelations ?? []), ...visibleRelations].map((relation) => ({
+      id: relation.id, source: relation.fromThreadId, target: relation.toThreadId,
+    }));
+    // Dense cyclic graphs can make layered layout take tens of seconds. Use a
+    // source-prioritized spanning forest for positions and paint every edge.
+    const parent = new Map(nodes.map((id) => [id, id]));
+    const root = (id: string): string => {
+      let current = id;
+      while (parent.get(current) !== current) current = parent.get(current)!;
+      return current;
+    };
+    const edges = allEdges.filter((edge) => {
+      if (!parent.has(edge.source) || !parent.has(edge.target)) return false;
+      const left = root(edge.source);
+      const right = root(edge.target);
+      if (left === right) return false;
+      parent.set(right, left);
+      return true;
+    });
+    if (typeof Worker === "undefined") {
+      const { default: ELK } = await import("elkjs/lib/elk.bundled.js");
+      const result = await new ELK().layout({
+        id: "project",
+        layoutOptions: { "elk.algorithm": "layered", "elk.direction": "RIGHT",
+          "elk.spacing.nodeNode": "58", "elk.layered.spacing.nodeNodeBetweenLayers": "105" },
+        children: nodes.map((id) => ({ id, width: nodeWidth, height: nodeHeight })),
+        edges: edges.map(({ id, source, target }) => ({ id, sources: [source], targets: [target] })),
+      });
+      coordinates = new Map(result.children?.map((node) => [node.id, node]));
+    } else {
+      const positions = await new Promise<{ id: string; x?: number; y?: number }[]>((resolve, reject) => {
+        const worker = new Worker(new URL("./graphLayout.worker.ts", import.meta.url), { type: "module" });
+        const abort = () => { worker.terminate(); reject(new Error("布局已取消")); };
+        if (signal?.aborted) { abort(); return; }
+        signal?.addEventListener("abort", abort, { once: true });
+        worker.onmessage = (event: MessageEvent<{ positions?: { id: string; x?: number; y?: number }[]; error?: boolean }>) => {
+          signal?.removeEventListener("abort", abort);
+          worker.terminate();
+          if (event.data.error) reject(new Error("布局失败"));
+          else resolve(event.data.positions ?? []);
+        };
+        worker.onerror = () => { signal?.removeEventListener("abort", abort); worker.terminate(); reject(new Error("布局线程失败")); };
+        worker.postMessage({ nodes, edges });
+      });
+      coordinates = new Map(positions.map((node) => [node.id, node]));
+    }
+  } catch {
+    warning = "自动布局未完成，已按固定顺序展示全部会话和关系。";
+  }
+  const nodes: Node<GraphNodeData>[] = graph.nodes.map((node, index) => ({
+    id: node.id,
+    type: "thread",
+    position: { x: coordinates.get(node.id)?.x ?? (index % 4) * 320, y: coordinates.get(node.id)?.y ?? Math.floor(index / 4) * 150 },
+    data: { title: node.title || node.id, id: node.id, referenceOnly: node.referenceOnly },
+    draggable: false,
+  }));
+  return { nodes, edges: graphEdges(graph), warning };
 }
 
 export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, selectedThreadId = null, onSelectThread, visibleThreadIds, relationSource = "all", onRelationSourceChange, relationKind = "all", onRelationKindChange, minimumConfidence = 0.7, onMinimumConfidenceChange }: { projectId: string; refreshVersion: number;
@@ -213,9 +249,12 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   useEffect(() => {
     if (!graph) return;
     let active = true;
-    layoutGraph(filteredGraph(graph, visibleThreadIds, relationSource, relationKind, threshold))
+    const controller = new AbortController();
+    const filtered = filteredGraph(graph, visibleThreadIds, relationSource, relationKind, threshold);
+    setLayout((current) => ({ ...current, edges: graphEdges(filtered) }));
+    layoutGraph(filtered, controller.signal)
       .then((positioned) => { if (active) setLayout(positioned); });
-    return () => { active = false; };
+    return () => { active = false; controller.abort(); };
   }, [graph, visibleThreadIds, relationSource, relationKind, threshold]);
 
   const detail = useMemo(() => {

@@ -262,28 +262,37 @@ fn get_project_sessions(
 }
 
 #[tauri::command]
-fn query_project_threads(
+async fn query_project_threads(
     state: tauri::State<'_, AppState>,
     project_id: String,
     query: ProjectThreadQuery,
 ) -> Result<ProjectThreadQueryResult, AppError> {
-    service(&state)?.query_project_threads(&project_id, query)
+    let service = service(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || service.query_project_threads(&project_id, query))
+        .await
+        .map_err(|_| AppError::store("后台会话查询失败。"))?
 }
 
 #[tauri::command]
-fn get_project_graph(
+async fn get_project_graph(
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<ProjectGraph, AppError> {
-    service(&state)?.project_graph(&project_id)
+    let service = service(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || service.project_graph(&project_id))
+        .await
+        .map_err(|_| AppError::store("后台关系图查询失败。"))?
 }
 
 #[tauri::command]
-fn get_project_workstreams(
+async fn get_project_workstreams(
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<ProjectWorkstreams, AppError> {
-    service(&state)?.project_workstreams(&project_id)
+    let service = service(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || service.project_workstreams(&project_id))
+        .await
+        .map_err(|_| AppError::store("后台工作流查询失败。"))?
 }
 
 #[tauri::command]
@@ -352,11 +361,14 @@ fn decide_inferred_relation(
 }
 
 #[tauri::command]
-fn get_candidate_preview(
+async fn get_candidate_preview(
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<CandidatePreview, AppError> {
-    service(&state)?.candidate_preview(&project_id)
+    let service = service(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || service.candidate_preview(&project_id))
+        .await
+        .map_err(|_| AppError::store("后台候选查询失败。"))?
 }
 
 #[tauri::command]
@@ -434,11 +446,14 @@ async fn continue_analysis_run(
 }
 
 #[tauri::command]
-fn get_project_timeline(
+async fn get_project_timeline(
     state: tauri::State<'_, AppState>,
     project_id: String,
 ) -> Result<ProjectTimeline, AppError> {
-    service(&state)?.project_timeline(&project_id)
+    let service = service(&state)?.clone();
+    tauri::async_runtime::spawn_blocking(move || service.project_timeline(&project_id))
+        .await
+        .map_err(|_| AppError::store("后台时间线查询失败。"))?
 }
 
 #[tauri::command]

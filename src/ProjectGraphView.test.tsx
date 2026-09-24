@@ -4,11 +4,12 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectGraphView } from "./ProjectGraphView";
 
-const layoutControl = vi.hoisted(() => ({ fail: false }));
+const layoutControl = vi.hoisted(() => ({ fail: false, edgeCount: 0 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("elkjs/lib/elk.bundled.js", () => ({
   default: class {
-    async layout(graph: { children: { id: string }[] }) {
+    async layout(graph: { children: { id: string }[]; edges: unknown[] }) {
+      layoutControl.edgeCount = graph.edges.length;
       if (layoutControl.fail) throw new Error("布局失败");
       return { children: graph.children.map((node, index) => ({ ...node, x: index * 300, y: 0 })) };
     }
@@ -34,7 +35,21 @@ vi.mock("@xyflow/react", () => ({
   </div>,
 }));
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); layoutControl.fail = false; });
+afterEach(() => { cleanup(); vi.clearAllMocks(); layoutControl.fail = false; layoutControl.edgeCount = 0; });
+
+test("密集关系使用结构骨架定位且保留全部可见关系", async () => {
+  const edge = (id: string, fromThreadId: string, toThreadId: string) => ({
+    id, projectId: "project", fromThreadId, toThreadId, kind: "FORKED_FROM",
+    source: "observed", sourceField: "forkedFromId", confidence: 1,
+    parentEndpoint: "inProject",
+  });
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: ["a", "b", "c"].map((id) => ({ id, title: id, referenceOnly: false })),
+    relations: [edge("ab", "a", "b"), edge("bc", "b", "c"), edge("ca", "c", "a")], diagnostics: [] });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  await waitFor(() => expect(document.querySelectorAll("[data-source]")).toHaveLength(3));
+  expect(layoutControl.edgeCount).toBe(2);
+});
 
 test("固定项目图展示来源方向、双关系、缺失端点诊断和选择详情", async () => {
   vi.mocked(invoke).mockResolvedValue({

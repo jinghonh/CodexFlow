@@ -2307,6 +2307,59 @@ impl SessionStore {
         .transpose()
     }
 
+    pub fn cached_automatic_candidate_view_if_current(
+        &self,
+        project_id: &str,
+        input_version: &str,
+        expected: &[(String, i64, i64)],
+        fact_rule: &str,
+    ) -> Result<Option<(CandidatePreview, Vec<DerivedRelation>)>, AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始读取候选缓存失败。"))?;
+        for (thread_id, source_updated_at, generation) in expected {
+            let owner: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT project_id FROM thread_attributions WHERE thread_id=?1",
+                    [thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("检查候选缓存项目归属失败。"))?;
+            if owner.flatten().as_deref() != Some(project_id)
+                || !complete_history_at_revision(
+                    &tx,
+                    thread_id,
+                    *source_updated_at,
+                    *generation,
+                    Some(fact_rule),
+                )?
+            {
+                return Ok(None);
+            }
+        }
+        let saved: Option<(String, String)> = tx
+            .query_row(
+                "SELECT preview_json,relations_json FROM automatic_candidate_views WHERE project_id=?1",
+                [project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取候选缓存失败。"))?;
+        let Some((preview_json, relations_json)) = saved else {
+            return Ok(None);
+        };
+        let preview: CandidatePreview =
+            serde_json::from_str(&preview_json).map_err(|_| AppError::store("候选缓存损坏。"))?;
+        if preview.input_version != input_version || !preview.stale_candidates.is_empty() {
+            return Ok(None);
+        }
+        let relations = serde_json::from_str(&relations_json)
+            .map_err(|_| AppError::store("规则关系缓存损坏。"))?;
+        Ok(Some((preview, relations)))
+    }
+
     pub fn replace_automatic_candidates(
         &self,
         preview: &CandidatePreview,
@@ -3201,6 +3254,7 @@ mod tests {
         let store = SessionStore::new(dir.clone()).unwrap();
         let preview = CandidatePreview {
             project_id: "project".into(),
+            input_version: String::new(),
             thread_count: 2,
             unavailable_threads: 0,
             neighbor_limit: 10,
@@ -3237,6 +3291,30 @@ mod tests {
                 .len(),
             1
         );
+        assert!(store
+            .cached_automatic_candidate_view_if_current("project", "v1", &[], "rule")
+            .unwrap()
+            .is_none());
+        let mut current = preview.clone();
+        current.input_version = "v1".into();
+        store.replace_automatic_candidates(&current, &[]).unwrap();
+        assert!(store
+            .cached_automatic_candidate_view_if_current("project", "v1", &[], "rule")
+            .unwrap()
+            .is_some());
+        assert!(store
+            .cached_automatic_candidate_view_if_current("project", "v2", &[], "rule")
+            .unwrap()
+            .is_none());
+        assert!(store
+            .cached_automatic_candidate_view_if_current(
+                "project",
+                "v1",
+                &[("missing".into(), 1, 1)],
+                "rule",
+            )
+            .unwrap()
+            .is_none());
         drop(connection);
         let _ = fs::remove_dir_all(dir);
     }
