@@ -198,6 +198,11 @@ button:disabled { cursor: wait; opacity: .6; }
 .graph-summary { display: flex; flex-wrap: wrap; gap: 8px 20px; border-top: 1px solid var(--line); padding: 13px 0; color: var(--muted); font-size: 11px; }
 .graph-summary strong { color: var(--ink); }
 .graph-confidence-toggle { display: inline-flex; align-items: center; gap: 7px; margin-bottom: 10px; color: var(--ink); font-size: 11px; cursor: pointer; }
+.graph-review-list { display: grid; justify-items: start; gap: 7px; margin: 0 0 12px; padding: 10px; border: 1px solid var(--line); font-size: 11px; }
+.graph-review-list .browse-button { max-width: 100%; overflow-wrap: anywhere; white-space: normal; text-align: left; padding: 7px 10px; }
+.graph-review-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.graph-review-actions .browse-button { padding: 8px 11px; }
+.graph-review-actions .browse-button:disabled { cursor: not-allowed; }
 .graph-layout-warning { padding: 8px 11px; color: var(--red); background: var(--red-soft); font-size: 11px; margin-bottom: 9px; }
 .graph-canvas { height: 520px; border: 1px solid var(--line); background: var(--page); }
 .graph-node { position: relative; width: 224px; height: 82px; padding: 13px 15px; background: var(--paper); border: 1px solid var(--green); border-radius: 6px; box-shadow: 0 4px 12px #00000013; overflow: visible; }

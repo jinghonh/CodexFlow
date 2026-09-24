@@ -13,7 +13,7 @@ type Run = { id: string; projectId: string; state: "queued" | "running" | "cance
   jevPinnedModel?: string | null; jevProbeAttempts?: number;
   inputTokens: number | null; outputTokens: number | null; processed: number; succeeded: number; failed: number; pending: number;
   interrupted: boolean; error: { message: string } | null; limits: Limits;
-  units: { id: string; state: string; attempts: number; actualModel: string | null; error: { message: string } | null }[] };
+  units: { id: string; stage: Stage["stage"]; state: string; attempts: number; actualModel: string | null; error: { message: string } | null }[] };
 const initialLimits: Limits = { callLimit: 100, concurrencyLimit: 2, timeoutSeconds: 180, retryLimit: 2, inputCharacterLimit: 40000 };
 const stageNames: Record<Stage["stage"], string> = { summary: "会话总结", relation: "候选分类", evidenceSelection: "证据选择", naming: "工作流命名" };
 const stateNames: Record<Run["state"], string> = { queued: "待执行", running: "执行中", cancelling: "取消中", cancelled: "已取消",
@@ -23,14 +23,21 @@ function message(error: unknown): string {
     ? error.message : "分析操作失败。";
 }
 
-export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0 }: {
-  projectId: string; refreshVersion: string; settingsRevision?: number;
+export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0, onRelationResultsChanged }: {
+  projectId: string; refreshVersion: string; settingsRevision?: number; onRelationResultsChanged?: () => void;
 }) {
   const [limits, setLimits] = useState<Limits>(initialLimits);
   const [previewState, setPreviewState] = useState<{ key: string; value: Preview } | null>(null);
   const [run, setRun] = useState<Run | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const succeededRelationUnits = run?.units
+    .filter((unit) => (unit.stage === "relation" || unit.stage === "evidenceSelection") && unit.state === "succeeded")
+    .map((unit) => unit.id).sort().join("|") || "";
+  const relationResultsRevision = succeededRelationUnits ? `${run?.id}:${succeededRelationUnits}` : "";
+  useEffect(() => {
+    if (relationResultsRevision) onRelationResultsChanged?.();
+  }, [relationResultsRevision, onRelationResultsChanged]);
   const terminalRun = run && ["paused", "cancelled", "complete", "partial", "failed"].includes(run.state)
     ? `${run.id}:${run.state}:${run.totalCalls}:${run.processed}` : "";
   const previewKey = JSON.stringify([projectId, refreshVersion, settingsRevision, limits, terminalRun]);

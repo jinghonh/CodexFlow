@@ -3,8 +3,8 @@ use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AppError, CandidatePreview, DisplayTheme,
     EvidenceCheck, EvidencePage, FactPage, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
     HistoryTurnPage, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
-    ProjectGraph, ProjectSessions, ProjectTimeline, SessionList, SourceStatus,
-    SummaryEvidenceCheck, SummaryPreview, SummaryRun,
+    ProjectGraph, ProjectSessions, ProjectTimeline, RelationReview, SessionList, SourceStatus,
+    SummaryEvidenceCheck, SummaryPreview, SummaryRun, UserRelationDecision,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -269,6 +269,24 @@ fn get_project_graph(
 }
 
 #[tauri::command]
+fn decide_inferred_relation(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+    relation_id: String,
+    decision: UserRelationDecision,
+    expected_revision: u64,
+    expected_evidence_version: Option<String>,
+) -> Result<RelationReview, AppError> {
+    service(&state)?.decide_inferred_relation(
+        &project_id,
+        &relation_id,
+        decision,
+        expected_revision,
+        expected_evidence_version.as_deref(),
+    )
+}
+
+#[tauri::command]
 fn get_candidate_preview(
     state: tauri::State<'_, AppState>,
     project_id: String,
@@ -417,6 +435,7 @@ fn main() {
             get_project_catalog,
             get_project_sessions,
             get_project_graph,
+            decide_inferred_relation,
             get_candidate_preview,
             get_analysis_preview,
             start_project_analysis,

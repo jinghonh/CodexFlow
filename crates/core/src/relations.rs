@@ -113,6 +113,7 @@ pub(crate) fn project_graph(
         relations,
         derived_relations: Vec::new(),
         inferred_relations: Vec::new(),
+        reviewed_relations: Vec::new(),
         inference_outcomes: Vec::new(),
         diagnostics,
     }

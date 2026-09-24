@@ -142,3 +142,89 @@ test("推断关系按置信度隐藏并能查看双侧证据", async () => {
   expect(onSelectEvidence).toHaveBeenCalledWith(expect.objectContaining({ threadId: "thread-b", itemId: "item-thread-b" }));
   expect(screen.getByText(/无关系 1/)).toBeTruthy();
 });
+
+test("确认、拒绝和显式恢复立即更新图边且保留推断来源", async () => {
+  const proof = (id: string, threadId: string) => ({ id, threadId, turnId: "turn", itemId: id, excerpt: "来源摘录", contentVersion: "v1" });
+  const relation = { id: "inferred", projectId: "project", candidateId: "candidate", fromThreadId: "thread-a", toThreadId: "thread-b",
+    kind: "RELATED" as const, source: "jev" as const, requestedModel: "jev-latest", actualModel: "jev-1.13.0", confidence: 0.55,
+    probabilities: {}, evidenceConfidence: 0.9, evidenceProbabilities: {},
+    evidence: { id: "pair", left: proof("left", "thread-a"), right: proof("right", "thread-b") },
+    timeCheck: "unverifiable" as const, explanation: "本地整理的依据", inputVersion: "input-v1" };
+  let decision: "pending" | "confirmed" | "rejected" = "pending";
+  let revision = 0;
+  const graph = () => ({ project: { id: "project", name: "项目" },
+    nodes: [{ id: "thread-a", title: "甲", referenceOnly: false }, { id: "thread-b", title: "乙", referenceOnly: false }],
+    relations: [], derivedRelations: [], diagnostics: [],
+    inferredRelations: decision === "rejected" ? [] : [relation],
+    reviewedRelations: [{ ...relation, evidenceVersion: "evidence-v1", evidenceValid: true,
+      review: { relationId: relation.id, projectId: "project", decision, revision,
+        confirmedEvidenceVersion: decision === "confirmed" ? "evidence-v1" : null } }],
+  });
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "get_project_graph") return graph();
+    if (command === "decide_inferred_relation") {
+      const request = args as { decision: typeof decision; expectedRevision: number; expectedEvidenceVersion: string };
+      expect(request.expectedRevision).toBe(revision);
+      expect(request.expectedEvidenceVersion).toBe("evidence-v1");
+      decision = request.decision;
+      revision += 1;
+      return { relationId: relation.id, decision, revision };
+    }
+    throw new Error(`unexpected command ${command}`);
+  });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  fireEvent.click(await screen.findByRole("checkbox", { name: /低于 0.70/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "推断 · 相关 · 0.55" }));
+  fireEvent.click(screen.getByRole("button", { name: "确认关系" }));
+  expect(await screen.findByText("已确认")).toBeTruthy();
+  fireEvent.click(screen.getByRole("checkbox", { name: /低于 0.70/ }));
+  expect(await screen.findByRole("button", { name: "推断 · 相关 · 0.55" })).toBeTruthy();
+  expect(screen.getByText(/Jev · jev-1.13.0/)).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "拒绝关系" }));
+  expect(await screen.findByText("已拒绝")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "推断 · 相关 · 0.55" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "恢复待裁决" }));
+  expect(await screen.findByText("待裁决")).toBeTruthy();
+  expect(revision).toBe(3);
+});
+
+test("过期证据不能确认，过期写入提示刷新", async () => {
+  const proof = (threadId: string) => ({ id: threadId, threadId, turnId: "turn", itemId: "item", excerpt: "摘录", contentVersion: "old" });
+  const relation = { id: "stale", projectId: "project", candidateId: "candidate", fromThreadId: "a", toThreadId: "b",
+    kind: "FIXES" as const, source: "jev" as const, requestedModel: "jev-latest", actualModel: "jev-1.13.0", confidence: 0.8,
+    probabilities: {}, evidenceConfidence: 0.9, evidenceProbabilities: {}, evidence: { id: "pair", left: proof("a"), right: proof("b") },
+    timeCheck: "verified" as const, explanation: "旧依据", inputVersion: "old" };
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_project_graph") return { project: { id: "project", name: "项目" }, nodes: [], relations: [], diagnostics: [],
+      inferredRelations: [], reviewedRelations: [{ ...relation, evidenceVersion: "old-evidence", evidenceValid: false,
+        review: { relationId: "stale", projectId: "project", decision: "confirmed", revision: 2, confirmedEvidenceVersion: "old-evidence" } }] };
+    if (command === "decide_inferred_relation") throw { code: "CONCURRENT_MODIFICATION", message: "冲突" };
+    throw new Error(`unexpected command ${command}`);
+  });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  fireEvent.click(await screen.findByRole("button", { name: /修复 · 已确认；当前关系未验证或证据已过期/ }));
+  expect(screen.getByRole("button", { name: "确认关系" }).hasAttribute("disabled")).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "恢复待裁决" }));
+  expect(await screen.findByText(/关系裁决已被更新，请刷新关系图后重试/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: "刷新关系图" })).toBeTruthy();
+});
+
+test("旧确认不会让新证据的低分关系默认显示", async () => {
+  const proof = (threadId: string) => ({ id: threadId, threadId, turnId: "turn", itemId: "item", excerpt: "新证据", contentVersion: "new" });
+  const relation = { id: "same-identity", projectId: "project", candidateId: "candidate", fromThreadId: "a", toThreadId: "b",
+    kind: "RELATED" as const, source: "jev" as const, requestedModel: "jev-new", actualModel: "jev-2.0.0", confidence: 0.51,
+    probabilities: {}, evidenceConfidence: 0.9, evidenceProbabilities: {}, evidence: { id: "pair", left: proof("a"), right: proof("b") },
+    timeCheck: "unverifiable" as const, explanation: "新分析", inputVersion: "input-new" };
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: [{ id: "a", title: "甲", referenceOnly: false }, { id: "b", title: "乙", referenceOnly: false }],
+    relations: [], diagnostics: [], inferredRelations: [relation], reviewedRelations: [{ ...relation,
+      evidenceVersion: "new-version", evidenceValid: true, review: { relationId: relation.id, projectId: "project",
+        decision: "confirmed", revision: 1, confirmedEvidenceVersion: "old-version" } }] });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  await screen.findByRole("checkbox", { name: /低于 0.70/ });
+  expect(screen.queryByRole("button", { name: "推断 · 相关 · 0.51" })).toBeNull();
+  fireEvent.click(screen.getByRole("checkbox", { name: /低于 0.70/ }));
+  fireEvent.click(await screen.findByRole("button", { name: "推断 · 相关 · 0.51" }));
+  expect(screen.getByText("已确认；当前证据尚未确认")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "确认关系" }).hasAttribute("disabled")).toBe(false);
+});

@@ -12,7 +12,8 @@ use codexflow_domain::{
     EvidenceCheck, EvidenceField, EvidencePage, EvidenceState, FactPage, HistoryCoverage,
     HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig,
     JevConnectionResult, JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph,
-    ProjectSessions, ProjectTimeline, SessionList, SourceEvidence, SourceStatus,
+    ProjectSessions, ProjectTimeline, RelationReview, ReviewedInferredRelation, SessionList,
+    SourceEvidence, SourceStatus, UserRelationDecision,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -626,38 +627,177 @@ impl SourceService {
         let (preview, derived) = self.automatic_candidates(&sessions)?;
         let mut graph = relations::project_graph(sessions, relations);
         graph.derived_relations = derived;
+        let reviews: std::collections::BTreeMap<_, _> = self
+            .sessions
+            .relation_reviews()?
+            .into_iter()
+            .map(|(review, snapshot)| (review.relation_id.clone(), (review, snapshot)))
+            .collect();
+        let mut reviewed = std::collections::BTreeMap::new();
         for result in self.sessions.inferred_pair_outcomes(project_id)? {
-            if let Some(candidate) = preview
+            let candidate = preview
                 .candidates
                 .iter()
-                .find(|candidate| candidate.id == result.candidate_id)
-            {
-                if inferred::candidate_version(self, candidate)? == result.input_version {
-                    for relation in &result.relations {
-                        if relation.input_version == result.input_version
-                            && relation.from_thread_id != relation.to_thread_id
-                            && relation.source == "jev"
-                            && [
-                                relation.from_thread_id.as_str(),
-                                relation.to_thread_id.as_str(),
-                            ]
-                            .iter()
-                            .all(|id| {
-                                *id == candidate.left_thread_id || *id == candidate.right_thread_id
-                            })
-                            && candidate.evidence.pairs.contains(&relation.evidence)
-                            && (0.0..=1.0).contains(&relation.confidence)
-                            && inferred::valid_evidence(self, project_id, &relation.evidence.left)?
-                            && inferred::valid_evidence(self, project_id, &relation.evidence.right)?
-                        {
-                            graph.inferred_relations.push(relation.clone());
-                        }
-                    }
-                    graph.inference_outcomes.push(result);
+                .find(|candidate| candidate.id == result.candidate_id);
+            let current = if let Some(candidate) = candidate {
+                inferred::candidate_version(self, candidate)? == result.input_version
+            } else {
+                false
+            };
+            for relation in &result.relations {
+                if relation.project_id != project_id
+                    || relation.source != "jev"
+                    || relation.from_thread_id == relation.to_thread_id
+                {
+                    continue;
                 }
+                let mut relation = relation.clone();
+                relation.id = inferred::relation_id(
+                    &relation.from_thread_id,
+                    &relation.to_thread_id,
+                    relation.kind,
+                );
+                let evidence_version = inferred::evidence_version(&relation.evidence)?;
+                let review = reviews
+                    .get(&relation.id)
+                    .map(|(review, _)| review.clone())
+                    .unwrap_or(RelationReview {
+                        relation_id: relation.id.clone(),
+                        project_id: project_id.into(),
+                        decision: UserRelationDecision::Pending,
+                        revision: 0,
+                        confirmed_evidence_version: None,
+                    });
+                let valid = if let Some(candidate) = candidate {
+                    current
+                        && relation.input_version == result.input_version
+                        && relation.from_thread_id != relation.to_thread_id
+                        && [
+                            relation.from_thread_id.as_str(),
+                            relation.to_thread_id.as_str(),
+                        ]
+                        .iter()
+                        .all(|id| {
+                            *id == candidate.left_thread_id || *id == candidate.right_thread_id
+                        })
+                        && candidate.evidence.pairs.contains(&relation.evidence)
+                        && (0.0..=1.0).contains(&relation.confidence)
+                        && inferred::valid_evidence(self, project_id, &relation.evidence.left)?
+                        && inferred::valid_evidence(self, project_id, &relation.evidence.right)?
+                } else {
+                    false
+                };
+                let entry = ReviewedInferredRelation {
+                    relation,
+                    evidence_version,
+                    evidence_valid: valid,
+                    review,
+                };
+                if !reviewed
+                    .get(&entry.relation.id)
+                    .is_some_and(|old: &ReviewedInferredRelation| old.evidence_valid)
+                {
+                    reviewed.insert(entry.relation.id.clone(), entry);
+                }
+            }
+            if current {
+                graph.inference_outcomes.push(result);
+            }
+        }
+        for (relation_id, (review, snapshot)) in reviews {
+            if reviewed.contains_key(&relation_id) {
+                continue;
+            }
+            let Some(mut relation) = snapshot else {
+                continue;
+            };
+            if relation.source != "jev"
+                || relation.from_thread_id == relation.to_thread_id
+                || inferred::relation_id(
+                    &relation.from_thread_id,
+                    &relation.to_thread_id,
+                    relation.kind,
+                ) != relation_id
+                || self
+                    .sessions
+                    .thread_project_id(&relation.from_thread_id)?
+                    .as_deref()
+                    != Some(project_id)
+                || self
+                    .sessions
+                    .thread_project_id(&relation.to_thread_id)?
+                    .as_deref()
+                    != Some(project_id)
+            {
+                continue;
+            }
+            relation.id = relation_id.clone();
+            relation.project_id = project_id.into();
+            let evidence_version = inferred::evidence_version(&relation.evidence)?;
+            reviewed.insert(
+                relation_id,
+                ReviewedInferredRelation {
+                    relation,
+                    evidence_version,
+                    evidence_valid: false,
+                    review,
+                },
+            );
+        }
+        graph.reviewed_relations = reviewed.into_values().collect();
+        for entry in &graph.reviewed_relations {
+            if entry.evidence_valid && entry.review.decision != UserRelationDecision::Rejected {
+                graph.inferred_relations.push(entry.relation.clone());
             }
         }
         Ok(graph)
+    }
+
+    pub fn decide_inferred_relation(
+        &self,
+        project_id: &str,
+        relation_id: &str,
+        decision: UserRelationDecision,
+        expected_revision: u64,
+        expected_evidence_version: Option<&str>,
+    ) -> Result<RelationReview, AppError> {
+        let graph = self.project_graph(project_id)?;
+        let relation = graph
+            .reviewed_relations
+            .iter()
+            .find(|entry| entry.relation.id == relation_id)
+            .ok_or_else(|| AppError {
+                code: ErrorCode::AnalysisInvalidResult,
+                message: "找不到该推断关系，请刷新项目关系图。".into(),
+                retryable: true,
+                cache_preserved: true,
+                backend: "core".into(),
+                retry_after_ms: None,
+            })?;
+        if decision == UserRelationDecision::Confirmed {
+            if expected_evidence_version != Some(relation.evidence_version.as_str()) {
+                return Err(AppError::conflict());
+            }
+            if !relation.evidence_valid {
+                return Err(AppError {
+                    code: ErrorCode::AnalysisInvalidResult,
+                    message: "关系证据已过期，请刷新并重新检查证据。".into(),
+                    retryable: true,
+                    cache_preserved: true,
+                    backend: "core".into(),
+                    retry_after_ms: None,
+                });
+            }
+        }
+        self.sessions.save_relation_review(
+            project_id,
+            relation_id,
+            decision,
+            (decision == UserRelationDecision::Confirmed)
+                .then_some(relation.evidence_version.as_str()),
+            expected_revision,
+            Some(&relation.relation),
+        )
     }
 
     fn automatic_candidates(

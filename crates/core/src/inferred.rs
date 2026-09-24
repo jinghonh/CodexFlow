@@ -15,6 +15,31 @@ fn stable_id(parts: &[&str]) -> String {
     format!("inferred:{:x}", hash.finalize())
 }
 
+pub(crate) fn relation_id(
+    from: &str,
+    to: &str,
+    kind: codexflow_domain::InferredRelationKind,
+) -> String {
+    let (from, to) = if !kind.directed() && from > to {
+        (to, from)
+    } else {
+        (from, to)
+    };
+    stable_id(&["inferred", from, to, kind.as_str()])
+}
+
+pub(crate) fn evidence_version(pair: &EvidencePair) -> Result<String, AppError> {
+    let mut sides = [&pair.left, &pair.right];
+    sides.sort_by(|a, b| (&a.thread_id, &a.id).cmp(&(&b.thread_id, &b.id)));
+    let mut hash = Sha256::new();
+    for side in sides {
+        let data = serde_json::to_vec(side).map_err(|_| AppError::store("证据版本计算失败。"))?;
+        hash.update((data.len() as u64).to_be_bytes());
+        hash.update(data);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
 pub(crate) fn candidate_version(
     service: &SourceService,
     candidate: &RelationCandidate,
@@ -226,7 +251,7 @@ pub(crate) fn outcome(
                 (&candidate.right_thread_id, &candidate.left_thread_id)
             };
             relations.push(InferredRelation {
-                id: stable_id(&[project_id, from_id, to_id, choice.kind.as_str()]),
+                id: relation_id(from_id, to_id, choice.kind),
                 project_id: project_id.into(),
                 candidate_id: candidate.id.clone(),
                 from_thread_id: from_id.clone(),
@@ -274,4 +299,30 @@ pub(crate) fn outcome(
         jev_identity: None,
         relations,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codexflow_domain::InferredRelationKind;
+
+    #[test]
+    fn inferred_identity_normalizes_only_symmetric_endpoints() {
+        assert_eq!(
+            relation_id("thread-b", "thread-a", InferredRelationKind::Related),
+            relation_id("thread-a", "thread-b", InferredRelationKind::Related),
+        );
+        assert_eq!(
+            relation_id("thread-b", "thread-a", InferredRelationKind::AlternativeTo),
+            relation_id("thread-a", "thread-b", InferredRelationKind::AlternativeTo),
+        );
+        assert_ne!(
+            relation_id("thread-b", "thread-a", InferredRelationKind::Fixes),
+            relation_id("thread-a", "thread-b", InferredRelationKind::Fixes),
+        );
+        assert_ne!(
+            relation_id("thread-a", "thread-b", InferredRelationKind::Related),
+            relation_id("thread-a", "thread-b", InferredRelationKind::AlternativeTo),
+        );
+    }
 }

@@ -72,6 +72,17 @@ impl AppError {
             retry_after_ms: None,
         }
     }
+
+    pub fn conflict() -> Self {
+        Self {
+            code: ErrorCode::ConcurrentModification,
+            message: "关系裁决已被更新，请刷新后重试。".into(),
+            retryable: true,
+            cache_preserved: true,
+            backend: "store".into(),
+            retry_after_ms: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -113,6 +124,7 @@ pub enum ErrorCode {
     AnalysisAuthenticationFailed,
     AnalysisQuotaExceeded,
     AnalysisOverloaded,
+    ConcurrentModification,
 }
 
 /// A stage is scheduled by core, while its transport remains in its adapter.
@@ -759,6 +771,8 @@ pub struct ProjectGraph {
     #[serde(default)]
     pub inferred_relations: Vec<InferredRelation>,
     #[serde(default)]
+    pub reviewed_relations: Vec<ReviewedInferredRelation>,
+    #[serde(default)]
     pub inference_outcomes: Vec<InferredPairOutcome>,
     pub diagnostics: Vec<GraphDiagnostic>,
 }
@@ -954,6 +968,34 @@ pub struct InferredRelation {
     pub time_check: CausalTimeCheck,
     pub explanation: String,
     pub input_version: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UserRelationDecision {
+    Pending,
+    Confirmed,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelationReview {
+    pub relation_id: String,
+    pub project_id: String,
+    pub decision: UserRelationDecision,
+    pub revision: u64,
+    pub confirmed_evidence_version: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewedInferredRelation {
+    #[serde(flatten)]
+    pub relation: InferredRelation,
+    pub evidence_version: String,
+    pub evidence_valid: bool,
+    pub review: RelationReview,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

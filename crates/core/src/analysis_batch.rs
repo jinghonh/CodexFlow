@@ -2804,6 +2804,138 @@ mod tests {
                 && item.from_thread_id == candidate.left_thread_id));
         assert_eq!(valid.relations[0].evidence_confidence, 0.91);
         service.sessions.save_inferred_pair_outcome(&valid).unwrap();
+        let initial = service.project_graph("project-test").unwrap();
+        let reviewed = &initial.reviewed_relations[0];
+        assert_eq!(reviewed.review.revision, 0);
+        let relation_id = reviewed.relation.id.clone();
+        let evidence_version = reviewed.evidence_version.clone();
+        assert!(matches!(
+            service.decide_inferred_relation(
+                "project-test",
+                "observed-or-manual-id",
+                codexflow_domain::UserRelationDecision::Confirmed,
+                0,
+                Some(&evidence_version)
+            ),
+            Err(AppError {
+                code: ErrorCode::AnalysisInvalidResult,
+                ..
+            })
+        ));
+        assert!(matches!(
+            service.decide_inferred_relation(
+                "project-test",
+                &relation_id,
+                codexflow_domain::UserRelationDecision::Confirmed,
+                0,
+                Some("older-evidence")
+            ),
+            Err(AppError {
+                code: ErrorCode::ConcurrentModification,
+                ..
+            })
+        ));
+        let confirmed = service
+            .decide_inferred_relation(
+                "project-test",
+                &relation_id,
+                codexflow_domain::UserRelationDecision::Confirmed,
+                0,
+                Some(&evidence_version),
+            )
+            .unwrap();
+        assert_eq!(confirmed.revision, 1);
+        assert_eq!(
+            confirmed.confirmed_evidence_version.as_deref(),
+            Some(evidence_version.as_str())
+        );
+        assert_eq!(
+            service
+                .project_graph("project-test")
+                .unwrap()
+                .inferred_relations
+                .len(),
+            1
+        );
+        assert!(matches!(
+            service.decide_inferred_relation(
+                "project-test",
+                &relation_id,
+                codexflow_domain::UserRelationDecision::Rejected,
+                0,
+                None
+            ),
+            Err(AppError {
+                code: ErrorCode::ConcurrentModification,
+                ..
+            })
+        ));
+        let mut rerun = valid.clone();
+        rerun.relations[0].actual_model = "jev-2.0.0".into();
+        rerun.relations[0].requested_model = "jev-other".into();
+        service.sessions.save_inferred_pair_outcome(&rerun).unwrap();
+        assert_eq!(
+            service
+                .project_graph("project-test")
+                .unwrap()
+                .reviewed_relations[0]
+                .relation
+                .id,
+            relation_id
+        );
+        let rejected = service
+            .decide_inferred_relation(
+                "project-test",
+                &relation_id,
+                codexflow_domain::UserRelationDecision::Rejected,
+                1,
+                None,
+            )
+            .unwrap();
+        assert_eq!(rejected.revision, 2);
+        service.sessions.save_inferred_pair_outcome(&valid).unwrap();
+        let rejected_graph = service.project_graph("project-test").unwrap();
+        assert!(rejected_graph.inferred_relations.is_empty());
+        assert_eq!(
+            rejected_graph.reviewed_relations[0].review.decision,
+            codexflow_domain::UserRelationDecision::Rejected
+        );
+        service.sessions.save_inferred_pair_outcome(&none).unwrap();
+        let absent = service.project_graph("project-test").unwrap();
+        assert!(absent.inferred_relations.is_empty());
+        assert!(!absent.reviewed_relations[0].evidence_valid);
+        assert_eq!(absent.reviewed_relations[0].relation.id, relation_id);
+        let reopened_review = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
+        assert!(reopened_review
+            .project_graph("project-test")
+            .unwrap()
+            .inferred_relations
+            .is_empty());
+        drop(reopened_review);
+        let restored = service
+            .decide_inferred_relation(
+                "project-test",
+                &relation_id,
+                codexflow_domain::UserRelationDecision::Pending,
+                2,
+                None,
+            )
+            .unwrap();
+        assert_eq!(restored.revision, 3);
+        service.sessions.save_inferred_pair_outcome(&valid).unwrap();
+        service
+            .decide_inferred_relation(
+                "project-test",
+                &relation_id,
+                codexflow_domain::UserRelationDecision::Confirmed,
+                3,
+                Some(&evidence_version),
+            )
+            .unwrap();
         assert_eq!(
             service
                 .project_graph("project-test")
@@ -2868,6 +3000,25 @@ mod tests {
             .unwrap()
             .inferred_relations
             .is_empty());
+        let stale = service.project_graph("project-test").unwrap();
+        assert!(!stale.reviewed_relations[0].evidence_valid);
+        assert_eq!(
+            stale.reviewed_relations[0].review.decision,
+            codexflow_domain::UserRelationDecision::Confirmed
+        );
+        assert!(matches!(
+            service.decide_inferred_relation(
+                "project-test",
+                &relation_id,
+                codexflow_domain::UserRelationDecision::Confirmed,
+                4,
+                Some(&evidence_version)
+            ),
+            Err(AppError {
+                code: ErrorCode::AnalysisInvalidResult,
+                ..
+            })
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

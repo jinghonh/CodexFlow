@@ -2,16 +2,17 @@ use codexflow_domain::{
     AnalysisRun, AnalysisRunState, AnalysisUnitState, AppError, AttributedThread, CandidatePreview,
     DerivedRelation, EvidencePage, FactPage, HistoryCoverage, HistoryItem, HistoryItemLocation,
     HistoryItemPage, HistorySnapshot, HistoryTurn, HistoryTurnPage, IndexRun, IndexRunState,
-    InferredPairOutcome, ListScopeStatus, LocalProject, ObservedRelation, Preferences,
-    ProjectCatalog, ProjectSessions, SessionList, SourceEvidence, SourceFact, SummaryRun,
-    SummaryRunState, ThreadAttribution, ThreadMetadata, ThreadSummary,
+    InferredPairOutcome, InferredRelation, ListScopeStatus, LocalProject, ObservedRelation,
+    Preferences, ProjectCatalog, ProjectSessions, RelationReview, SessionList, SourceEvidence,
+    SourceFact, SummaryRun, SummaryRunState, ThreadAttribution, ThreadMetadata, ThreadSummary,
+    UserRelationDecision,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{
     fs,
     io::Write,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub struct PreferenceStore {
@@ -119,7 +120,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 11 {
+        if version > 12 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -389,6 +390,28 @@ impl SessionStore {
                 )
                 .map_err(|_| AppError::migration("迁移推断关系数据库失败，原数据已保留。"))?;
         }
+        if version < 12 {
+            let transaction = connection
+                .transaction()
+                .map_err(|_| AppError::migration("开始关系裁决数据库迁移失败。"))?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS relation_reviews (
+                    relation_id TEXT PRIMARY KEY NOT NULL,
+                    project_id TEXT NOT NULL,
+                    decision TEXT NOT NULL CHECK(decision IN ('pending','confirmed','rejected')),
+                    revision INTEGER NOT NULL,
+                    confirmed_evidence_version TEXT,
+                    relation_json TEXT
+                );
+                CREATE INDEX IF NOT EXISTS relation_reviews_project ON relation_reviews(project_id);
+                PRAGMA user_version = 12;",
+                )
+                .map_err(|_| AppError::migration("迁移关系裁决数据库失败，原数据已保留。"))?;
+            transaction
+                .commit()
+                .map_err(|_| AppError::migration("提交关系裁决数据库迁移失败，原数据已保留。"))?;
+        }
         store.recover_interrupted_runs()?;
         store.recover_interrupted_summary_runs()?;
         store.recover_interrupted_analysis_runs()?;
@@ -396,8 +419,12 @@ impl SessionStore {
     }
 
     fn connection(&self) -> Result<Connection, AppError> {
-        Connection::open(&self.path)
-            .map_err(|_| AppError::store("打开会话数据库失败，请检查应用数据目录。"))
+        let connection = Connection::open(&self.path)
+            .map_err(|_| AppError::store("打开会话数据库失败，请检查应用数据目录。"))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|_| AppError::store("设置会话数据库等待时间失败。"))?;
+        Ok(connection)
     }
 
     pub fn save_analysis_run(&self, run: &AnalysisRun) -> Result<(), AppError> {
@@ -1665,6 +1692,105 @@ impl SessionStore {
         .collect()
     }
 
+    pub fn relation_reviews(
+        &self,
+    ) -> Result<Vec<(RelationReview, Option<InferredRelation>)>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection.prepare(
+            "SELECT relation_id,project_id,decision,revision,confirmed_evidence_version,relation_json FROM relation_reviews ORDER BY relation_id"
+        ).map_err(|_| AppError::store("读取关系裁决失败。"))?;
+        let rows = query
+            .query_map([], |row| {
+                let decision: String = row.get(2)?;
+                let decision = match decision.as_str() {
+                    "confirmed" => UserRelationDecision::Confirmed,
+                    "rejected" => UserRelationDecision::Rejected,
+                    _ => UserRelationDecision::Pending,
+                };
+                Ok((
+                    RelationReview {
+                        relation_id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        decision,
+                        revision: row.get::<_, i64>(3)? as u64,
+                        confirmed_evidence_version: row.get(4)?,
+                    },
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(|_| AppError::store("查询关系裁决失败。"))?;
+        rows.map(|row| {
+            let (review, json) = row.map_err(|_| AppError::store("读取关系裁决失败。"))?;
+            let relation = json
+                .map(|value| {
+                    serde_json::from_str(&value).map_err(|_| AppError::store("关系裁决快照损坏。"))
+                })
+                .transpose()?;
+            Ok((review, relation))
+        })
+        .collect()
+    }
+
+    pub fn save_relation_review(
+        &self,
+        project_id: &str,
+        relation_id: &str,
+        decision: UserRelationDecision,
+        evidence_version: Option<&str>,
+        expected_revision: u64,
+        relation: Option<&InferredRelation>,
+    ) -> Result<RelationReview, AppError> {
+        let relation_json = relation
+            .map(|item| {
+                serde_json::to_string(item).map_err(|_| AppError::store("序列化关系裁决快照失败。"))
+            })
+            .transpose()?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AppError::store("开始保存关系裁决失败。"))?;
+        let current: Option<i64> = transaction
+            .query_row(
+                "SELECT revision FROM relation_reviews WHERE relation_id=?1",
+                [relation_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取关系修订号失败。"))?;
+        if current.unwrap_or(0) != i64::try_from(expected_revision).unwrap_or(-1) {
+            return Err(AppError::conflict());
+        }
+        let revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(AppError::conflict)?;
+        let revision_sql = i64::try_from(revision).map_err(|_| AppError::conflict())?;
+        let status = match decision {
+            UserRelationDecision::Pending => "pending",
+            UserRelationDecision::Confirmed => "confirmed",
+            UserRelationDecision::Rejected => "rejected",
+        };
+        let confirmed_evidence_version = if decision == UserRelationDecision::Confirmed {
+            evidence_version.map(str::to_owned)
+        } else {
+            None
+        };
+        transaction.execute(
+            "INSERT INTO relation_reviews(relation_id,project_id,decision,revision,confirmed_evidence_version,relation_json) VALUES (?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(relation_id) DO UPDATE SET project_id=excluded.project_id,decision=excluded.decision,revision=excluded.revision,confirmed_evidence_version=excluded.confirmed_evidence_version,relation_json=excluded.relation_json",
+            params![relation_id, project_id, status, revision_sql, confirmed_evidence_version, relation_json],
+        ).map_err(|_| AppError::store("保存关系裁决失败。"))?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交关系裁决失败。"))?;
+        Ok(RelationReview {
+            relation_id: relation_id.into(),
+            project_id: project_id.into(),
+            decision,
+            revision,
+            confirmed_evidence_version,
+        })
+    }
+
     pub fn selection(&self) -> Result<(Option<String>, Vec<String>), AppError> {
         let connection = self.connection()?;
         let (selected, recent_json): (Option<String>, String) = connection
@@ -1924,7 +2050,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 12;")
+            .execute_batch("PRAGMA user_version = 13;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -1935,12 +2061,101 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn either_issue_v8_database_upgrades_to_the_complete_v11_schema() {
+    fn relation_review_revision_survives_restart_and_serializes_concurrent_writes() {
+        use std::sync::{Arc, Barrier};
+        let nonce = now_ms();
+        let dir = std::env::temp_dir().join(format!("codexflow-review-{nonce}"));
+        let store = Arc::new(SessionStore::new(dir.clone()).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let handles: Vec<_> = [
+            UserRelationDecision::Confirmed,
+            UserRelationDecision::Rejected,
+        ]
+        .into_iter()
+        .map(|decision| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                store.save_relation_review(
+                    "project",
+                    "inferred:one",
+                    decision,
+                    Some("evidence-v1"),
+                    0,
+                    None,
+                )
+            })
+        })
+        .collect();
+        barrier.wait();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    Err(AppError {
+                        code: ErrorCode::ConcurrentModification,
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+        drop(store);
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        let review = reopened.relation_reviews().unwrap().remove(0).0;
+        assert_eq!(review.revision, 1);
+        assert_eq!(
+            review.confirmed_evidence_version.is_some(),
+            review.decision == UserRelationDecision::Confirmed
+        );
+        let restored = reopened
+            .save_relation_review(
+                "project",
+                "inferred:one",
+                UserRelationDecision::Pending,
+                None,
+                review.revision,
+                None,
+            )
+            .unwrap();
+        assert_eq!(restored.revision, 2);
+        assert_eq!(restored.confirmed_evidence_version, None);
+        assert_eq!(
+            reopened.relation_reviews().unwrap()[0].0.decision,
+            UserRelationDecision::Pending
+        );
+        let moved = reopened
+            .save_relation_review(
+                "another-project",
+                "inferred:one",
+                UserRelationDecision::Rejected,
+                None,
+                restored.revision,
+                None,
+            )
+            .unwrap();
+        assert_eq!(moved.revision, 3);
+        assert_eq!(
+            reopened.relation_reviews().unwrap()[0].0.project_id,
+            "another-project"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn either_issue_v8_database_upgrades_to_the_complete_v12_schema() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1982,13 +2197,14 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 11);
+            assert_eq!(version, 12);
             for table in [
                 "automatic_candidate_views",
                 "thread_summaries",
                 "summary_runs",
                 "analysis_runs",
                 "inferred_pair_outcomes",
+                "relation_reviews",
             ] {
                 let exists: bool = connection
                     .query_row(
@@ -2335,7 +2551,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2396,7 +2612,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -2557,7 +2773,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (11, 1));
+        assert_eq!((version, count), (12, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2590,7 +2806,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, 12);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2693,7 +2909,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 11);
+            assert_eq!(version, 12);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

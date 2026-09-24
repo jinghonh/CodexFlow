@@ -21,6 +21,20 @@ const run = { id: "analysis-1", projectId: "project", state: "running", pauseRea
   batchNumber: 1, batchCalls: 1, totalCalls: 1, totalQuestions: 0, inputTokens: null, outputTokens: null,
   processed: 0, succeeded: 0, failed: 0, pending: 2, interrupted: false, error: null, limits, units: [] };
 
+test("已保存的关系分析结果通知项目图刷新", async () => {
+  const onRelationResultsChanged = vi.fn();
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") return preview;
+    if (command === "get_latest_analysis_run") return { ...run, state: "complete", units: [
+      { id: "summary-1", stage: "summary", state: "succeeded", attempts: 1, actualModel: "codex", error: null },
+      { id: "relation-1", stage: "relation", state: "succeeded", attempts: 1, actualModel: "jev", error: null },
+    ] };
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ProjectAnalysisView projectId="project" refreshVersion="1" onRelationResultsChanged={onRelationResultsChanged} />);
+  await waitFor(() => expect(onRelationResultsChanged).toHaveBeenCalledTimes(1));
+});
+
 test("预览明确未配置阶段，手动启动后可暂停和继续", async () => {
   vi.mocked(invoke).mockImplementation(async (command) => {
     if (command === "get_analysis_preview") return preview;
