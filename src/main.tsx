@@ -35,6 +35,8 @@ type SourceStatus = {
 };
 type Settings = { theme: Theme; source: SourceStatus };
 type JevStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean; credentialError: AppError | null };
+type TextStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean; credentialError: AppError | null };
+type TextValidation = { requestedModel: string; actualModel: string; reply: string };
 type JevConnectionResult = { models: string[]; requestedModel: string };
 type JevInferenceResult = {
   requestedModel: string;
@@ -70,8 +72,6 @@ const labels: { key: keyof SourceStatus["capabilities"]; title: string; number: 
   { key: "metadata", title: "会话元数据", number: "01" },
   { key: "history", title: "历史读取", number: "02" },
   { key: "experimentalHistory", title: "实验性分页", number: "03" },
-  { key: "codexSummary", title: "Codex 总结", number: "04" },
-  { key: "codexNaming", title: "工作流命名", number: "05" },
 ];
 
 function errorText(error: unknown): string {
@@ -101,6 +101,15 @@ export function App() {
   const [jevError, setJevError] = useState("");
   const [jevConnection, setJevConnection] = useState<JevConnectionResult | null>(null);
   const [jevInference, setJevInference] = useState<JevInferenceResult | null>(null);
+  const [textStatus, setTextStatus] = useState<TextStatus | null>(null);
+  const [textBaseUrl, setTextBaseUrl] = useState("");
+  const [textModel, setTextModel] = useState("");
+  const [textKey, setTextKey] = useState("");
+  const [textBusy, setTextBusy] = useState(false);
+  const [textValidating, setTextValidating] = useState(false);
+  const [textError, setTextError] = useState("");
+  const [textValidation, setTextValidation] = useState<TextValidation | null>(null);
+  const textEpoch = useRef(0);
   const [analysisSettingsRevision, setAnalysisSettingsRevision] = useState(0);
   const jevEpoch = useRef(0);
   const [listError, setListError] = useState("");
@@ -270,6 +279,13 @@ export function App() {
   }, []);
 
   useEffect(() => {
+    invoke<TextStatus>("get_text_status").then((status) => {
+      setTextStatus(status); setTextBaseUrl(status.config.baseUrl); setTextModel(status.config.model);
+      setAnalysisSettingsRevision((revision) => revision + 1);
+    }).catch((error) => setTextError(errorText(error)));
+  }, []);
+
+  useEffect(() => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
@@ -428,12 +444,55 @@ export function App() {
     } catch (error) { if (epoch === jevEpoch.current) setJevError(errorText(error)); }
   }
 
+  async function saveText() {
+    textEpoch.current += 1; setTextBusy(true); setTextError("");
+    try {
+      const next = await invoke<TextStatus>("save_text_settings", {
+        baseUrl: textBaseUrl, model: textModel, apiKey: textKey || null,
+      });
+      setTextStatus(next); setTextBaseUrl(next.config.baseUrl); setTextModel(next.config.model);
+      setTextKey(""); setTextValidation(null);
+      setAnalysisSettingsRevision((revision) => revision + 1);
+    } catch (error) { setTextError(errorText(error)); }
+    finally { setTextBusy(false); }
+  }
+
+  async function deleteText() {
+    if (!window.confirm("删除钥匙串中的文本服务 API Key？已有结果会保留。")) return;
+    textEpoch.current += 1; setTextBusy(true); setTextError("");
+    try {
+      setTextStatus(await invoke<TextStatus>("delete_text_credential"));
+      setTextKey(""); setTextValidation(null);
+      setAnalysisSettingsRevision((revision) => revision + 1);
+    } catch (error) { setTextError(errorText(error)); }
+    finally { setTextBusy(false); }
+  }
+
+  async function validateText() {
+    const epoch = textEpoch.current; setTextValidating(true); setTextError(""); setTextValidation(null);
+    try {
+      const result = await invoke<TextValidation>("validate_text_settings");
+      if (epoch === textEpoch.current) setTextValidation(result);
+    } catch (error) { if (epoch === textEpoch.current) setTextError(errorText(error)); }
+    finally { setTextValidating(false); }
+  }
+
+  async function cancelText() {
+    const epoch = ++textEpoch.current;
+    try {
+      await invoke("cancel_text_request");
+      if (epoch === textEpoch.current) setTextError("本地请求已取消；远端计算或计费可能继续。");
+    } catch (error) { if (epoch === textEpoch.current) setTextError(errorText(error)); }
+  }
+
   const connected = source?.connection === "connected";
   const failed = source?.connection === "failed";
   const checkedAt = source?.checkedAtUnixMs ? new Date(source.checkedAtUnixMs).toLocaleString("zh-CN") : "尚未检查";
   const jevBusy = jevSaving || jevRequestBusy || jevDeleting;
   const jevUnsaved = !jevStatus || jevBaseUrl !== jevStatus.config.baseUrl ||
     jevModel !== jevStatus.config.model || jevKey.length > 0;
+  const textUnsaved = !textStatus || textBaseUrl !== textStatus.config.baseUrl ||
+    textModel !== textStatus.config.model || textKey.length > 0;
   const scopes = projectSessions?.scopes ?? projectCatalog?.scopes ?? [];
   const attempted = scopes.some((scope) => scope.attemptedAtUnixMs !== null);
   const complete = scopes.length === 2 && scopes.every((scope) => scope.complete);
@@ -541,6 +600,29 @@ export function App() {
           {!jevUnsaved && jevInference && <div className="jev-result" role="status"><strong>合成推理已验证</strong><span>判定：{jevInference.answer.choice === "resolved" ? "已处理" : "尚未处理"}；置信度 {(jevInference.answer.confidence * 100).toFixed(1)}%；选项概率：已处理 {(jevInference.answer.probabilities.resolved * 100).toFixed(1)}%、尚未处理 {(jevInference.answer.probabilities.unresolved * 100).toFixed(1)}%。实际模型：{jevInference.actualModel}；输入 {jevInference.inputTokens}，输出 {jevInference.outputTokens} 个令牌。</span></div>}
         </section>
 
+        <section className="panel jev-panel" aria-label="文本生成服务设置">
+          <div className="panel-kicker">04 / 总结与命名服务</div>
+          <h2>文本模型连接设置</h2>
+          <p className="panel-intro">会话总结和工作流命名共用此服务。验证只发送固定合成文字；项目历史仅在手动启动总结或项目分析后发送。</p>
+          <div className="jev-fields">
+            <label htmlFor="text-url">服务地址<input id="text-url" spellCheck={false} value={textBaseUrl} onChange={(event) => setTextBaseUrl(event.target.value)} placeholder="https://example.com/v1" /></label>
+            <label htmlFor="text-model">模型 ID<input id="text-model" spellCheck={false} value={textModel} onChange={(event) => setTextModel(event.target.value)} placeholder="模型名称" /></label>
+            <label htmlFor="text-key">API Key<input id="text-key" type="password" autoComplete="off" spellCheck={false} value={textKey} onChange={(event) => setTextKey(event.target.value)} placeholder={textStatus?.credentialConfigured ? "已保存；留空保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
+          </div>
+          <p className="jev-key-state">钥匙串：{textStatus?.credentialError ? "暂时无法读取" : textStatus?.credentialConfigured ? "当前地址已配置密钥" : "当前地址未配置密钥"}。更换地址必须填写新密钥。{textUnsaved ? "请先保存修改。" : ""}</p>
+          {textStatus?.credentialError && <p className="page-error" role="alert">{errorText(textStatus.credentialError)}</p>}
+          {textError && <p className="page-error" role="alert">{textError}</p>}
+          <div className="jev-actions">
+            <button className="primary-button" disabled={textBusy || textValidating} onClick={() => void saveText()}>保存设置</button>
+            {textStatus?.credentialError && <button className="browse-button" disabled={textBusy || textValidating} onClick={() => void invoke<TextStatus>("get_text_status").then(setTextStatus).catch((error) => setTextError(errorText(error)))}>重查钥匙串</button>}
+            <button className="browse-button" disabled={textBusy || textValidating || textUnsaved || !textStatus?.credentialConfigured} onClick={() => void validateText()}>验证固定合成推理</button>
+            {textValidating && <button className="plain-button" onClick={() => void cancelText()}>取消请求</button>}
+            <button className="plain-button" disabled={textBusy || textValidating || !textStatus?.credentialConfigured} onClick={() => void deleteText()}>删除密钥</button>
+          </div>
+          <p className="jev-cost-note">验证会发送一段固定合成文字并消耗一次推理调用。取消后远端仍可能计费。</p>
+          {!textUnsaved && textValidation && <div className="jev-result" role="status"><strong>合成推理已验证</strong><span>请求模型：{textValidation.requestedModel}；实际模型：{textValidation.actualModel}；回复：{textValidation.reply}</span></div>}
+        </section>
+
         <section className="footer-panel"><div><div className="panel-kicker">显示偏好</div><h3>界面外观</h3></div><div className="theme-picker" role="group" aria-label="界面外观">{(["system", "light", "dark"] as const).map((value) => <button key={value} className={theme === value ? "selected" : ""} onClick={() => changeTheme(value)}>{value === "system" ? "跟随系统" : value === "light" ? "浅色" : "深色"}</button>)}</div><small>保存于应用管理的本机用户数据目录</small></section>
         <section id="projects" className="panel project-panel">
           <div className="panel-kicker">02 / 本地项目</div><h2>选择项目</h2>
@@ -576,11 +658,11 @@ export function App() {
         {!showUnassigned && projectSessions && <div className="project-view-switch" role="group" aria-label="项目视图"><button aria-pressed={viewMode === "timeline"} onClick={() => setViewMode("timeline")}>时间线</button><button aria-pressed={viewMode === "graph"} onClick={() => setViewMode("graph")}>关系图</button></div>}
         {!showUnassigned && projectSessions && viewMode === "timeline" && <ProjectTimelineView key={projectSessions.project.id} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} connected={connected} onSelectThread={setSelectedThreadId} selectedThreadId={selectedThreadId} visibleThreadIds={visibleIds} workstreams={workstreams?.workstreams ?? []} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />}
         {selectedThread && selectedAttribution && projectSessions && !showUnassigned && <ProjectThreadDetailsView projectId={projectSessions.project.id} thread={selectedThread} attribution={selectedAttribution} refreshVersion={graphVersion} hidden={selectionHidden} onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} relationSource={relationSource} relationKind={relationKind} minimumConfidence={minimumConfidence} />}
-        {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} locationRequest={evidenceLocation} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />}
+        {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} settingsRevision={analysisSettingsRevision} locationRequest={evidenceLocation} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />}
         {!showUnassigned && projectSessions && viewMode === "graph" && <ProjectGraphView projectId={projectSessions.project.id} refreshVersion={graphVersion} onSelectEvidence={selectEvidence} selectedThreadId={selectedThreadId} onSelectThread={setSelectedThreadId} visibleThreadIds={visibleIds} relationSource={relationSource} onRelationSourceChange={setRelationSource} relationKind={relationKind} onRelationKindChange={setRelationKind} minimumConfidence={minimumConfidence} onMinimumConfidenceChange={setMinimumConfidence} />}
         {!showUnassigned && projectSessions && <CandidatePreviewView projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} onSelectEvidence={selectEvidence} />}
         {!showUnassigned && projectSessions && <ProjectAnalysisView projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} onRelationResultsChanged={refreshGraphForAnalysis} />}
-        <p className="disclaimer">连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。Jev 连接检查不运行推理；只有点击“测试固定合成推理”才会发起该次模型调用。</p>
+        <p className="disclaimer">来源连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。文本服务验证和 Jev 合成测试只发送固定合成材料，只有手动操作才会发起模型调用。</p>
       </div>
     </main>
   </div>;

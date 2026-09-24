@@ -305,6 +305,7 @@ mod tests {
             evidence_refs: vec![],
             model: "test".into(),
             requested_model: None,
+            service_base_url: None,
             binary_path: None,
             binary_fingerprint: None,
             binary_version: None,

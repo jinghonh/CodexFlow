@@ -4,8 +4,8 @@ use codexflow_domain::{
     EvidenceCheck, EvidencePage, FactPage, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
     HistoryTurnPage, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
     ProjectGraph, ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview,
-    SessionList, SourceStatus, SummaryEvidenceCheck, SummaryPreview, SummaryRun,
-    UserRelationDecision,
+    SessionList, SourceStatus, SummaryEvidenceCheck, SummaryPreview, SummaryRun, TextStatus,
+    TextValidation, UserRelationDecision,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -142,6 +142,39 @@ async fn test_jev_inference(
 #[tauri::command]
 async fn cancel_jev_request(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     service(&state)?.cancel_jev().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_text_status(state: tauri::State<'_, AppState>) -> Result<TextStatus, AppError> {
+    Ok(service(&state)?.text_status().await)
+}
+
+#[tauri::command]
+async fn save_text_settings(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<TextStatus, AppError> {
+    service(&state)?.save_text(base_url, model, api_key).await
+}
+
+#[tauri::command]
+async fn delete_text_credential(state: tauri::State<'_, AppState>) -> Result<TextStatus, AppError> {
+    service(&state)?.delete_text_credential().await
+}
+
+#[tauri::command]
+async fn validate_text_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<TextValidation, AppError> {
+    service(&state)?.validate_text().await
+}
+
+#[tauri::command]
+async fn cancel_text_request(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    service(&state)?.cancel_text_request().await;
     Ok(())
 }
 
@@ -548,6 +581,11 @@ fn main() {
             check_jev_connection,
             test_jev_inference,
             cancel_jev_request,
+            get_text_status,
+            save_text_settings,
+            delete_text_credential,
+            validate_text_settings,
+            cancel_text_request,
             get_session_list,
             load_thread_history,
             get_summary_preview,

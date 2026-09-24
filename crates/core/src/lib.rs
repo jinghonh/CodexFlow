@@ -6,6 +6,7 @@ mod inferred;
 mod projects;
 mod relations;
 mod summary;
+mod text_settings;
 mod workstreams;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
@@ -18,13 +19,13 @@ use codexflow_domain::{
     SessionList, SourceEvidence, SourceStatus, UserRelationDecision,
 };
 use codexflow_jev::{
-    normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
+    normalize_base_url, system_credentials, system_text_credentials, Credential, CredentialStore,
+    JevClient,
 };
 use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore, WorkstreamChange};
 pub use explorer::{ProjectThreadQuery, ProjectThreadQueryResult};
 use sha2::{Digest, Sha256};
 use std::{
-    io::Read,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -46,11 +47,15 @@ pub struct SourceService {
     preferences: Mutex<Preferences>,
     state: Mutex<State>,
     credentials: Arc<dyn CredentialStore>,
+    text_credentials: Arc<dyn CredentialStore>,
     project_updates: std::sync::Mutex<()>,
     // Invalidates ownership computed from stale source and project snapshots.
     reconciliation_revision: AtomicU64,
     jev_gate: RwLock<()>,
     jev_cancel: Mutex<CancellationToken>,
+    text_gate: RwLock<()>,
+    text_cancel: Mutex<CancellationToken>,
+    text_validation_cancel: Mutex<CancellationToken>,
     refresh_active: std::sync::Mutex<Option<(String, CancellationToken)>>,
     summary_active:
         std::sync::Mutex<std::collections::HashMap<String, (String, CancellationToken)>>,
@@ -59,8 +64,8 @@ pub struct SourceService {
     analysis_update_lock: std::sync::Mutex<()>,
     analysis_clock: Arc<dyn Fn() -> i64 + Send + Sync>,
     model_slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
     analysis_auth_home: Option<PathBuf>,
-    binary_fingerprint_cache: std::sync::Mutex<Option<(String, u64, SystemTime, String)>>,
 }
 
 struct State {
@@ -68,42 +73,43 @@ struct State {
     session: Option<Session>,
 }
 
-impl SourceService {
-    fn binary_fingerprint(&self, path: &str) -> Option<String> {
-        let before = std::fs::metadata(path).ok()?;
-        let modified = before.modified().ok()?;
-        let mut cached = self.binary_fingerprint_cache.lock().unwrap();
-        if let Some((saved_path, size, saved_modified, digest)) = cached.as_ref() {
-            if saved_path == path && *size == before.len() && *saved_modified == modified {
-                return Some(digest.clone());
-            }
-        }
-        let mut file = std::fs::File::open(path).ok()?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer).ok()?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        let after = std::fs::metadata(path).ok()?;
-        if after.len() != before.len() || after.modified().ok()? != modified {
-            return None;
-        }
-        let digest = format!("{:x}", hasher.finalize());
-        *cached = Some((path.to_owned(), before.len(), modified, digest.clone()));
-        Some(digest)
+struct EmptyCredentials;
+impl CredentialStore for EmptyCredentials {
+    fn load(&self) -> Result<Option<Credential>, AppError> {
+        Ok(None)
     }
+    fn save(&self, _: &Credential) -> Result<(), AppError> {
+        Err(AppError::text(
+            ErrorCode::TextCredentialFailed,
+            "测试凭据存储不可写。",
+            false,
+        ))
+    }
+    fn delete(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+}
 
+impl SourceService {
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
-        Self::with_credentials(app_data_dir, system_credentials())
+        Self::with_credential_stores(
+            app_data_dir,
+            system_credentials(),
+            system_text_credentials(),
+        )
     }
 
     pub fn with_credentials(
         app_data_dir: PathBuf,
         credentials: Arc<dyn CredentialStore>,
+    ) -> Result<Self, AppError> {
+        Self::with_credential_stores(app_data_dir, credentials, Arc::new(EmptyCredentials))
+    }
+
+    pub fn with_credential_stores(
+        app_data_dir: PathBuf,
+        credentials: Arc<dyn CredentialStore>,
+        text_credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppError> {
         let store = PreferenceStore::new(app_data_dir.clone());
         let sessions = SessionStore::new(app_data_dir)?;
@@ -118,18 +124,22 @@ impl SourceService {
                 session: None,
             }),
             credentials,
+            text_credentials,
             project_updates: std::sync::Mutex::new(()),
             reconciliation_revision: AtomicU64::new(0),
             jev_gate: RwLock::new(()),
             jev_cancel: Mutex::new(CancellationToken::new()),
+            text_gate: RwLock::new(()),
+            text_cancel: Mutex::new(CancellationToken::new()),
+            text_validation_cancel: Mutex::new(CancellationToken::new()),
             refresh_active: std::sync::Mutex::new(None),
             summary_active: std::sync::Mutex::new(std::collections::HashMap::new()),
             analysis_active: std::sync::Mutex::new(std::collections::HashMap::new()),
             analysis_update_lock: std::sync::Mutex::new(()),
             analysis_clock: Arc::new(|| now_ms() as i64),
             model_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(test)]
             analysis_auth_home: None,
-            binary_fingerprint_cache: std::sync::Mutex::new(None),
         };
         service.reconcile_projects()?;
         Ok(service)
@@ -320,6 +330,8 @@ impl SourceService {
             theme,
             jev: preferences.jev.clone(),
             jev_revision: preferences.jev_revision,
+            text: preferences.text.clone(),
+            text_revision: preferences.text_revision,
         };
         self.store.save(&next)?;
         *preferences = next;
@@ -351,6 +363,8 @@ impl SourceService {
                 theme: preferences.theme.clone(),
                 jev: preferences.jev.clone(),
                 jev_revision: preferences.jev_revision,
+                text: preferences.text.clone(),
+                text_revision: preferences.text_revision,
             };
             self.store.save(&next)?;
             *preferences = next;
@@ -3716,6 +3730,7 @@ mod tests {
             evidence_refs: vec![],
             model: "synthetic-model".into(),
             requested_model: None,
+            service_base_url: None,
             binary_path: None,
             binary_fingerprint: None,
             binary_version: None,
@@ -3831,6 +3846,8 @@ mod tests {
                 codex_binary_fingerprint: None,
                 codex_version: None,
                 codex_model: "synthetic-model".into(),
+                text_base_url: String::new(),
+                text_config_revision: 0,
                 jev_base_url: "https://api.typesafe.ai".into(),
                 jev_model: "jev-1.13.0".into(),
                 jev_rules_version: "synthetic".into(),

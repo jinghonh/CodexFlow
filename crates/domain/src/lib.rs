@@ -49,6 +49,12 @@ impl AppError {
             ErrorCode::JevCredentialFailed => {
                 "解锁钥匙串并允许应用访问；如密钥已删除，请重新填写 API Key。"
             }
+            ErrorCode::TextCredentialFailed => "解锁钥匙串并允许应用访问，然后重试。",
+            ErrorCode::TextNotConfigured => "填写文本生成服务地址、模型和当前地址的 API Key。",
+            ErrorCode::TextInvalidAddress => "填写有效的 HTTPS 服务地址并重新保存。",
+            ErrorCode::TextConnectionFailed | ErrorCode::TextProtocolInvalid => {
+                "检查文本服务地址、协议和网络后重试。"
+            }
             ErrorCode::JevNotConfigured => "为当前服务地址填写并保存 API Key。",
             ErrorCode::JevInvalidAddress => "填写有效的 HTTPS 服务根地址并重新保存。",
             ErrorCode::JevAuthenticationFailed | ErrorCode::AnalysisAuthenticationFailed => {
@@ -96,6 +102,16 @@ impl AppError {
             retryable,
             cache_preserved: true,
             backend: "jev".into(),
+            retry_after_ms: None,
+        }
+    }
+    pub fn text(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+            cache_preserved: true,
+            backend: "text".into(),
             retry_after_ms: None,
         }
     }
@@ -200,6 +216,11 @@ pub enum ErrorCode {
     JevTimeout,
     JevCancelled,
     JevCredentialFailed,
+    TextInvalidAddress,
+    TextNotConfigured,
+    TextCredentialFailed,
+    TextConnectionFailed,
+    TextProtocolInvalid,
     MigrationFailed,
     DatabaseTooNew,
     ProjectResolutionFailed,
@@ -332,7 +353,12 @@ pub struct AnalysisRun {
     #[serde(default)]
     pub codex_binary_fingerprint: Option<String>,
     pub codex_version: Option<String>,
+    #[serde(rename = "textModel", alias = "codexModel")]
     pub codex_model: String,
+    #[serde(default)]
+    pub text_base_url: String,
+    #[serde(default)]
+    pub text_config_revision: u64,
     pub jev_base_url: String,
     pub jev_model: String,
     #[serde(default)]
@@ -593,6 +619,8 @@ pub struct ThreadSummary {
     #[serde(default)]
     pub requested_model: Option<String>,
     #[serde(default)]
+    pub service_base_url: Option<String>,
+    #[serde(default)]
     pub binary_path: Option<String>,
     #[serde(default)]
     pub binary_fingerprint: Option<String>,
@@ -631,6 +659,8 @@ pub struct SummaryEvidenceCheck {
 #[serde(rename_all = "camelCase")]
 pub struct SummaryPreview {
     pub thread_id: String,
+    #[serde(default)]
+    pub service_base_url: Option<String>,
     pub model: String,
     pub character_limit: usize,
     pub character_count: usize,
@@ -902,6 +932,10 @@ pub struct Workstream {
     pub name_input_version: Option<String>,
     #[serde(default)]
     pub name_actual_model: Option<String>,
+    #[serde(default)]
+    pub name_service_base_url: Option<String>,
+    #[serde(default)]
+    pub name_requested_model: Option<String>,
     pub name_error: Option<String>,
     pub predecessor_ids: Vec<String>,
 }
@@ -1298,6 +1332,33 @@ pub struct Preferences {
     pub jev: JevConfig,
     #[serde(default)]
     pub jev_revision: u64,
+    #[serde(default)]
+    pub text: TextConfig,
+    #[serde(default)]
+    pub text_revision: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextConfig {
+    pub base_url: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextStatus {
+    pub config: TextConfig,
+    pub credential_configured: bool,
+    pub credential_error: Option<AppError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextValidation {
+    pub requested_model: String,
+    pub actual_model: String,
+    pub reply: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1356,6 +1417,8 @@ impl Default for Preferences {
             theme: DisplayTheme::System,
             jev: JevConfig::default(),
             jev_revision: 0,
+            text: TextConfig::default(),
+            text_revision: 0,
         }
     }
 }

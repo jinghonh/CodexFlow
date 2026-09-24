@@ -79,14 +79,24 @@ pub trait CredentialStore: Send + Sync {
 }
 
 pub fn system_credentials() -> Arc<dyn CredentialStore> {
-    Arc::new(KeychainCredentialStore)
+    Arc::new(KeychainCredentialStore {
+        service: b"dev.codexflow.desktop.jev",
+    })
 }
 
-pub struct KeychainCredentialStore;
+pub fn system_text_credentials() -> Arc<dyn CredentialStore> {
+    Arc::new(KeychainCredentialStore {
+        service: b"dev.codexflow.desktop.text",
+    })
+}
+
+pub struct KeychainCredentialStore {
+    service: &'static [u8],
+}
 
 impl CredentialStore for KeychainCredentialStore {
     fn load(&self) -> Result<Option<Credential>, AppError> {
-        let bytes = keychain::load()?;
+        let bytes = keychain::load(self.service)?;
         bytes
             .map(|bytes| {
                 let record: KeychainRecord =
@@ -105,11 +115,11 @@ impl CredentialStore for KeychainCredentialStore {
             key: &credential.key,
         })
         .map_err(|_| credential_error())?;
-        keychain::save(&bytes)
+        keychain::save(self.service, &bytes)
     }
 
     fn delete(&self) -> Result<(), AppError> {
-        keychain::delete()
+        keychain::delete(self.service)
     }
 }
 
@@ -393,7 +403,6 @@ async fn success(response: reqwest::Response) -> Result<reqwest::Response, AppEr
 mod keychain {
     use super::{credential_error, AppError};
     use std::ffi::c_void;
-    const SERVICE: &[u8] = b"dev.codexflow.desktop.jev";
     const ACCOUNT: &[u8] = b"global";
     const NOT_FOUND: i32 = -25300;
     type Item = *mut c_void;
@@ -433,15 +442,18 @@ mod keychain {
         fn CFRelease(value: Item);
     }
 
-    fn find(with_password: bool) -> Result<Option<(Item, Option<Vec<u8>>)>, AppError> {
+    fn find(
+        service: &[u8],
+        with_password: bool,
+    ) -> Result<Option<(Item, Option<Vec<u8>>)>, AppError> {
         let mut item: Item = std::ptr::null_mut();
         let mut len = 0u32;
         let mut data: *mut c_void = std::ptr::null_mut();
         let status = unsafe {
             SecKeychainFindGenericPassword(
                 std::ptr::null_mut(),
-                SERVICE.len() as u32,
-                SERVICE.as_ptr(),
+                service.len() as u32,
+                service.as_ptr(),
                 ACCOUNT.len() as u32,
                 ACCOUNT.as_ptr(),
                 if with_password {
@@ -478,8 +490,8 @@ mod keychain {
         };
         Ok(Some((item, bytes)))
     }
-    pub fn load() -> Result<Option<Vec<u8>>, AppError> {
-        let found = find(true)?;
+    pub fn load(service: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+        let found = find(service, true)?;
         Ok(found.map(|(item, bytes)| {
             unsafe {
                 CFRelease(item);
@@ -487,8 +499,8 @@ mod keychain {
             bytes.expect("password requested")
         }))
     }
-    pub fn delete() -> Result<(), AppError> {
-        if let Some((item, _)) = find(false)? {
+    pub fn delete(service: &[u8]) -> Result<(), AppError> {
+        if let Some((item, _)) = find(service, false)? {
             let status = unsafe { SecKeychainItemDelete(item) };
             unsafe {
                 CFRelease(item);
@@ -499,8 +511,8 @@ mod keychain {
         }
         Ok(())
     }
-    pub fn save(bytes: &[u8]) -> Result<(), AppError> {
-        let status = if let Some((item, _)) = find(false)? {
+    pub fn save(service: &[u8], bytes: &[u8]) -> Result<(), AppError> {
+        let status = if let Some((item, _)) = find(service, false)? {
             let status = unsafe {
                 SecKeychainItemModifyAttributesAndData(
                     item,
@@ -517,8 +529,8 @@ mod keychain {
             unsafe {
                 SecKeychainAddGenericPassword(
                     std::ptr::null_mut(),
-                    SERVICE.len() as u32,
-                    SERVICE.as_ptr(),
+                    service.len() as u32,
+                    service.as_ptr(),
                     ACCOUNT.len() as u32,
                     ACCOUNT.as_ptr(),
                     bytes.len() as u32,
@@ -796,13 +808,13 @@ mod tests {
 #[cfg(not(target_os = "macos"))]
 mod keychain {
     use super::{credential_error, AppError};
-    pub fn load() -> Result<Option<Vec<u8>>, AppError> {
+    pub fn load(_: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
         Err(credential_error())
     }
-    pub fn save(_: &[u8]) -> Result<(), AppError> {
+    pub fn save(_: &[u8], _: &[u8]) -> Result<(), AppError> {
         Err(credential_error())
     }
-    pub fn delete() -> Result<(), AppError> {
+    pub fn delete(_: &[u8]) -> Result<(), AppError> {
         Err(credential_error())
     }
 }

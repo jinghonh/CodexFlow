@@ -12,10 +12,10 @@ const limits = { callLimit: 100, concurrencyLimit: 2, timeoutSeconds: 180, retry
 const preview = { projectId: "project", inputVersion: "v1", cachedSummaries: 1, unavailableSummaries: 1,
   maximumCandidates: 2, evidenceSelectionCallLimit: 4, pendingGroups: null, limits, jevConfigured: false,
   stages: [
-    { stage: "summary", service: "Codex", model: "test-model", sendScope: "单条会话来源", pendingItems: 2, maximumCalls: 6, available: true, note: "本批可执行" },
+    { stage: "summary", service: "文本服务 https://text.example/v1", model: "test-model", sendScope: "单条会话来源", pendingItems: 2, maximumCalls: 6, available: true, note: "本批可执行" },
     { stage: "relation", service: "Jev", model: "jev-latest", sendScope: "发送到配置的 Jev 服务", pendingItems: 2, maximumCalls: 7, available: false, note: "尚未接入" },
     { stage: "evidenceSelection", service: "Jev", model: "jev-latest", sendScope: "候选证据", pendingItems: 2, maximumCalls: 12, available: false, note: "最多两次请求" },
-    { stage: "naming", service: "Codex", model: "test-model", sendScope: "分组事实", pendingItems: 0, maximumCalls: 0, available: false, note: "待命名数量未知" },
+    { stage: "naming", service: "文本服务 https://text.example/v1", model: "test-model", sendScope: "分组事实", pendingItems: 0, maximumCalls: 0, available: false, note: "待命名数量未知" },
   ] };
 const run = { id: "analysis-1", projectId: "project", state: "running", pauseReason: null,
   batchNumber: 1, batchCalls: 1, totalCalls: 1, totalQuestions: 0, inputTokens: null, outputTokens: null,
