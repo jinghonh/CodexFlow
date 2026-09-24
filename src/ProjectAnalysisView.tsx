@@ -87,7 +87,8 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   const summary = preview?.stages[0];
   const canStart = (!!summary?.available || (summary?.pendingItems ?? 0) === 0) &&
     (((summary?.pendingItems ?? 0) > 0) ||
-      (!!preview?.stages[1]?.available && (preview?.stages[1]?.pendingItems ?? 0) > 0)) &&
+      (!!preview?.stages[1]?.available && (preview?.stages[1]?.pendingItems ?? 0) > 0) ||
+      (!!preview?.stages[3]?.available && (preview?.stages[3]?.pendingItems ?? 0) > 0)) &&
     !active && run?.state !== "paused" && !busy;
   const valid = Number.isInteger(limits.callLimit) && limits.callLimit > 0 && Number.isInteger(limits.timeoutSeconds) && limits.timeoutSeconds > 0 &&
     Number.isInteger(limits.concurrencyLimit) && limits.concurrencyLimit >= 1 && limits.concurrencyLimit <= 2 &&
@@ -97,7 +98,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   return <section className="panel analysis-panel" aria-label="项目分析批次">
     <div className="panel-kicker">06 / 项目分析</div>
     <h2>预览与批次</h2>
-    <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的 Jev 设置；修改后需保存才生效。Codex 负责会话总结，Jev 负责关系判断和证据选择；工作流命名尚未接入。调用次数是上限，不是费用或令牌估计。</p>
+    <p className="panel-intro">只有手动启动才会调用模型。预览使用已保存的 Jev 设置；修改后需保存才生效。Codex 负责会话总结和工作流命名，Jev 负责关系判断和证据选择。调用次数是上限，不是费用或令牌估计。</p>
     <div className="analysis-limits">
       <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={limits.callLimit} onChange={(event) => setLimits({ ...limits, callLimit: Number(event.target.value) })} /></label>
       <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max="2" value={limits.concurrencyLimit} onChange={(event) => setLimits({ ...limits, concurrencyLimit: Number(event.target.value) })} /></label>

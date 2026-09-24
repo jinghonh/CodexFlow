@@ -1,9 +1,11 @@
 use super::summary::SummaryBatchSnapshot;
 use super::{inferred, now_ms, SourceService};
+use codexflow_codex::{analyze_workstream_name, AnalysisEvent};
 use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisRunState, AnalysisStage,
     AnalysisStagePlan, AnalysisUnit, AnalysisUnitState, AppError, CapabilityState, ErrorCode,
     InferredPairOutcome, JevDecisionIdentity, RelationJudgment, SummaryRun, SummaryRunState,
+    Workstream,
 };
 use codexflow_jev::{JevClient, JevRelationAnalyzer, RELATION_RULES_VERSION};
 use sha2::{Digest, Sha256};
@@ -179,6 +181,98 @@ impl SourceService {
     fn analysis_now(&self) -> i64 {
         (self.analysis_clock)()
     }
+    fn naming_material(
+        &self,
+        graph: &codexflow_domain::ProjectGraph,
+        stream: &Workstream,
+        limit: usize,
+    ) -> Result<(String, String), AppError> {
+        let mut prompt = String::from("请只依据下列已确定的工作流成员与来源事实，给这条工作流起一个简短、具体的中文名称。不得改变成员或推断没有证据的目标。只返回 name 字段。\n");
+        prompt.push_str(&format!(
+            "成员数：{}；算法：{}。\n",
+            stream.members.len(),
+            stream.algorithm_version
+        ));
+        let mut fingerprint = Sha256::new();
+        fingerprint.update(stream.algorithm_version.as_bytes());
+        for id in &stream.members {
+            fingerprint.update(id.as_bytes());
+            let title = graph
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .and_then(|node| node.title.as_deref())
+                .unwrap_or("无标题");
+            let summary = self.sessions.summary(id)?;
+            let current = self.sessions.thread(id)?;
+            let generation = self.sessions.history_generation(id)?;
+            let summary = summary.filter(|summary| {
+                current.as_ref().is_some_and(|thread| {
+                    summary.source_updated_at == thread.updated_at
+                        && summary.history_generation == generation
+                })
+            });
+            let line = serde_json::json!({"threadId":id,"title":title,
+                "goal":summary.as_ref().map(|item| item.content.goal.as_str()),
+                "activity":summary.as_ref().map(|item| item.content.activity.as_str()),
+                "outcome":summary.as_ref().map(|item| item.content.outcome.as_str())})
+            .to_string();
+            fingerprint.update(line.as_bytes());
+            if prompt.chars().count() + line.chars().count() + 2 < limit.saturating_sub(500) {
+                prompt.push_str(&line);
+                prompt.push('\n');
+            }
+        }
+        for relation in graph
+            .relations
+            .iter()
+            .filter(|item| stream.relation_ids.contains(&item.id))
+        {
+            let line = format!(
+                "结构关系 {} {} {}\n",
+                relation.from_thread_id,
+                relation.kind.as_str(),
+                relation.to_thread_id
+            );
+            fingerprint.update(line.as_bytes());
+            if prompt.chars().count() + line.chars().count() < limit {
+                prompt.push_str(&line);
+            }
+        }
+        for relation in graph
+            .derived_relations
+            .iter()
+            .filter(|item| stream.relation_ids.contains(&item.id))
+        {
+            let line = format!(
+                "规则关系 {} {:?} {}：{}\n",
+                relation.from_thread_id, relation.kind, relation.to_thread_id, relation.basis
+            );
+            fingerprint.update(line.as_bytes());
+            if prompt.chars().count() + line.chars().count() < limit {
+                prompt.push_str(&line);
+            }
+        }
+        for relation in graph
+            .reviewed_relations
+            .iter()
+            .filter(|item| stream.relation_ids.contains(&item.relation.id))
+        {
+            let line = format!(
+                "推断关系 {} {} {}；证据：{} / {}\n",
+                relation.relation.from_thread_id,
+                relation.relation.kind.as_str(),
+                relation.relation.to_thread_id,
+                relation.relation.evidence.left.excerpt,
+                relation.relation.evidence.right.excerpt
+            );
+            fingerprint.update(line.as_bytes());
+            if prompt.chars().count() + line.chars().count() < limit {
+                prompt.push_str(&line);
+            }
+        }
+        Ok((format!("{:x}", fingerprint.finalize()), prompt))
+    }
     async fn analysis_material(
         &self,
         project_id: &str,
@@ -251,6 +345,16 @@ impl SourceService {
             }
         }
         let attempts = u64::from(limits.retry_limit) + 1;
+        let streams = self.project_workstreams(project_id)?;
+        let naming_graph = self.project_graph(project_id)?;
+        let mut pending_groups = 0;
+        for stream in &streams.workstreams {
+            let (version, _) =
+                self.naming_material(&naming_graph, stream, limits.input_character_limit)?;
+            if stream.name_input_version.as_deref() != Some(&version) {
+                pending_groups += 1;
+            }
+        }
         let alias_probe_calls = u64::from(
             jev_configured && candidate_upper_bound > 0 && !pinned_jev_model(&jev.config.model),
         )
@@ -311,11 +415,15 @@ impl SourceService {
                 stage: AnalysisStage::Naming,
                 service: "Codex".into(),
                 model,
-                send_scope: "形成工作流后发送分组事实与必要证据；本阶段尚未接入。".into(),
-                pending_items: 0,
-                maximum_calls: 0,
-                available: false,
-                note: "尚未形成分组，待命名数量未知；不会在本批调用。".into(),
+                send_scope: "发送已确定分组的成员标题、可用总结与内部来源关系；每次受输入字符上限约束。".into(),
+                pending_items: pending_groups,
+                maximum_calls: (if pending_candidates > 0 { candidate.thread_count / 2 }
+                    else { pending_groups }).saturating_mul(attempts),
+                available: codex_available,
+                note: if codex_available && pending_candidates > 0 {
+                    "当前数量只含已有分组；Jev 关系完成后可能增加。每组一次临时 Codex 回合，重试计入共享预算。"
+                } else if codex_available { "分组先由关系图确定；每组一次临时 Codex 回合，重试计入共享预算。" }
+                    else { "Codex 隔离配置或能力未通过检查，分组仍可浏览。" }.into(),
             },
         ];
         let preview = AnalysisPreview {
@@ -326,7 +434,7 @@ impl SourceService {
             unavailable_summaries: unavailable,
             maximum_candidates: candidate_upper_bound,
             evidence_selection_call_limit: candidate_upper_bound,
-            pending_groups: None,
+            pending_groups: (pending_candidates == 0).then_some(pending_groups),
             limits,
             jev_configured,
         };
@@ -504,6 +612,7 @@ impl SourceService {
             pending: units.len() as u32,
             units,
             relations_planned: false,
+            names_planned: false,
             started_at_unix_ms: self.analysis_now(),
             finished_at_unix_ms: None,
             interrupted: false,
@@ -850,6 +959,39 @@ impl SourceService {
                 run.relations_planned = true;
                 self.save_analysis(&mut run, &control.update)?;
             }
+            if run.relations_planned
+                && !run.names_planned
+                && !run.units.iter().any(|unit| {
+                    unit.state == AnalysisUnitState::Pending && unit.stage != AnalysisStage::Naming
+                })
+            {
+                let groups = self.project_workstreams(&run.project_id)?;
+                let naming_graph = self.project_graph(&run.project_id)?;
+                for stream in groups.workstreams {
+                    let (version, _) = self.naming_material(
+                        &naming_graph,
+                        &stream,
+                        run.limits.input_character_limit,
+                    )?;
+                    if stream.name_input_version.as_deref() == Some(&version) {
+                        continue;
+                    }
+                    run.units.push(AnalysisUnit {
+                        id: stream.id,
+                        stage: AnalysisStage::Naming,
+                        input_version: version,
+                        state: AnalysisUnitState::Pending,
+                        attempts: 0,
+                        active_summary_run_id: None,
+                        requested_model: run.codex_model.clone(),
+                        actual_model: None,
+                        error: None,
+                        relation_classification: None,
+                    });
+                }
+                run.names_planned = true;
+                self.save_analysis(&mut run, &control.update)?;
+            }
             let Some(index) = run
                 .units
                 .iter()
@@ -917,6 +1059,17 @@ impl SourceService {
                 ));
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
+            }
+            if run.units[index].stage == AnalysisStage::Naming {
+                self.run_naming_unit(control, index, run).await?;
+                if self
+                    .sessions
+                    .analysis_run(&control.id)?
+                    .is_some_and(|run| run.state == AnalysisRunState::Paused)
+                {
+                    return Ok(());
+                }
+                continue;
             }
             let thread_id = run.units[index].id.clone();
             let current_generation = self.sessions.history_generation(&thread_id)?;
@@ -1122,6 +1275,214 @@ impl SourceService {
                 }
             }
         }
+    }
+
+    async fn run_naming_unit(
+        &self,
+        control: &AnalysisControl,
+        index: usize,
+        mut run: AnalysisRun,
+    ) -> Result<(), AppError> {
+        let stream_id = run.units[index].id.clone();
+        let groups = self.project_workstreams(&run.project_id)?;
+        let naming_graph = self.project_graph(&run.project_id)?;
+        let Some(stream) = groups
+            .workstreams
+            .into_iter()
+            .find(|item| item.id == stream_id)
+        else {
+            run.units[index].state = AnalysisUnitState::Failed;
+            run.units[index].error = Some(core_error(
+                ErrorCode::SourceReadFailed,
+                "工作流分组已变化，请启动新分析。",
+                true,
+            ));
+            return self.save_analysis(&mut run, &control.update);
+        };
+        let (version, prompt) =
+            self.naming_material(&naming_graph, &stream, run.limits.input_character_limit)?;
+        if version != run.units[index].input_version {
+            run.units[index].state = AnalysisUnitState::Failed;
+            run.units[index].error = Some(core_error(
+                ErrorCode::SourceReadFailed,
+                "命名材料已变化，请启动新分析。",
+                true,
+            ));
+            return self.save_analysis(&mut run, &control.update);
+        }
+        if stream.name_input_version.as_deref() == Some(&version) {
+            run.units[index].state = AnalysisUnitState::Succeeded;
+            run.units[index].error = None;
+            return self.save_analysis(&mut run, &control.update);
+        }
+        let permit = tokio::select! {
+            _ = control.cancel.cancelled() => return Ok(()),
+            _ = control.queue_pause.cancelled() => return Ok(()),
+            acquired = self.model_slots.acquire() => acquired.map_err(|_| core_error(
+                ErrorCode::AnalysisUnavailable, "模型并发队列已关闭。", true))?,
+        };
+        let dispatch = control.dispatch.lock().await;
+        if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        reserve_attempt(&mut run, index, 0)?;
+        self.save_analysis(&mut run, &control.update)?;
+        drop(dispatch);
+        let turn_started = std::sync::atomic::AtomicBool::new(false);
+        let call_cancel = control.cancel.child_token();
+        let timeout_cancel = call_cancel.clone();
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let timeout_flag = Arc::clone(&timed_out);
+        let timeout_seconds = run.limits.timeout_seconds;
+        let timeout = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+            timeout_flag.store(true, Ordering::SeqCst);
+            timeout_cancel.cancel();
+        });
+        let result = analyze_workstream_name(
+            run.codex_binary.as_deref(),
+            Some(&run.codex_model),
+            self.analysis_auth_home.as_deref(),
+            prompt,
+            call_cancel,
+            |event| {
+                if matches!(event, AnalysisEvent::Turn(_)) {
+                    turn_started.store(true, Ordering::SeqCst);
+                }
+                Ok(())
+            },
+        )
+        .await;
+        timeout.abort();
+        let result = if timed_out.load(Ordering::SeqCst) && !control.cancel.is_cancelled() {
+            Err(core_error(
+                ErrorCode::AnalysisTimeout,
+                "工作流命名超过本次超时，已取消临时回合；可重试。",
+                true,
+            ))
+        } else {
+            result
+        };
+        drop(permit);
+        let mut current = self
+            .sessions
+            .analysis_run(&control.id)?
+            .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
+        if !turn_started.load(Ordering::SeqCst) {
+            current.batch_calls = current.batch_calls.saturating_sub(1);
+            current.total_calls = current.total_calls.saturating_sub(1);
+            current.units[index].attempts = current.units[index].attempts.saturating_sub(1);
+        }
+        if control.cancel.is_cancelled() || current.state == AnalysisRunState::Cancelling {
+            current.units[index].state = AnalysisUnitState::Pending;
+            return self.save_analysis(&mut current, &control.update);
+        }
+        let parsed = result.and_then(|output| {
+            let value: serde_json::Value = serde_json::from_str(&output.text).map_err(|_| {
+                core_error(
+                    ErrorCode::AnalysisInvalidResult,
+                    "工作流名称格式无效。",
+                    true,
+                )
+            })?;
+            let name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|name| {
+                    (2..=80).contains(&name.chars().count()) && !name.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    core_error(
+                        ErrorCode::AnalysisInvalidResult,
+                        "工作流名称必须为 2–80 个可显示字符。",
+                        true,
+                    )
+                })?;
+            Ok((name.to_owned(), output.model))
+        });
+        match parsed {
+            Ok((name, model)) => {
+                let latest = self.project_workstreams(&run.project_id)?;
+                let valid = latest
+                    .workstreams
+                    .iter()
+                    .find(|item| item.id == stream_id)
+                    .is_some_and(|item| item.members == stream.members);
+                let latest_graph = self.project_graph(&run.project_id)?;
+                if valid
+                    && self
+                        .naming_material(&latest_graph, &stream, run.limits.input_character_limit)?
+                        .0
+                        == version
+                {
+                    current.units[index].state = AnalysisUnitState::Succeeded;
+                    current.units[index].actual_model = Some(model);
+                    current.units[index].error = None;
+                    let saved = {
+                        let _guard = self.analysis_update_lock.lock().unwrap();
+                        recalculate(&mut current);
+                        let saved = !control.cancel.is_cancelled()
+                            && self.sessions.save_analysis_with_workstream_name(
+                                &current,
+                                &stream_id,
+                                &stream.members,
+                                &name,
+                                &version,
+                            )?;
+                        if saved {
+                            (control.update)(current.clone());
+                        }
+                        saved
+                    };
+                    if saved {
+                        return Ok(());
+                    }
+                    current.units[index].state = if control.cancel.is_cancelled() {
+                        AnalysisUnitState::Pending
+                    } else {
+                        AnalysisUnitState::Failed
+                    };
+                    current.units[index].error = Some(core_error(
+                        ErrorCode::SourceReadFailed,
+                        "命名提交时分组已变化，旧名称未保存。",
+                        true,
+                    ));
+                } else {
+                    current.units[index].state = AnalysisUnitState::Failed;
+                    current.units[index].error = Some(core_error(
+                        ErrorCode::SourceReadFailed,
+                        "分组或命名材料已变化，旧名称未保存。",
+                        true,
+                    ));
+                }
+            }
+            Err(error) => {
+                current.units[index].error = Some(error.clone());
+                if matches!(
+                    error.code,
+                    ErrorCode::AnalysisQuotaExceeded | ErrorCode::AnalysisAuthenticationFailed
+                ) {
+                    current.units[index].state = AnalysisUnitState::Pending;
+                    current.state = AnalysisRunState::Paused;
+                    current.pause_reason = Some(error.message);
+                } else if error.retryable
+                    && current.units[index].attempts <= u32::from(run.limits.retry_limit)
+                    && turn_started.load(Ordering::SeqCst)
+                {
+                    current.units[index].state = AnalysisUnitState::Pending;
+                } else {
+                    current.units[index].state = AnalysisUnitState::Failed;
+                    self.sessions.save_workstream_name_error(
+                        &run.project_id,
+                        &stream_id,
+                        &stream.members,
+                        &error.message,
+                    )?;
+                }
+            }
+        }
+        self.save_analysis(&mut current, &control.update)
     }
 
     async fn probe_jev_alias(
@@ -2487,6 +2848,113 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn naming_runs_without_jev_when_rule_group_already_exists() {
+        let root = root("naming-without-jev");
+        let service = service(&root, "ok", 2).await;
+        let sessions = service.project_sessions("project-test").unwrap();
+        service
+            .sessions
+            .save_projects_and_attributions(
+                &[sessions.project],
+                &sessions
+                    .threads
+                    .into_iter()
+                    .map(|item| item.attribution)
+                    .collect::<Vec<_>>(),
+                Some(&[codexflow_domain::ObservedRelation {
+                    id: "observed-pair".into(),
+                    project_id: "project-test".into(),
+                    from_thread_id: "thread-0".into(),
+                    to_thread_id: "thread-1".into(),
+                    kind: codexflow_domain::ObservedRelationKind::ForkedFrom,
+                    source: "observed".into(),
+                    source_field: "forkedFromId".into(),
+                    confidence: 1.0,
+                    parent_endpoint: codexflow_domain::ParentEndpoint::InProject,
+                }]),
+            )
+            .unwrap();
+        let preview = service
+            .analysis_preview("project-test", AnalysisLimits::default())
+            .await
+            .unwrap();
+        assert!(!preview.jev_configured);
+        assert_eq!(preview.stages[3].pending_items, 1);
+        let started = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        let completed = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(completed.total_calls, 3);
+        assert_eq!(
+            completed
+                .units
+                .iter()
+                .filter(|unit| unit.stage == AnalysisStage::Naming
+                    && unit.state == AnalysisUnitState::Succeeded)
+                .count(),
+            1
+        );
+        assert_eq!(
+            service
+                .project_workstreams("project-test")
+                .unwrap()
+                .workstreams[0]
+                .name,
+            "测试工作流"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn invalid_name_keeps_deterministic_group_and_failure_reason() {
+        let root = root("invalid-name");
+        let service = service(&root, "invalid", 2).await;
+        let sessions = service.project_sessions("project-test").unwrap();
+        service
+            .sessions
+            .save_projects_and_attributions(
+                &[sessions.project],
+                &sessions
+                    .threads
+                    .into_iter()
+                    .map(|item| item.attribution)
+                    .collect::<Vec<_>>(),
+                Some(&[codexflow_domain::ObservedRelation {
+                    id: "observed-pair".into(),
+                    project_id: "project-test".into(),
+                    from_thread_id: "thread-0".into(),
+                    to_thread_id: "thread-1".into(),
+                    kind: codexflow_domain::ObservedRelationKind::ForkedFrom,
+                    source: "observed".into(),
+                    source_field: "forkedFromId".into(),
+                    confidence: 1.0,
+                    parent_endpoint: codexflow_domain::ParentEndpoint::InProject,
+                }]),
+            )
+            .unwrap();
+        let before = service.project_workstreams("project-test").unwrap();
+        assert_eq!(before.workstreams.len(), 1);
+        let started = service
+            .start_project_analysis(
+                "project-test".into(),
+                AnalysisLimits {
+                    retry_limit: 0,
+                    ..AnalysisLimits::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let _ = wait_state(&service, &started.id, AnalysisRunState::Failed).await;
+        let after = service.project_workstreams("project-test").unwrap();
+        assert_eq!(after.workstreams[0].id, before.workstreams[0].id);
+        assert_eq!(after.workstreams[0].name, before.workstreams[0].name);
+        assert!(after.workstreams[0].name_error.is_some());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn native_jev_two_post_path_persists_a_locatable_inferred_edge() {
         let root = root("jev-two-post");
         let service = service(&root, "ok", 2).await;
@@ -2570,11 +3038,15 @@ mod tests {
             .any(|unit| unit.stage == AnalysisStage::EvidenceSelection
                 && unit.relation_classification.is_some()));
         service
-            .continue_analysis_run(&started.id, 1, |_| {})
+            .continue_analysis_run(&started.id, 2, |_| {})
             .await
             .unwrap();
         let completed = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
-        assert_eq!(completed.total_calls, 4); // two Codex summaries plus two Jev POSTs
+        assert_eq!(completed.total_calls, 5); // two summaries, two Jev POSTs and one name
+        let streams = service.project_workstreams("project-test").unwrap();
+        assert_eq!(streams.workstreams.len(), 1);
+        assert_eq!(streams.workstreams[0].name, "测试工作流");
+        assert!(streams.workstreams[0].name_input_version.is_some());
         assert_eq!(completed.total_questions, 17);
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
@@ -3413,7 +3885,7 @@ mod tests {
         let completed = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
         assert_eq!(completed.jev_pinned_model.as_deref(), Some("jev-1.13.0"));
         assert_eq!(completed.jev_probe_attempts, 1);
-        assert_eq!(completed.total_calls, 8); // 三次总结、一次探测、三次分类和一次证据选择
+        assert_eq!(completed.total_calls, 9); // 三次总结、一次探测、三次分类、一次证据选择和一次命名
         assert_eq!(completed.total_questions, 50);
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 5);

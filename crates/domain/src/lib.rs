@@ -259,6 +259,8 @@ pub struct AnalysisRun {
     pub units: Vec<AnalysisUnit>,
     #[serde(default)]
     pub relations_planned: bool,
+    #[serde(default)]
+    pub names_planned: bool,
     pub started_at_unix_ms: i64,
     pub finished_at_unix_ms: Option<i64>,
     pub interrupted: bool,
@@ -775,6 +777,29 @@ pub struct ProjectGraph {
     #[serde(default)]
     pub inference_outcomes: Vec<InferredPairOutcome>,
     pub diagnostics: Vec<GraphDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Workstream {
+    pub id: String,
+    pub project_id: String,
+    pub name: String,
+    pub members: Vec<String>,
+    pub relation_ids: Vec<String>,
+    pub algorithm_version: String,
+    pub name_input_version: Option<String>,
+    pub name_error: Option<String>,
+    pub predecessor_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectWorkstreams {
+    pub project_id: String,
+    pub workstreams: Vec<Workstream>,
+    pub ungrouped_thread_ids: Vec<String>,
+    pub cross_relation_ids: Vec<String>,
 }
 
 /// 规则只记录来源事实的交集或引用，不表达语义因果关系。

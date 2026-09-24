@@ -218,7 +218,8 @@ for line in sys.stdin:
         if mode.endswith(("network-missing", "network-null", "network-string", "network-true")):
             (pathlib.Path(__file__).parent / "unexpected-turn-start").touch()
         assert request["params"]["threadId"] == analysis_thread
-        assert request["params"]["outputSchema"]["required"] == ["goal", "activity", "outcome", "decisions", "issues", "evidenceIds"]
+        naming = request["params"]["outputSchema"]["required"] == ["name"]
+        assert naming or request["params"]["outputSchema"]["required"] == ["goal", "activity", "outcome", "decisions", "issues", "evidenceIds"]
         response = {"id": request["id"], "result": {"turn": {"id": analysis_turn, "status": "inProgress", "items": []}}}
         print(json.dumps(response), flush=True)
         if mode.endswith("twice-flaky"):
@@ -248,7 +249,9 @@ for line in sys.stdin:
         if mode.endswith("tool"):
             print(json.dumps({"method":"item/started","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"commandExecution","id":"cmd-1"}}}), flush=True)
             continue
-        content = "{}" if mode.endswith("invalid") else json.dumps({"goal":"实现测试", "activity":"运行检查", "outcome":"通过", "decisions":"采用临时会话", "issues":"未知", "evidenceIds":["hallucinated" if mode.endswith("bad-evidence") else "item:turn-1:item-1"]}, ensure_ascii=False)
+        content = "{}" if mode.endswith("invalid") else json.dumps(
+            {"name":"测试工作流"} if naming else
+            {"goal":"实现测试", "activity":"运行检查", "outcome":"通过", "decisions":"采用临时会话", "issues":"未知", "evidenceIds":["hallucinated" if mode.endswith("bad-evidence") else "item:turn-1:item-1"]}, ensure_ascii=False)
         print(json.dumps({"method":"item/completed","params":{"threadId":analysis_thread,"turnId":analysis_turn,"item":{"type":"agentMessage","id":"msg-1","phase":"final_answer","text":content}}}), flush=True)
         print(json.dumps({"method":"turn/completed","params":{"threadId":analysis_thread,"turn":{"id":analysis_turn,"status":"completed","items":[]}}}), flush=True)
         continue

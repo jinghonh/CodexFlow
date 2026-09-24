@@ -506,6 +506,54 @@ pub async fn analyze_summary(
     cancel: CancellationToken,
     mut on_event: impl FnMut(AnalysisEvent) -> Result<(), AppError>,
 ) -> Result<AnalysisOutput, AppError> {
+    let schema = json!({"type":"object","additionalProperties":false,
+        "properties":{"goal":{"type":"string"},"activity":{"type":"string"},
+            "outcome":{"type":"string"},"decisions":{"type":"string"},"issues":{"type":"string"},
+            "evidenceIds":{"type":"array","items":{"type":"string"}}},
+        "required":["goal","activity","outcome","decisions","issues","evidenceIds"]});
+    analyze_structured(
+        binary_choice,
+        model_choice,
+        origin_home,
+        prompt,
+        schema,
+        cancel,
+        &mut on_event,
+    )
+    .await
+}
+
+pub async fn analyze_workstream_name(
+    binary_choice: Option<&str>,
+    model_choice: Option<&str>,
+    origin_home: Option<&Path>,
+    prompt: String,
+    cancel: CancellationToken,
+    mut on_event: impl FnMut(AnalysisEvent) -> Result<(), AppError>,
+) -> Result<AnalysisOutput, AppError> {
+    let schema = json!({"type":"object","additionalProperties":false,
+        "properties":{"name":{"type":"string"}},"required":["name"]});
+    analyze_structured(
+        binary_choice,
+        model_choice,
+        origin_home,
+        prompt,
+        schema,
+        cancel,
+        &mut on_event,
+    )
+    .await
+}
+
+async fn analyze_structured(
+    binary_choice: Option<&str>,
+    model_choice: Option<&str>,
+    origin_home: Option<&Path>,
+    prompt: String,
+    schema: Value,
+    cancel: CancellationToken,
+    on_event: &mut impl FnMut(AnalysisEvent) -> Result<(), AppError>,
+) -> Result<AnalysisOutput, AppError> {
     if cancel.is_cancelled() {
         return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false));
     }
@@ -517,8 +565,9 @@ pub async fn analyze_summary(
         &workspace.cwd,
         model_choice,
         prompt,
+        schema,
         &cancel,
-        &mut on_event,
+        on_event,
     )
     .await;
     let _ = fs::remove_dir_all(&workspace.root);
@@ -531,6 +580,7 @@ async fn analyze_in_home(
     cwd: &Path,
     model_choice: Option<&str>,
     prompt: String,
+    schema: Value,
     cancel: &CancellationToken,
     on_event: &mut impl FnMut(AnalysisEvent) -> Result<(), AppError>,
 ) -> Result<AnalysisOutput, AppError> {
@@ -566,11 +616,6 @@ async fn analyze_in_home(
         }
         on_event(AnalysisEvent::Thread(thread_id.clone()))?;
         if cancel.is_cancelled() { return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)); }
-        let schema = json!({"type":"object","additionalProperties":false,
-            "properties":{"goal":{"type":"string"},"activity":{"type":"string"},
-                "outcome":{"type":"string"},"decisions":{"type":"string"},"issues":{"type":"string"},
-                "evidenceIds":{"type":"array","items":{"type":"string"}}},
-            "required":["goal","activity","outcome","decisions","issues","evidenceIds"]});
         let started_turn = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(failure(ErrorCode::AnalysisCancelled, "分析已取消。", false)),

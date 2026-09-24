@@ -5,6 +5,7 @@ mod inferred;
 mod projects;
 mod relations;
 mod summary;
+mod workstreams;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
 use codexflow_domain::{
@@ -12,8 +13,8 @@ use codexflow_domain::{
     EvidenceCheck, EvidenceField, EvidencePage, EvidenceState, FactPage, HistoryCoverage,
     HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig,
     JevConnectionResult, JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph,
-    ProjectSessions, ProjectTimeline, RelationReview, ReviewedInferredRelation, SessionList,
-    SourceEvidence, SourceStatus, UserRelationDecision,
+    ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview, ReviewedInferredRelation,
+    SessionList, SourceEvidence, SourceStatus, UserRelationDecision,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, Credential, CredentialStore, JevClient,
@@ -751,6 +752,18 @@ impl SourceService {
             }
         }
         Ok(graph)
+    }
+
+    pub fn project_workstreams(&self, project_id: &str) -> Result<ProjectWorkstreams, AppError> {
+        let graph = self.project_graph(project_id)?;
+        let _guard = self.lock_project_updates();
+        let previous = self.sessions.workstreams(project_id)?;
+        let result = workstreams::build(&graph, &previous);
+        if result.workstreams != previous {
+            self.sessions
+                .replace_workstreams(project_id, &result.workstreams)?;
+        }
+        Ok(result)
     }
 
     pub fn decide_inferred_relation(

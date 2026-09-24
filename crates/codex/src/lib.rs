@@ -1,8 +1,8 @@
 mod analysis;
 mod history;
 pub use analysis::{
-    analysis_isolation_issue, analyze_summary, configured_summary_model, AnalysisEvent,
-    AnalysisOutput,
+    analysis_isolation_issue, analyze_summary, analyze_workstream_name, configured_summary_model,
+    AnalysisEvent, AnalysisOutput,
 };
 
 use codexflow_domain::{
@@ -509,6 +509,59 @@ mod tests {
         );
         let mut session = diagnosis.session;
         session.close().await;
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn ephemeral_workstream_naming_uses_structured_turn() {
+        let path = fake_binary("analysis-ok");
+        let mut saw_turn = false;
+        let output = analyze_workstream_name(
+            Some(path.to_str().unwrap()),
+            None,
+            path.parent(),
+            "固定分组：会话 a 与 b".into(),
+            CancellationToken::new(),
+            |event| {
+                if matches!(event, AnalysisEvent::Turn(_)) {
+                    saw_turn = true;
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(saw_turn);
+        assert_eq!(output.text, "{\"name\": \"测试工作流\"}");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancelling_workstream_name_interrupts_its_temporary_turn() {
+        let path = fake_binary("analysis-cancel");
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        let result = analyze_workstream_name(
+            Some(path.to_str().unwrap()),
+            None,
+            path.parent(),
+            "固定分组".into(),
+            cancel,
+            |event| {
+                if matches!(event, AnalysisEvent::Turn(_)) {
+                    trigger.cancel();
+                }
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError {
+                code: ErrorCode::AnalysisCancelled,
+                ..
+            })
+        ));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

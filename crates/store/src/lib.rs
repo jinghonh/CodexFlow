@@ -5,7 +5,7 @@ use codexflow_domain::{
     InferredPairOutcome, InferredRelation, ListScopeStatus, LocalProject, ObservedRelation,
     Preferences, ProjectCatalog, ProjectSessions, RelationReview, SessionList, SourceEvidence,
     SourceFact, SummaryRun, SummaryRunState, ThreadAttribution, ThreadMetadata, ThreadSummary,
-    UserRelationDecision,
+    UserRelationDecision, Workstream,
 };
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{
@@ -120,7 +120,7 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 12 {
+        if version > 13 {
             return Err(AppError::migration(
                 "会话数据库来自更新版本的应用，请使用相应版本打开。",
             ));
@@ -412,6 +412,18 @@ impl SessionStore {
                 .commit()
                 .map_err(|_| AppError::migration("提交关系裁决数据库迁移失败，原数据已保留。"))?;
         }
+        if version < 13 {
+            connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS workstreams (
+                    id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL,
+                    stream_json TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS workstreams_project ON workstreams(project_id);
+                PRAGMA user_version = 13;",
+                )
+                .map_err(|_| AppError::migration("迁移工作流数据库失败，原数据已保留。"))?;
+        }
         store.recover_interrupted_runs()?;
         store.recover_interrupted_summary_runs()?;
         store.recover_interrupted_analysis_runs()?;
@@ -425,6 +437,199 @@ impl SessionStore {
             .busy_timeout(Duration::from_secs(5))
             .map_err(|_| AppError::store("设置会话数据库等待时间失败。"))?;
         Ok(connection)
+    }
+
+    pub fn workstreams(&self, project_id: &str) -> Result<Vec<Workstream>, AppError> {
+        let connection = self.connection()?;
+        let mut statement = connection
+            .prepare("SELECT stream_json FROM workstreams WHERE project_id=?1 ORDER BY id")
+            .map_err(|_| AppError::store("读取工作流失败。"))?;
+        let streams = statement
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("读取工作流失败。"))?
+            .map(|row| {
+                let json = row.map_err(|_| AppError::store("读取工作流失败。"))?;
+                serde_json::from_str(&json).map_err(|_| AppError::store("解析工作流失败。"))
+            })
+            .collect();
+        streams
+    }
+
+    pub fn replace_workstreams(
+        &self,
+        project_id: &str,
+        streams: &[Workstream],
+    ) -> Result<(), AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AppError::store("开始保存工作流失败。"))?;
+        transaction
+            .execute("DELETE FROM workstreams WHERE project_id=?1", [project_id])
+            .map_err(|_| AppError::store("清理旧工作流失败。"))?;
+        for stream in streams {
+            if stream.project_id != project_id {
+                return Err(AppError::store("工作流所属项目不一致。"));
+            }
+            let json =
+                serde_json::to_string(stream).map_err(|_| AppError::store("序列化工作流失败。"))?;
+            transaction
+                .execute(
+                    "INSERT INTO workstreams(id,project_id,stream_json) VALUES (?1,?2,?3)",
+                    params![stream.id, project_id, json],
+                )
+                .map_err(|_| AppError::store("保存工作流失败。"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交工作流失败。"))
+    }
+
+    pub fn save_workstream_name(
+        &self,
+        project_id: &str,
+        id: &str,
+        members: &[String],
+        name: &str,
+        input_version: &str,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AppError::store("开始保存工作流名称失败。"))?;
+        let json: Option<String> = transaction
+            .query_row(
+                "SELECT stream_json FROM workstreams WHERE id=?1 AND project_id=?2",
+                params![id, project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取工作流名称失败。"))?;
+        let Some(json) = json else { return Ok(false) };
+        let mut stream: Workstream =
+            serde_json::from_str(&json).map_err(|_| AppError::store("解析工作流失败。"))?;
+        if stream.members != members {
+            return Ok(false);
+        }
+        stream.name = name.into();
+        stream.name_input_version = Some(input_version.into());
+        stream.name_error = None;
+        let json =
+            serde_json::to_string(&stream).map_err(|_| AppError::store("序列化工作流失败。"))?;
+        transaction
+            .execute(
+                "UPDATE workstreams SET stream_json=?1 WHERE id=?2 AND project_id=?3",
+                params![json, id, project_id],
+            )
+            .map_err(|_| AppError::store("保存工作流名称失败。"))?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交工作流名称失败。"))?;
+        Ok(true)
+    }
+
+    pub fn save_workstream_name_error(
+        &self,
+        project_id: &str,
+        id: &str,
+        members: &[String],
+        message: &str,
+    ) -> Result<(), AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AppError::store("开始保存命名错误失败。"))?;
+        let json: Option<String> = transaction
+            .query_row(
+                "SELECT stream_json FROM workstreams WHERE id=?1 AND project_id=?2",
+                params![id, project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取工作流失败。"))?;
+        if let Some(json) = json {
+            let mut stream: Workstream =
+                serde_json::from_str(&json).map_err(|_| AppError::store("解析工作流失败。"))?;
+            if stream.members == members && stream.name_input_version.is_none() {
+                stream.name_error = Some(message.into());
+                let json = serde_json::to_string(&stream)
+                    .map_err(|_| AppError::store("序列化工作流失败。"))?;
+                transaction
+                    .execute(
+                        "UPDATE workstreams SET stream_json=?1 WHERE id=?2",
+                        params![json, id],
+                    )
+                    .map_err(|_| AppError::store("保存命名错误失败。"))?;
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交命名错误失败。"))
+    }
+
+    pub fn save_analysis_with_workstream_name(
+        &self,
+        run: &AnalysisRun,
+        id: &str,
+        members: &[String],
+        name: &str,
+        input_version: &str,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AppError::store("开始保存命名结果失败。"))?;
+        let current: String = transaction
+            .query_row(
+                "SELECT run_json FROM analysis_runs WHERE id=?1",
+                [&run.id],
+                |row| row.get(0),
+            )
+            .map_err(|_| AppError::store("读取分析运行失败。"))?;
+        let current: AnalysisRun =
+            serde_json::from_str(&current).map_err(|_| AppError::store("解析分析运行失败。"))?;
+        if current.state == AnalysisRunState::Cancelling {
+            return Ok(false);
+        }
+        let stream: Option<String> = transaction
+            .query_row(
+                "SELECT stream_json FROM workstreams WHERE id=?1 AND project_id=?2",
+                params![id, run.project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取工作流失败。"))?;
+        let Some(stream) = stream else {
+            return Ok(false);
+        };
+        let mut stream: Workstream =
+            serde_json::from_str(&stream).map_err(|_| AppError::store("解析工作流失败。"))?;
+        if stream.members != members {
+            return Ok(false);
+        }
+        stream.name = name.into();
+        stream.name_input_version = Some(input_version.into());
+        stream.name_error = None;
+        let stream_json =
+            serde_json::to_string(&stream).map_err(|_| AppError::store("序列化工作流失败。"))?;
+        let run_json =
+            serde_json::to_string(run).map_err(|_| AppError::store("序列化分析运行失败。"))?;
+        transaction
+            .execute(
+                "UPDATE workstreams SET stream_json=?1 WHERE id=?2",
+                params![stream_json, id],
+            )
+            .map_err(|_| AppError::store("保存工作流名称失败。"))?;
+        transaction
+            .execute(
+                "UPDATE analysis_runs SET run_json=?1 WHERE id=?2",
+                params![run_json, run.id],
+            )
+            .map_err(|_| AppError::store("保存分析运行失败。"))?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("提交命名结果失败。"))?;
+        Ok(true)
     }
 
     pub fn save_analysis_run(&self, run: &AnalysisRun) -> Result<(), AppError> {
@@ -2040,6 +2245,52 @@ mod tests {
     }
 
     #[test]
+    fn workstream_name_and_failure_survive_restart() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-workstreams-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let stream = Workstream {
+            id: "stream".into(),
+            project_id: "project".into(),
+            name: "工作流 stream".into(),
+            members: vec!["a".into(), "b".into()],
+            relation_ids: vec!["ab".into()],
+            algorithm_version: "test".into(),
+            name_input_version: None,
+            name_error: None,
+            predecessor_ids: Vec::new(),
+        };
+        store
+            .replace_workstreams("project", &[stream.clone()])
+            .unwrap();
+        store
+            .save_workstream_name_error("project", "stream", &stream.members, "模型失败")
+            .unwrap();
+        assert_eq!(
+            store.workstreams("project").unwrap()[0]
+                .name_error
+                .as_deref(),
+            Some("模型失败")
+        );
+        assert!(!store
+            .save_workstream_name("project", "stream", &["other".into()], "名称", "v1")
+            .unwrap());
+        assert!(store
+            .save_workstream_name("project", "stream", &stream.members, "项目工作", "v1")
+            .unwrap());
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        let saved = reopened.workstreams("project").unwrap();
+        assert_eq!(saved[0].name, "项目工作");
+        assert_eq!(saved[0].name_input_version.as_deref(), Some("v1"));
+        assert_eq!(saved[0].name_error, None);
+        assert!(reopened.workstreams("other").unwrap().is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn newer_database_is_not_replaced_with_an_empty_list() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2050,7 +2301,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 13;")
+            .execute_batch("PRAGMA user_version = 14;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -2061,7 +2312,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2155,7 +2406,7 @@ mod tests {
     }
 
     #[test]
-    fn either_issue_v8_database_upgrades_to_the_complete_v12_schema() {
+    fn either_issue_v8_database_upgrades_to_the_complete_v13_schema() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2197,7 +2448,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 12);
+            assert_eq!(version, 13);
             for table in [
                 "automatic_candidate_views",
                 "thread_summaries",
@@ -2551,7 +2802,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2612,7 +2863,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -2773,7 +3024,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (12, 1));
+        assert_eq!((version, count), (13, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2806,7 +3057,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 13);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -2909,7 +3160,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 12);
+            assert_eq!(version, 13);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

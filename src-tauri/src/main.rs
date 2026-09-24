@@ -3,8 +3,9 @@ use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AppError, CandidatePreview, DisplayTheme,
     EvidenceCheck, EvidencePage, FactPage, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
     HistoryTurnPage, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
-    ProjectGraph, ProjectSessions, ProjectTimeline, RelationReview, SessionList, SourceStatus,
-    SummaryEvidenceCheck, SummaryPreview, SummaryRun, UserRelationDecision,
+    ProjectGraph, ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview,
+    SessionList, SourceStatus, SummaryEvidenceCheck, SummaryPreview, SummaryRun,
+    UserRelationDecision,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -269,6 +270,14 @@ fn get_project_graph(
 }
 
 #[tauri::command]
+fn get_project_workstreams(
+    state: tauri::State<'_, AppState>,
+    project_id: String,
+) -> Result<ProjectWorkstreams, AppError> {
+    service(&state)?.project_workstreams(&project_id)
+}
+
+#[tauri::command]
 fn decide_inferred_relation(
     state: tauri::State<'_, AppState>,
     project_id: String,
@@ -435,6 +444,7 @@ fn main() {
             get_project_catalog,
             get_project_sessions,
             get_project_graph,
+            get_project_workstreams,
             decide_inferred_relation,
             get_candidate_preview,
             get_analysis_preview,
