@@ -9,11 +9,12 @@ import { ProjectAnalysisView } from "./ProjectAnalysisView";
 import { ProjectTimelineView } from "./ProjectTimelineView";
 import { ProjectWorkstreamsView } from "./ProjectWorkstreamsView";
 import { ThreadHistoryView } from "./ThreadHistoryView";
+import { formatAppError } from "./appError";
 import "./style.css";
 
 type Theme = "system" | "light" | "dark";
 type Capability = { state: "available" | "unavailable" | "notVerified"; detail: string };
-type AppError = { code: string; message: string; retryable: boolean; cachePreserved: boolean; backend: string };
+type AppError = { code: string; message: string; retryable: boolean; cachePreserved: boolean; backend: string; nextStep?: string };
 type SourceStatus = {
   selectedBinary: string | null;
   resolvedBinary: string | null;
@@ -67,8 +68,7 @@ const labels: { key: keyof SourceStatus["capabilities"]; title: string; number: 
 ];
 
 function errorText(error: unknown): string {
-  if (typeof error === "object" && error && "message" in error && typeof error.message === "string") return error.message;
-  return "操作失败。请检查桌面应用状态后重试。";
+  return formatAppError(error, "操作失败。请检查桌面应用状态后重试。");
 }
 
 function App() {
@@ -395,7 +395,7 @@ function App() {
         </section>
 
         {pageError && <div className="page-error" role="alert">{pageError}</div>}
-        {source?.error && <div className="error-detail" role="alert"><span className="error-code">{source.error.code}</span><span>{source.error.retryable ? "可以修正后重试。" : "请更换或升级二进制。"} 已有本地数据保持不变。</span></div>}
+        {source?.error && <div className="error-detail" role="alert"><span className="error-code">{source.error.code}</span><span>{source.error.retryable ? "可重试。" : "需先修正原因。"} {source.error.cachePreserved ? "已有缓存保留。" : "请重新确认缓存状态。"} {source.error.nextStep}</span></div>}
 
         <div className="columns">
           <section className="panel choose-panel">
@@ -430,7 +430,7 @@ function App() {
             <label htmlFor="jev-key">API Key<input id="jev-key" type="password" autoComplete="off" spellCheck={false} value={jevKey} onChange={(event) => setJevKey(event.target.value)} placeholder={jevStatus?.credentialError ? "钥匙串不可用；请先解锁" : jevStatus?.credentialConfigured ? "已保存；留空则保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
           </div>
           <p className="jev-key-state">钥匙串状态：{jevStatus?.credentialError ? "暂时无法读取" : jevStatus?.credentialConfigured ? "已保存地址已配置密钥" : "已保存地址未配置密钥"}。更换服务地址时需填写新密钥。{jevUnsaved ? "请先保存修改，再运行验证。" : ""}</p>
-          {jevStatus?.credentialError && <div className="page-error" role="alert">{jevStatus.credentialError.message} 已保存的服务地址与模型仍可查看；解锁后重新检查钥匙串。</div>}
+          {jevStatus?.credentialError && <div className="page-error" role="alert">{errorText(jevStatus.credentialError)}</div>}
           {jevError && <div className="page-error" role="alert">{jevError}</div>}
           <div className="jev-actions">
             <button className="primary-button" disabled={jevBusy} onClick={saveJev}>保存设置</button>
@@ -456,7 +456,7 @@ function App() {
         </section>
         <section id="sessions" className="panel session-panel">
           <div className="session-heading"><div><div className="panel-kicker">03 / 项目会话</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
-          {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{indexRun.error.code}：{indexRun.error.message}</em>}</div>}
+          {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}</div>}
           {!showUnassigned && projectSessions && <div className="workspace-list"><strong>实际工作区</strong>{projectSessions.workspaces.length ? projectSessions.workspaces.map((workspace) => <code key={workspace}>{workspace}</code>) : <span>当前没有可验证的工作区</span>}</div>}
           <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{refreshing ? "刷新中；缓存可浏览" : !attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>选择会话后按需读取回合与条目</span></div>
           {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "已归档" : "未归档"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "上次列表完整" : "最近读取未完成"}</span><small>{scope.completedAtUnixMs ? `上次完整读取 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整读取记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}

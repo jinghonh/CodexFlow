@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { formatAppError } from "./appError";
 
 type Limits = { callLimit: number; concurrencyLimit: number; timeoutSeconds: number; retryLimit: number; inputCharacterLimit: number };
 type Stage = { stage: "summary" | "relation" | "evidenceSelection" | "naming"; service: string; model: string;
@@ -19,8 +20,7 @@ const stageNames: Record<Stage["stage"], string> = { summary: "会话总结", re
 const stateNames: Record<Run["state"], string> = { queued: "待执行", running: "执行中", cancelling: "取消中", cancelled: "已取消",
   paused: "已暂停", complete: "完成", partial: "部分完成", failed: "失败" };
 function message(error: unknown): string {
-  return typeof error === "object" && error !== null && "message" in error && typeof error.message === "string"
-    ? error.message : "分析操作失败。";
+  return formatAppError(error, "分析操作失败。");
 }
 
 export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0, onRelationResultsChanged }: {
@@ -133,8 +133,8 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       <small>此运行固定启动时的模型、超时、重试和输入上限；继续时仅使用上方新的调用上限。</small>
       {run.interrupted && <em>应用退出中断后已恢复状态，可继续未完成单元。</em>}
       {run.pauseReason && <em>{run.pauseReason}</em>}
-      {run.error && <em>{run.error.message}</em>}
-      {run.units.filter((unit) => unit.state === "failed").slice(0, 5).map((unit) => <small key={unit.id}>{unit.id}：{unit.error?.message ?? "分析失败"}</small>)}
+      {run.error && <em>{message(run.error)}</em>}
+      {run.units.filter((unit) => unit.state === "failed").slice(0, 5).map((unit) => <small key={unit.id}>{unit.id}：{unit.error ? message(unit.error) : "分析失败"}</small>)}
       {run.state === "cancelled" && <small>取消已确认本地请求结束；远端服务仍可能计费。</small>}
     </div>}
   </section>;

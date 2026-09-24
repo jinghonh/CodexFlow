@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { formatAppError } from "./appError";
 
 type Grain = "day" | "week" | "month";
 type Quality = "complete" | "partial" | "unknown";
@@ -111,6 +112,7 @@ function duration(value: number | null): string {
 export function ProjectTimelineView({ projectId, refreshVersion, connected, onSelectThread }: {
   projectId: string; refreshVersion: string; connected: boolean; onSelectThread: (threadId: string) => void;
 }) {
+  const loadedProjectId = useRef(projectId);
   const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [error, setError] = useState("");
   const [grain, setGrain] = useState<Grain>("day");
@@ -126,11 +128,14 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
 
   useEffect(() => {
     let active = true;
-    setTimeline(null);
+    if (loadedProjectId.current !== projectId) {
+      loadedProjectId.current = projectId;
+      setTimeline(null);
+    }
     setError("");
     invoke<Timeline>("get_project_timeline", { projectId })
       .then((value) => { if (active) setTimeline(value); })
-      .catch((caught) => { if (active) setError(typeof caught?.message === "string" ? caught.message : "读取项目时间线失败。"); });
+      .catch((caught) => { if (active) setError(formatAppError(caught, "读取项目时间线失败。")); });
     return () => { active = false; };
   }, [projectId, refreshVersion]);
 

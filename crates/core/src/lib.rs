@@ -183,6 +183,12 @@ impl SourceService {
                 false,
             ));
         }
+        let replacing_key = api_key.is_some();
+        let previous_credential = if replacing_key {
+            self.credentials.load()?
+        } else {
+            None
+        };
         if let Some(key) = api_key {
             self.credentials.save(&Credential {
                 base_url: base_url.clone(),
@@ -195,7 +201,23 @@ impl SourceService {
             model,
         };
         next.jev_revision = next.jev_revision.saturating_add(1);
-        self.store.save(&next)?;
+        if let Err(error) = self.store.save(&next) {
+            if replacing_key {
+                let restored = if let Some(previous) = previous_credential {
+                    self.credentials.save(&previous)
+                } else {
+                    self.credentials.delete()
+                };
+                if restored.is_err() {
+                    return Err(AppError::jev(
+                        ErrorCode::JevCredentialFailed,
+                        "设置保存失败，且无法恢复之前的钥匙串状态；请重新填写当前服务地址的 API Key。",
+                        true,
+                    ));
+                }
+            }
+            return Err(error);
+        }
         *preferences = next;
         drop(preferences);
         self.jev_status().await
@@ -1512,8 +1534,19 @@ mod tests {
             .unwrap();
         assert!(first.credential_configured);
         assert_eq!(first.config.base_url, "https://api.typesafe.ai");
-        let persisted = fs::read_to_string(dir.join("preferences.json")).unwrap();
+        let persisted: String = rusqlite::Connection::open(dir.join("sessions.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT preferences_json FROM app_preferences WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!persisted.contains("synthetic-secret"));
+        assert!(!fs::read(dir.join("sessions.sqlite3"))
+            .unwrap()
+            .windows(b"synthetic-secret".len())
+            .any(|bytes| bytes == b"synthetic-secret"));
         drop(service);
 
         let reopened = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
@@ -1542,6 +1575,126 @@ mod tests {
             reopened.test_jev_inference().await.unwrap_err().code,
             ErrorCode::JevNotConfigured
         ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn sqlite_write_conflict_does_not_report_settings_saved_or_replace_key() {
+        let dir = temp_data_dir();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let service = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
+        service
+            .save_jev(
+                "https://api.typesafe.ai".into(),
+                "jev-1.13.0".into(),
+                Some("old-synthetic-key".into()),
+            )
+            .await
+            .unwrap();
+        service.set_theme(DisplayTheme::Dark).await.unwrap();
+        let lock = rusqlite::Connection::open(dir.join("sessions.sqlite3")).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let error = service
+            .save_jev(
+                "https://other.example".into(),
+                "jev-new".into(),
+                Some("new-synthetic-key".into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error.code, ErrorCode::StorageFailed));
+        assert!(error.retryable && error.cache_preserved);
+        let status = service.jev_status().await.unwrap();
+        assert!(status.credential_configured);
+        assert_eq!(status.config.base_url, "https://api.typesafe.ai");
+        assert_eq!(
+            credentials.load().unwrap().unwrap().key,
+            "old-synthetic-key"
+        );
+        assert!(matches!(service.settings().await.0, DisplayTheme::Dark));
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(service);
+        let reopened = SourceService::with_credentials(dir.clone(), credentials).unwrap();
+        assert!(reopened.jev_status().await.unwrap().credential_configured);
+        assert_eq!(
+            reopened.jev_status().await.unwrap().config.model,
+            "jev-1.13.0"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn read_only_database_does_not_report_settings_saved() {
+        let dir = temp_data_dir();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let service = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
+        service.set_theme(DisplayTheme::Dark).await.unwrap();
+        let database = dir.join("sessions.sqlite3");
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o444)).unwrap();
+        let error = service.set_theme(DisplayTheme::Light).await.unwrap_err();
+        assert!(matches!(error.code, ErrorCode::StorageFailed));
+        assert!(error.cache_preserved);
+        assert!(matches!(service.settings().await.0, DisplayTheme::Dark));
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(service);
+        let reopened = SourceService::with_credentials(dir.clone(), credentials).unwrap();
+        assert!(matches!(reopened.settings().await.0, DisplayTheme::Dark));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn service_upgrades_settings_with_keychain_reference_and_rejects_future_schema() {
+        let dir = temp_data_dir();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let original = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
+        original
+            .save_jev(
+                "https://api.typesafe.ai/gateway".into(),
+                "jev-1.13.0".into(),
+                Some("synthetic-only-key".into()),
+            )
+            .await
+            .unwrap();
+        let preferences = original.preferences.lock().await.clone();
+        fs::write(
+            dir.join("preferences.json"),
+            serde_json::to_vec(&preferences).unwrap(),
+        )
+        .unwrap();
+        drop(original);
+        let database = dir.join("sessions.sqlite3");
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("DROP TABLE app_preferences; PRAGMA user_version = 14;")
+            .unwrap();
+        drop(connection);
+        let upgraded = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
+        let status = upgraded.jev_status().await.unwrap();
+        assert!(status.credential_configured);
+        assert_eq!(status.config.model, "jev-1.13.0");
+        assert_eq!(status.config.base_url, "https://api.typesafe.ai/gateway");
+        fs::remove_file(dir.join("preferences.json")).unwrap();
+        drop(upgraded);
+        let reopened = SourceService::with_credentials(dir.clone(), credentials).unwrap();
+        assert!(reopened.jev_status().await.unwrap().credential_configured);
+        drop(reopened);
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version = 16;")
+            .unwrap();
+        drop(connection);
+        let error =
+            SourceService::with_credentials(dir.clone(), Arc::new(MemoryCredentials::default()))
+                .err()
+                .expect("future schema must be refused");
+        assert!(matches!(error.code, ErrorCode::DatabaseTooNew));
+        assert!(!error.retryable && error.cache_preserved);
+        let version: i64 = rusqlite::Connection::open(&database)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 16);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1598,7 +1751,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error.code, ErrorCode::JevCredentialFailed));
-        assert!(!dir.join("preferences.json").exists());
+        let persisted: i64 = rusqlite::Connection::open(dir.join("sessions.sqlite3"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM app_preferences", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(persisted, 0);
         let status = service.jev_status().await.unwrap();
         assert_eq!(status.config.base_url, "https://api.typesafe.ai");
         assert!(!status.credential_configured);
@@ -3409,6 +3566,408 @@ mod tests {
             ["c", "d"]
         );
         assert_eq!(view.ungrouped_thread_ids, ["x"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn complete_cached_project_recovers_through_public_service_after_restart() {
+        use codexflow_domain::{
+            AnalysisRun, AnalysisRunState, AnalysisStage, AnalysisUnit, AnalysisUnitState,
+            CandidateEvidence, CausalTimeCheck, EvidenceField, EvidencePair, EvidenceState,
+            HistoryItem, HistoryReadPath, HistorySnapshot, HistoryTurn, IndexRun, IndexRunState,
+            InferredRelation, InferredRelationKind, SummaryRun, SummaryRunState, ThreadMetadata,
+            ThreadSummary, ThreadSummaryContent, UserRelationDecision,
+        };
+
+        let root = temp_data_dir();
+        let project_path = root.join("project");
+        let data = root.join("data");
+        fs::create_dir_all(&project_path).unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let service = SourceService::with_credentials(data.clone(), credentials.clone()).unwrap();
+        service
+            .save_jev(
+                "https://api.typesafe.ai".into(),
+                "jev-1.13.0".into(),
+                Some("synthetic-only-key".into()),
+            )
+            .await
+            .unwrap();
+        let thread = |id: &str, parent: Option<&str>| ThreadMetadata {
+            id: id.into(),
+            session_id: id.into(),
+            title: Some(id.into()),
+            preview: id.into(),
+            cwd: project_path.to_string_lossy().into_owned(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: parent.map(str::to_owned),
+            forked_from_id: None,
+            git: None,
+            created_at: 1,
+            updated_at: 2,
+            archived: false,
+            metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
+            content_complete: false,
+            read_error: None,
+            observed_at_unix_ms: 2,
+        };
+        service
+            .sessions
+            .save_collection(
+                &[thread("a", None), thread("b", Some("a")), thread("x", None)],
+                &[],
+            )
+            .unwrap();
+        let project_id = service
+            .choose_project(project_path.to_str().unwrap())
+            .unwrap()
+            .selected_project_id
+            .unwrap();
+        let snapshot = HistorySnapshot {
+            coverage: codexflow_domain::HistoryCoverage {
+                thread_id: "a".into(),
+                source_updated_at: 2,
+                attempted_at_unix_ms: 3,
+                path: HistoryReadPath::FullRead,
+                turns_complete: true,
+                items_complete: true,
+                turn_pages: 0,
+                item_pages: 0,
+                loaded_turns: 1,
+                loaded_items: 1,
+                incompatible: false,
+                error: None,
+            },
+            turns: vec![HistoryTurn {
+                thread_id: "a".into(),
+                id: "turn".into(),
+                ordinal: 0,
+                status: "completed".into(),
+                started_at_unix_ms: Some(10),
+                completed_at_unix_ms: Some(20),
+                duration_ms: Some(10),
+                time_error: None,
+                source_updated_at: 2,
+                content_version: "turn-v1".into(),
+            }],
+            items: vec![HistoryItem {
+                thread_id: "a".into(),
+                turn_id: "turn".into(),
+                id: "item".into(),
+                ordinal: 0,
+                source_type: "commandExecution".into(),
+                supported: true,
+                text: None,
+                command: Some("cargo test".into()),
+                cwd: None,
+                output: None,
+                exit_code: Some(0),
+                status: Some("completed".into()),
+                changes: vec![],
+                source_updated_at: 2,
+                content_version: "item-v1".into(),
+            }],
+        };
+        service.sessions.save_history(&snapshot).unwrap();
+        let evidence = service
+            .source_evidence("a", 0, 10)
+            .unwrap()
+            .evidence
+            .remove(0);
+        let summary = ThreadSummary {
+            thread_id: "a".into(),
+            content: ThreadSummaryContent {
+                goal: "验证项目".into(),
+                activity: "运行测试".into(),
+                outcome: "通过".into(),
+                decisions: "保留实现".into(),
+                issues: "无".into(),
+            },
+            evidence_ids: vec![evidence.id.clone()],
+            evidence_refs: vec![],
+            model: "synthetic-model".into(),
+            requested_model: None,
+            binary_path: None,
+            binary_fingerprint: None,
+            binary_version: None,
+            input_digest: "synthetic".into(),
+            source_updated_at: 2,
+            history_generation: service.sessions.history_generation("a").unwrap(),
+            created_at_unix_ms: 4,
+        };
+        assert!(service
+            .sessions
+            .save_summary_if_current(&summary, summary.history_generation)
+            .unwrap());
+        let mut streams = service.project_workstreams(&project_id).unwrap();
+        let stream_id = streams
+            .workstreams
+            .iter()
+            .find(|stream| stream.members == ["a", "b"])
+            .unwrap()
+            .id
+            .clone();
+        service
+            .rename_workstream(&project_id, &stream_id, "人工主线", streams.revision)
+            .unwrap();
+        streams = service.project_workstreams(&project_id).unwrap();
+        service
+            .move_thread_to_workstream(&project_id, "x", Some(&stream_id), streams.revision)
+            .unwrap();
+
+        let relation_id = inferred::relation_id("a", "b", InferredRelationKind::Related);
+        let candidate_evidence = |thread_id: &str| CandidateEvidence {
+            id: format!("evidence-{thread_id}"),
+            thread_id: thread_id.into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+            field: EvidenceField::Command,
+            change_index: None,
+            excerpt: "cargo test".into(),
+            content_version: "item-v1".into(),
+            fact_id: None,
+        };
+        let relation = InferredRelation {
+            id: relation_id.clone(),
+            project_id: project_id.clone(),
+            candidate_id: "candidate".into(),
+            from_thread_id: "a".into(),
+            to_thread_id: "b".into(),
+            kind: InferredRelationKind::Related,
+            source: "jev".into(),
+            requested_model: "jev-1.13.0".into(),
+            actual_model: "jev-1.13.0".into(),
+            confidence: 0.8,
+            probabilities: Default::default(),
+            evidence_confidence: 0.8,
+            evidence_probabilities: Default::default(),
+            evidence: EvidencePair {
+                id: "pair".into(),
+                left: candidate_evidence("a"),
+                right: candidate_evidence("b"),
+            },
+            time_check: CausalTimeCheck::Unverifiable,
+            explanation: "合成关系".into(),
+            input_version: "synthetic-v1".into(),
+        };
+        service
+            .sessions
+            .save_relation_review(
+                &project_id,
+                &relation_id,
+                UserRelationDecision::Rejected,
+                None,
+                0,
+                Some(&relation),
+            )
+            .unwrap();
+        service
+            .sessions
+            .save_index_run(&IndexRun {
+                id: "index-interrupted".into(),
+                project_id: Some(project_id.clone()),
+                state: IndexRunState::Running,
+                started_at_unix_ms: 5,
+                finished_at_unix_ms: None,
+                pages_saved: 1,
+                threads_seen: 3,
+                error: None,
+                interrupted: false,
+            })
+            .unwrap();
+        service
+            .sessions
+            .save_summary_run(&SummaryRun {
+                id: "summary-interrupted".into(),
+                thread_id: "a".into(),
+                state: SummaryRunState::Running,
+                model: "synthetic-model".into(),
+                started_at_unix_ms: 6,
+                finished_at_unix_ms: None,
+                temporary_thread_id: None,
+                turn_id: None,
+                reused_cache: false,
+                error: None,
+            })
+            .unwrap();
+        service
+            .sessions
+            .save_analysis_run(&AnalysisRun {
+                id: "analysis-interrupted".into(),
+                project_id: project_id.clone(),
+                state: AnalysisRunState::Running,
+                pause_reason: None,
+                input_version: "synthetic-v1".into(),
+                codex_binary: None,
+                codex_binary_fingerprint: None,
+                codex_version: None,
+                codex_model: "synthetic-model".into(),
+                jev_base_url: "https://api.typesafe.ai".into(),
+                jev_model: "jev-1.13.0".into(),
+                jev_rules_version: "synthetic".into(),
+                jev_config_revision: 1,
+                jev_pinned_model: Some("jev-1.13.0".into()),
+                jev_probe_attempts: 0,
+                limits: Default::default(),
+                batch_number: 1,
+                batch_calls: 1,
+                total_calls: 1,
+                total_questions: 0,
+                input_tokens: None,
+                output_tokens: None,
+                processed: 1,
+                succeeded: 1,
+                failed: 0,
+                pending: 1,
+                units: [AnalysisUnitState::Succeeded, AnalysisUnitState::Running]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, state)| AnalysisUnit {
+                        id: format!("unit-{index}"),
+                        stage: AnalysisStage::Summary,
+                        input_version: "synthetic-v1".into(),
+                        state,
+                        attempts: 1,
+                        active_summary_run_id: Some("summary-interrupted".into()),
+                        requested_model: "synthetic-model".into(),
+                        actual_model: None,
+                        error: None,
+                        relation_classification: None,
+                    })
+                    .collect(),
+                relations_planned: false,
+                names_planned: false,
+                started_at_unix_ms: 7,
+                finished_at_unix_ms: None,
+                interrupted: false,
+                error: None,
+            })
+            .unwrap();
+        let previous_settings = service.preferences.lock().await.clone();
+        fs::write(
+            data.join("preferences.json"),
+            serde_json::to_vec(&previous_settings).unwrap(),
+        )
+        .unwrap();
+        drop(service);
+
+        let connection = rusqlite::Connection::open(data.join("sessions.sqlite3")).unwrap();
+        connection
+            .execute_batch("DROP TABLE app_preferences; PRAGMA user_version = 14;")
+            .unwrap();
+        drop(connection);
+
+        let reopened = SourceService::with_credentials(data, credentials).unwrap();
+        assert_eq!(
+            reopened
+                .project_catalog()
+                .unwrap()
+                .selected_project_id
+                .as_deref(),
+            Some(project_id.as_str())
+        );
+        assert_eq!(
+            reopened
+                .project_sessions(&project_id)
+                .unwrap()
+                .threads
+                .len(),
+            3
+        );
+        assert_eq!(reopened.source_facts("a", 0, 10).unwrap().total, 1);
+        assert_eq!(
+            reopened
+                .validate_source_evidence(&evidence.id)
+                .unwrap()
+                .state,
+            EvidenceState::Valid
+        );
+        assert_eq!(
+            reopened
+                .summary_preview("a")
+                .await
+                .unwrap()
+                .cached_summary
+                .unwrap()
+                .content
+                .goal,
+            "验证项目"
+        );
+        assert!(reopened.jev_status().await.unwrap().credential_configured);
+        let reviewed = reopened
+            .project_graph(&project_id)
+            .unwrap()
+            .reviewed_relations;
+        assert_eq!(
+            reviewed
+                .iter()
+                .find(|item| item.relation.id == relation_id)
+                .unwrap()
+                .review
+                .decision,
+            UserRelationDecision::Rejected
+        );
+        let streams = reopened.project_workstreams(&project_id).unwrap();
+        assert_eq!(
+            streams
+                .workstreams
+                .iter()
+                .find(|stream| stream.id == stream_id)
+                .unwrap()
+                .name,
+            "人工主线"
+        );
+        assert!(streams
+            .workstreams
+            .iter()
+            .find(|stream| stream.id == stream_id)
+            .unwrap()
+            .members
+            .contains(&"x".into()));
+        let run = reopened.latest_analysis_run(&project_id).unwrap().unwrap();
+        assert_eq!(run.state, AnalysisRunState::Paused);
+        assert!(run.interrupted);
+        assert_eq!(run.units[0].state, AnalysisUnitState::Succeeded);
+        assert_eq!(run.units[1].state, AnalysisUnitState::Pending);
+        assert!(reopened.latest_refresh().unwrap().unwrap().interrupted);
+        assert_eq!(
+            reopened.latest_summary_run("a").unwrap().unwrap().state,
+            SummaryRunState::Failed
+        );
+        reopened
+            .sessions
+            .save_collection(
+                &[thread("a", None), thread("b", Some("a")), thread("x", None)],
+                &[],
+            )
+            .unwrap();
+        reopened.reconcile_projects().unwrap();
+        assert_eq!(
+            reopened
+                .project_graph(&project_id)
+                .unwrap()
+                .reviewed_relations[0]
+                .review
+                .decision,
+            UserRelationDecision::Rejected
+        );
+        assert_eq!(
+            reopened
+                .project_workstreams(&project_id)
+                .unwrap()
+                .workstreams
+                .iter()
+                .find(|stream| stream.id == stream_id)
+                .unwrap()
+                .name,
+            "人工主线"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

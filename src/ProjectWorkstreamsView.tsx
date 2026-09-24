@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { formatAppError } from "./appError";
 
 type Stream = { id: string; name: string; members: string[]; relationIds: string[];
   nameInputVersion: string | null; nameError: string | null };
@@ -15,6 +16,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
   projectId: string; refreshVersion: number; onSelectThread: (id: string) => void;
   onSelectEvidence: (evidence: { threadId: string; turnId: string; itemId: string }) => void;
 }) {
+  const loadedProjectId = useRef(projectId);
   const [view, setView] = useState<View | null>(null);
   const [graph, setGraph] = useState<Graph | null>(null);
   const [error, setError] = useState("");
@@ -26,12 +28,16 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
   const [saved, setSaved] = useState("");
   useEffect(() => {
     let active = true;
+    if (loadedProjectId.current !== projectId) {
+      loadedProjectId.current = projectId;
+      setView(null); setGraph(null); setSelectedId(null);
+    }
     Promise.all([
       invoke<View>("get_project_workstreams", { projectId }),
       invoke<Graph>("get_project_graph", { projectId }),
     ]).then(([nextView, nextGraph]) => {
       if (active) { setView(nextView); setGraph(nextGraph); setError(""); }
-    }).catch((caught) => { if (active) setError(caught?.message || "无法读取工作流。"); });
+    }).catch((caught) => { if (active) setError(formatAppError(caught, "无法读取工作流。")); });
     return () => { active = false; };
   }, [projectId, refreshVersion]);
   const selected = view?.workstreams.find((item) => item.id === selectedId) ?? view?.workstreams[0];
@@ -42,7 +48,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
     const failure = caught as { code?: string; message?: string };
     return failure?.code === "CONCURRENT_MODIFICATION"
       ? "工作流已被更新。请刷新工作流后重试；编辑内容已保留。"
-      : failure?.message || "保存工作流失败，请重试。";
+      : formatAppError(caught, "保存工作流失败，请重试。");
   };
   async function refresh() {
     try {

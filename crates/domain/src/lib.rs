@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 
 mod timeline;
 pub use timeline::{
@@ -6,7 +6,7 @@ pub use timeline::{
     TimelineTurn, TurnTimeState,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppError {
     pub code: ErrorCode,
@@ -18,7 +18,77 @@ pub struct AppError {
     pub retry_after_ms: Option<u64>,
 }
 
+impl Serialize for AppError {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut state = serializer.serialize_struct("AppError", 7)?;
+        state.serialize_field("code", &self.code)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("retryable", &self.retryable)?;
+        state.serialize_field("cachePreserved", &self.cache_preserved)?;
+        state.serialize_field("backend", &self.backend)?;
+        state.serialize_field("retryAfterMs", &self.retry_after_ms)?;
+        state.serialize_field("nextStep", self.next_step())?;
+        state.end()
+    }
+}
+
 impl AppError {
+    pub fn next_step(&self) -> &'static str {
+        match self.code {
+            ErrorCode::StorageFailed => "检查应用数据目录权限、可用空间和其他写入进程，然后重试。",
+            ErrorCode::MigrationFailed => {
+                "保留数据库文件，修复存储问题后重启应用；若仍失败，请使用受支持的应用版本。"
+            }
+            ErrorCode::DatabaseTooNew => {
+                "使用创建此数据库的较新版本应用打开；不要覆盖或删除原数据库。"
+            }
+            ErrorCode::ConcurrentModification => "刷新当前项目后重新提交修改。",
+            ErrorCode::JevCredentialFailed => {
+                "解锁钥匙串并允许应用访问；如密钥已删除，请重新填写 API Key。"
+            }
+            ErrorCode::JevNotConfigured => "为当前服务地址填写并保存 API Key。",
+            ErrorCode::JevInvalidAddress => "填写有效的 HTTPS 服务根地址并重新保存。",
+            ErrorCode::JevAuthenticationFailed | ErrorCode::AnalysisAuthenticationFailed => {
+                "检查对应服务的凭据后重试。"
+            }
+            ErrorCode::JevQuotaExceeded | ErrorCode::AnalysisQuotaExceeded => {
+                "检查对应服务的额度或账户状态后重试。"
+            }
+            ErrorCode::JevRateLimited
+            | ErrorCode::JevOverloaded
+            | ErrorCode::AnalysisOverloaded => "稍后重试；已保存的结果仍可查看。",
+            ErrorCode::BinaryUnavailable
+            | ErrorCode::SpawnFailed
+            | ErrorCode::InitializeFailed
+            | ErrorCode::ProtocolIncompatible
+            | ErrorCode::ProcessExited => "检查或更换 Codex 二进制后重试，已有缓存仍可查看。",
+            ErrorCode::SourceReadFailed => "检查 Codex 来源状态后重新刷新，已有缓存仍可查看。",
+            ErrorCode::JevConnectionFailed | ErrorCode::JevTimeout => {
+                "检查服务地址与网络连接后重试。"
+            }
+            ErrorCode::JevModelUnsupported | ErrorCode::AnalysisModelUnsupported => {
+                "检查模型 ID 与服务支持情况后重试。"
+            }
+            ErrorCode::JevProtocolInvalid
+            | ErrorCode::JevInvalidRequest
+            | ErrorCode::AnalysisInvalidResult => "检查配置或结果详情，修正后重新运行。",
+            ErrorCode::JevCancelled | ErrorCode::AnalysisCancelled => "需要时重新启动分析。",
+            ErrorCode::ProjectResolutionFailed => "检查项目路径与工作区归属后重新选择项目。",
+            ErrorCode::RefreshAlreadyRunning | ErrorCode::AnalysisAlreadyRunning => {
+                "等待当前运行结束，或先取消当前运行。"
+            }
+            ErrorCode::RefreshNotFound | ErrorCode::AnalysisNotFound => "刷新运行状态后重试。",
+            ErrorCode::AnalysisBudgetInvalid => "调整分析调用预算后重试。",
+            ErrorCode::AnalysisConfigChanged => "刷新分析预览并使用当前配置重新运行。",
+            ErrorCode::AnalysisTimeout | ErrorCode::AnalysisUnavailable => {
+                "检查分析服务状态后重试，已有结果仍可查看。"
+            }
+        }
+    }
+
     pub fn jev(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
         Self {
             code,
@@ -55,6 +125,17 @@ impl AppError {
         Self {
             code: ErrorCode::MigrationFailed,
             message: message.into(),
+            retryable: false,
+            cache_preserved: true,
+            backend: "store".into(),
+            retry_after_ms: None,
+        }
+    }
+
+    pub fn database_too_new() -> Self {
+        Self {
+            code: ErrorCode::DatabaseTooNew,
+            message: "会话数据库来自更新版本的应用，当前版本无法安全打开。".into(),
             retryable: false,
             cache_preserved: true,
             backend: "store".into(),
@@ -120,6 +201,7 @@ pub enum ErrorCode {
     JevCancelled,
     JevCredentialFailed,
     MigrationFailed,
+    DatabaseTooNew,
     ProjectResolutionFailed,
     RefreshAlreadyRunning,
     RefreshNotFound,

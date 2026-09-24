@@ -1,6 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { formatAppError } from "./appError";
 
 type Summary = { content: { goal: string; activity: string; outcome: string; decisions: string; issues: string };
   evidenceIds: string[]; model: string; createdAtUnixMs: number; sourceUpdatedAt: number; inputDigest?: string };
@@ -18,14 +19,14 @@ type SummaryEvidenceCheck = { id: string; state: "valid" | "missingThread" | "mi
   itemId: string | null; location: Location | null; excerpt: string | null };
 
 function errorText(error: unknown): string {
-  return typeof error === "object" && error !== null && "message" in error && typeof error.message === "string"
-    ? error.message : "总结请求失败。";
+  return formatAppError(error, "总结请求失败。");
 }
 
 export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
   threadId: string; connected: boolean; revision: number;
   onLocate: (location: Location, itemId: string) => Promise<void>;
 }) {
+  const loadedThreadId = useRef(threadId);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [run, setRun] = useState<Run | null>(null);
   const [error, setError] = useState("");
@@ -35,7 +36,11 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
 
   useEffect(() => {
     let active = true;
-    setPreview(null);
+    if (loadedThreadId.current !== threadId) {
+      loadedThreadId.current = threadId;
+      setPreview(null);
+      setRun(null);
+    }
     setError("");
     Promise.all([
       invoke<Preview>("get_summary_preview", { threadId }).catch((caught) => {
@@ -43,7 +48,7 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
         return null;
       }),
       invoke<Run | null>("get_latest_summary_run", { threadId }),
-    ]).then(([nextPreview, nextRun]) => { if (active) { setPreview(nextPreview); setRun(nextRun); } })
+    ]).then(([nextPreview, nextRun]) => { if (active) { if (nextPreview) setPreview(nextPreview); setRun(nextRun); } })
       .catch((caught) => { if (active) setError(errorText(caught)); });
     return () => { active = false; };
   }, [threadId, revision]);
@@ -140,7 +145,7 @@ export function ThreadSummaryView({ threadId, connected, revision, onLocate }: {
       {preview.analysisBlockedReason && <em role="alert">{preview.analysisBlockedReason}</em>}
       {summary && <em>{preview.cacheCurrent ? "总结有效" : `总结过期：${preview.staleReason ?? "分析输入已变化"}`}</em>}
     </div>}
-    {run && <p className="history-lookup-message" role="status">{run.state === "running" ? "分析中" : run.state === "cancelling" ? "取消中，等待回合终态或专用进程退出" : run.state === "complete" ? run.reusedCache ? "已复用有效缓存" : "总结已保存" : run.state === "cancelled" ? "已取消，旧总结保留" : "分析失败，旧总结保留"}{run.error ? `：${run.error.message}` : ""}</p>}
+    {run && <p className="history-lookup-message" role="status">{run.state === "running" ? "分析中" : run.state === "cancelling" ? "取消中，等待回合终态或专用进程退出" : run.state === "complete" ? run.reusedCache ? "已复用有效缓存" : "总结已保存" : run.state === "cancelled" ? "已取消，旧总结保留" : "分析失败，旧总结保留"}{run.error ? `：${errorText(run.error)}` : ""}</p>}
     {error && <p className="page-error" role="alert">{error}</p>}
     {summary ? <div className="summary-fields">{(Object.keys(labels) as (keyof typeof labels)[]).map((key) =>
       <div key={key}><strong>{labels[key]}</strong><p>{summary.content[key]}</p></div>)}

@@ -7,18 +7,20 @@ use codexflow_domain::{
     SourceFact, SummaryRun, SummaryRunState, ThreadAttribution, ThreadMetadata, ThreadSummary,
     UserRelationDecision, Workstream,
 };
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Write,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub struct PreferenceStore {
-    path: PathBuf,
+    database_path: PathBuf,
+    legacy_path: PathBuf,
 }
+
+const SESSION_SCHEMA_VERSION: i64 = 15;
 
 pub struct SessionStore {
     path: PathBuf,
@@ -221,14 +223,21 @@ impl SessionStore {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(|_| AppError::store("读取会话数据库版本失败。"))?;
-        if version > 14 {
-            return Err(AppError::migration(
-                "会话数据库来自更新版本的应用，请使用相应版本打开。",
-            ));
+        if version > SESSION_SCHEMA_VERSION {
+            return Err(AppError::database_too_new());
         }
+        if version == SESSION_SCHEMA_VERSION {
+            store.recover_interrupted_runs()?;
+            store.recover_interrupted_summary_runs()?;
+            store.recover_interrupted_analysis_runs()?;
+            return Ok(store);
+        }
+        let mut migration = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| AppError::migration("开始会话数据库升级失败，原数据已保留。"))?;
         if version == 0 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始会话数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -252,8 +261,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交会话数据库迁移失败，原数据已保留。"))?;
         }
         if version < 2 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始项目数据库迁移失败。"))?;
             transaction.execute_batch(
                 "CREATE TABLE projects (
@@ -279,8 +288,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交项目数据库迁移失败，原数据已保留。"))?;
         }
         if version < 3 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始索引运行与观察关系数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -304,8 +313,8 @@ impl SessionStore {
             })?;
         }
         if version < 4 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始合并数据库结构迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -329,8 +338,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交合并数据库结构迁移失败，原数据已保留。"))?;
         }
         if version < 5 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始历史数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -363,8 +372,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交历史数据库迁移失败，原数据已保留。"))?;
         }
         if version < 6 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始条目身份数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -389,8 +398,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交条目身份数据库迁移失败，原数据已保留。"))?;
         }
         if version < 7 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始事实与证据数据库迁移失败。"))?;
             transaction.execute_batch(
                 "CREATE TABLE IF NOT EXISTS source_facts (
@@ -417,8 +426,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交事实与证据数据库迁移失败，原数据已保留。"))?;
         }
         if version < 8 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始规则关系数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -437,8 +446,8 @@ impl SessionStore {
         // The issue branches independently used schema version 8. Version 9 fills
         // in either missing layout so databases from both branches upgrade safely.
         if version < 9 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始总结与规则关系数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -463,8 +472,8 @@ impl SessionStore {
             })?;
         }
         if version < 10 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始分析运行数据库迁移失败。"))?;
             transaction.execute_batch(
                 "CREATE TABLE IF NOT EXISTS analysis_runs (
@@ -479,7 +488,7 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交分析运行数据库迁移失败，原数据已保留。"))?;
         }
         if version < 11 {
-            connection
+            migration
                 .execute_batch(
                     "CREATE TABLE IF NOT EXISTS inferred_pair_outcomes (
                 candidate_id TEXT PRIMARY KEY NOT NULL,
@@ -492,8 +501,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("迁移推断关系数据库失败，原数据已保留。"))?;
         }
         if version < 12 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始关系裁决数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -514,7 +523,7 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("提交关系裁决数据库迁移失败，原数据已保留。"))?;
         }
         if version < 13 {
-            connection
+            migration
                 .execute_batch(
                     "CREATE TABLE IF NOT EXISTS workstreams (
                     id TEXT PRIMARY KEY NOT NULL, project_id TEXT NOT NULL,
@@ -526,8 +535,8 @@ impl SessionStore {
                 .map_err(|_| AppError::migration("迁移工作流数据库失败，原数据已保留。"))?;
         }
         if version < 14 {
-            let transaction = connection
-                .transaction()
+            let transaction = migration
+                .savepoint()
                 .map_err(|_| AppError::migration("开始工作流修正数据库迁移失败。"))?;
             transaction
                 .execute_batch(
@@ -551,6 +560,20 @@ impl SessionStore {
                 .commit()
                 .map_err(|_| AppError::migration("提交工作流修正数据库迁移失败，原数据已保留。"))?;
         }
+        if version < 15 {
+            migration
+                .execute_batch(
+                    "CREATE TABLE app_preferences (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    preferences_json TEXT NOT NULL
+                );
+                PRAGMA user_version = 15;",
+                )
+                .map_err(|_| AppError::migration("迁移应用设置数据库失败，原数据已保留。"))?;
+        }
+        migration
+            .commit()
+            .map_err(|_| AppError::migration("提交会话数据库升级失败，原数据已保留。"))?;
         store.recover_interrupted_runs()?;
         store.recover_interrupted_summary_runs()?;
         store.recover_interrupted_analysis_runs()?;
@@ -2739,46 +2762,60 @@ impl SessionStore {
 impl PreferenceStore {
     pub fn new(app_data_dir: PathBuf) -> Self {
         Self {
-            path: app_data_dir.join("preferences.json"),
+            database_path: app_data_dir.join("sessions.sqlite3"),
+            legacy_path: app_data_dir.join("preferences.json"),
         }
     }
 
     pub fn load(&self) -> Result<Preferences, AppError> {
-        match fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
-                AppError::store("显示设置文件无法读取，请检查应用数据目录中的 preferences.json。")
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Preferences::default()),
-            Err(_) => Err(AppError::store(
-                "读取显示设置失败，请检查应用数据目录权限。",
-            )),
+        let connection = self.connection()?;
+        let stored: Option<String> = connection
+            .query_row(
+                "SELECT preferences_json FROM app_preferences WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取应用设置失败。"))?;
+        if let Some(json) = stored {
+            return serde_json::from_str(&json).map_err(|_| AppError::store("应用设置数据损坏。"));
         }
+        let legacy = match fs::read(&self.legacy_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| {
+                AppError::store("旧应用设置文件无法读取，请检查 preferences.json。")
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Preferences::default())
+            }
+            Err(_) => return Err(AppError::store("读取旧应用设置失败，请检查目录权限。")),
+        };
+        self.save(&legacy)?;
+        Ok(legacy)
     }
 
     pub fn save(&self, preferences: &Preferences) -> Result<(), AppError> {
-        let parent = self.path.parent().expect("preferences path has parent");
-        fs::create_dir_all(parent)
-            .map_err(|_| AppError::store("创建应用数据目录失败，请检查目录权限。"))?;
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let temp = parent.join(format!("preferences.{nonce}.tmp"));
-        let bytes =
-            serde_json::to_vec(preferences).map_err(|_| AppError::store("保存显示设置失败。"))?;
-        let result = (|| {
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            fs::rename(&temp, &self.path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result.map_err(|_| AppError::store("保存显示设置失败，请检查应用数据目录权限。"))
+        let json = serde_json::to_string(preferences)
+            .map_err(|_| AppError::store("编码应用设置失败。"))?;
+        self.connection()?
+            .execute(
+                "INSERT INTO app_preferences(id,preferences_json) VALUES (1,?1)
+             ON CONFLICT(id) DO UPDATE SET preferences_json=excluded.preferences_json",
+                [json],
+            )
+            .map_err(|_| {
+                AppError::store("保存应用设置失败，请检查目录权限、空间或数据库写入冲突。")
+            })?;
+        Ok(())
+    }
+
+    fn connection(&self) -> Result<Connection, AppError> {
+        let connection =
+            Connection::open_with_flags(&self.database_path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .map_err(|_| AppError::store("打开应用设置数据库失败，请检查应用数据目录。"))?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(|_| AppError::store("设置应用设置数据库等待时间失败。"))?;
+        Ok(connection)
     }
 }
 
@@ -2829,6 +2866,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("codexflow-store-test-{nonce}"));
+        SessionStore::new(dir.clone()).unwrap();
         let store = PreferenceStore::new(dir.clone());
         store
             .save(&Preferences {
@@ -2841,6 +2879,47 @@ mod tests {
         let loaded = PreferenceStore::new(dir.clone()).load().unwrap();
         assert_eq!(loaded.selected_binary.as_deref(), Some("/tmp/codex"));
         assert!(matches!(loaded.theme, DisplayTheme::Dark));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn legacy_non_secret_settings_import_once_into_sqlite() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-settings-import-{nonce}"));
+        fs::create_dir_all(&dir).unwrap();
+        let old = Preferences {
+            selected_binary: Some("/tmp/codex".into()),
+            theme: DisplayTheme::Dark,
+            jev: codexflow_domain::JevConfig {
+                base_url: "https://api.typesafe.ai/gateway".into(),
+                model: "jev-1.13.0".into(),
+            },
+            jev_revision: 3,
+        };
+        fs::write(
+            dir.join("preferences.json"),
+            serde_json::to_vec(&old).unwrap(),
+        )
+        .unwrap();
+        SessionStore::new(dir.clone()).unwrap();
+        let settings = PreferenceStore::new(dir.clone());
+        assert_eq!(settings.load().unwrap().jev.model, "jev-1.13.0");
+        fs::remove_file(dir.join("preferences.json")).unwrap();
+        let restored = PreferenceStore::new(dir.clone()).load().unwrap();
+        assert_eq!(restored.jev.base_url, "https://api.typesafe.ai/gateway");
+        assert_eq!(restored.jev_revision, 3);
+        let stored: String = Connection::open(dir.join("sessions.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT preferences_json FROM app_preferences WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stored.contains("API Key"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -2971,18 +3050,75 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 15;")
+            .execute_batch("PRAGMA user_version = 16;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
             .err()
             .expect("migration error");
-        assert!(matches!(error.code, ErrorCode::MigrationFailed));
+        assert!(matches!(error.code, ErrorCode::DatabaseTooNew));
+        let desktop_error = serde_json::to_value(&error).unwrap();
+        assert_eq!(desktop_error["code"], "DATABASE_TOO_NEW");
+        assert_eq!(desktop_error["retryable"], false);
+        assert_eq!(desktop_error["cachePreserved"], true);
+        assert!(desktop_error["nextStep"]
+            .as_str()
+            .unwrap()
+            .contains("较新版本"));
         let connection = Connection::open(&path).unwrap();
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, 16);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_later_migration_rolls_back_earlier_schema_steps() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-migration-rollback-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        store
+            .save_collection(&[thread("原缓存", 200, false, 1_000)], &[])
+            .unwrap();
+        drop(store);
+        let path = dir.join("sessions.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE relation_reviews;
+             DROP TABLE workstreams;
+             DROP TABLE workstream_member_corrections;
+             CREATE TABLE workstream_member_corrections (wrong_column TEXT);
+             PRAGMA user_version = 11;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let error = SessionStore::new(dir.clone())
+            .err()
+            .expect("migration must fail");
+        assert!(matches!(error.code, ErrorCode::MigrationFailed));
+        assert!(error.cache_preserved);
+        assert!(serde_json::to_value(&error).unwrap()["nextStep"].is_string());
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 11);
+        let relation_reviews: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='relation_reviews')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(!relation_reviews);
+        let title: String = connection.query_row(
+            "SELECT json_extract(metadata_json, '$.title') FROM threads WHERE id='duplicate-thread'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(title, "原缓存");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -3109,7 +3245,7 @@ mod tests {
                     .unwrap();
             }
             connection
-                .execute_batch("PRAGMA user_version = 8;")
+                .execute_batch("DROP TABLE app_preferences; PRAGMA user_version = 8;")
                 .unwrap();
             drop(connection);
 
@@ -3118,7 +3254,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 14);
+            assert_eq!(version, 15);
             for table in [
                 "automatic_candidate_views",
                 "thread_summaries",
@@ -3449,7 +3585,7 @@ mod tests {
         let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE history_coverage; DROP TABLE history_turns; DROP TABLE history_items;
+                "DROP TABLE app_preferences; DROP TABLE history_coverage; DROP TABLE history_turns; DROP TABLE history_items;
              PRAGMA user_version = 4;",
             )
             .unwrap();
@@ -3475,7 +3611,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -3491,7 +3627,7 @@ mod tests {
         let connection = Connection::open(dir.join("sessions.sqlite3")).unwrap();
         connection
             .execute_batch(
-                "DROP TABLE history_items;
+                "DROP TABLE app_preferences; DROP TABLE history_items;
              CREATE TABLE history_items (
                 thread_id TEXT NOT NULL, id TEXT NOT NULL, turn_id TEXT NOT NULL,
                 ordinal INTEGER NOT NULL, item_json TEXT NOT NULL,
@@ -3536,7 +3672,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -3697,7 +3833,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (14, 1));
+        assert_eq!((version, count), (15, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -3730,7 +3866,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -3833,7 +3969,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 14);
+            assert_eq!(version, 15);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

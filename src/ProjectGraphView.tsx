@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow, Background, Controls, Handle, MarkerType, Position, type Edge, type Node,
   type NodeProps,
 } from "@xyflow/react";
 import { invoke } from "@tauri-apps/api/core";
 import ELK from "elkjs/lib/elk.bundled.js";
+import { formatAppError } from "./appError";
 import "@xyflow/react/dist/style.css";
 
 type GraphNode = { id: string; title: string | null; referenceOnly: boolean };
@@ -166,6 +167,7 @@ async function layoutGraph(graph: ProjectGraph, showLowConfidence: boolean): Pro
 
 export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }: { projectId: string; refreshVersion: number;
   onSelectEvidence?: (evidence: Evidence) => void }) {
+  const loadedProjectId = useRef(projectId);
   const [graph, setGraph] = useState<ProjectGraph | null>(null);
   const [layout, setLayout] = useState<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }>({ nodes: [], edges: [], warning: "" });
   const [selection, setSelection] = useState<Selection>(null);
@@ -175,7 +177,10 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
   const [showLowConfidence, setShowLowConfidence] = useState(false);
   useEffect(() => {
     let active = true;
-    setGraph(null);
+    if (loadedProjectId.current !== projectId) {
+      loadedProjectId.current = projectId;
+      setGraph(null);
+    }
     setError("");
     invoke<ProjectGraph>("get_project_graph", { projectId })
       .then(async (next) => {
@@ -188,7 +193,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
             ? current : null);
         }
       })
-      .catch((cause) => { if (active) setError(typeof cause?.message === "string" ? cause.message : "关系图读取失败。请重试刷新。"); });
+      .catch((cause) => { if (active) setError(formatAppError(cause, "关系图读取失败。请重试刷新。")); });
     return () => { active = false; };
   }, [projectId, refreshVersion, showLowConfidence]);
 
@@ -222,7 +227,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
       const failure = cause as { code?: string; message?: string };
       setDecisionError(failure?.code === "CONCURRENT_MODIFICATION"
         ? "关系裁决已被更新，请刷新关系图后重试。"
-        : failure?.message || "保存关系裁决失败，请刷新后重试。");
+        : formatAppError(cause, "保存关系裁决失败，请刷新后重试。"));
     } finally {
       setSavingDecision(false);
     }
@@ -235,7 +240,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence }
       setGraph(next);
       setLayout(await layoutGraph(next, showLowConfidence));
     } catch (cause) {
-      setDecisionError((cause as { message?: string })?.message || "刷新关系图失败。");
+      setDecisionError(formatAppError(cause, "刷新关系图失败。"));
     }
   }
 

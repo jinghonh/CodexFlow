@@ -99,3 +99,17 @@ test("可按需读取项目缺失回合并更新活动段", async () => {
   await waitFor(() => expect(document.querySelectorAll(".timeline-segment")).toHaveLength(1));
   expect(vi.mocked(invoke)).toHaveBeenCalledWith("load_thread_history", { threadId: "thread" });
 });
+
+test("同一项目刷新遇到存储故障时保留已加载时间线", async () => {
+  vi.mocked(invoke).mockResolvedValueOnce(timeline).mockRejectedValueOnce({
+    code: "STORAGE_FAILED", message: "读取项目时间线失败。", retryable: true,
+    cachePreserved: true, nextStep: "修复数据目录后重试。",
+  });
+  const view = render(<ProjectTimelineView projectId="project" refreshVersion="0" connected={false} onSelectThread={vi.fn()} />);
+  await screen.findByText("未分组会话");
+  expect(document.querySelectorAll(".timeline-segment")).toHaveLength(2);
+  view.rerender(<ProjectTimelineView projectId="project" refreshVersion="1" connected={false} onSelectThread={vi.fn()} />);
+  await screen.findByText(/STORAGE_FAILED：读取项目时间线失败/);
+  expect(document.querySelectorAll(".timeline-segment")).toHaveLength(2);
+  expect(screen.getByText(/已有缓存保留。下一步：修复数据目录后重试/)).toBeTruthy();
+});

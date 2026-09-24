@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { formatAppError } from "./appError";
 
 type Evidence = { id: string; threadId: string; turnId: string; itemId: string; excerpt: string; contentVersion: string };
 type Pair = { id: string; left: Evidence; right: Evidence };
@@ -14,16 +15,21 @@ const PAGE_SIZE = 25;
 export function CandidatePreviewView({ projectId, refreshVersion, onSelectEvidence }: {
   projectId: string; refreshVersion: string; onSelectEvidence: (evidence: Evidence) => void;
 }) {
+  const loadedProjectId = useRef(projectId);
   const [preview, setPreview] = useState<Preview | null>(null);
   const [error, setError] = useState("");
   const [page, setPage] = useState(0);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   useEffect(() => {
     let active = true;
-    setPreview(null); setError(""); setPage(0); setSelectedId(null);
+    if (loadedProjectId.current !== projectId) {
+      loadedProjectId.current = projectId;
+      setPreview(null); setPage(0); setSelectedId(null);
+    }
+    setError("");
     invoke<Preview>("get_candidate_preview", { projectId })
       .then((value) => { if (active) setPreview(value); })
-      .catch((caught) => { if (active) setError(typeof caught?.message === "string" ? caught.message : "候选清单读取失败。"); });
+      .catch((caught) => { if (active) setError(formatAppError(caught, "候选清单读取失败。")); });
     return () => { active = false; };
   }, [projectId, refreshVersion]);
   const selectedStale = preview?.staleCandidates?.find((entry) => selectedId === `stale:${entry.candidate.id}`);

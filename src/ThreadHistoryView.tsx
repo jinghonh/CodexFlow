@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { ThreadSummaryView } from "./ThreadSummaryView";
+import { formatAppError } from "./appError";
 
 type Coverage = {
   threadId: string; sourceUpdatedAt: number; attemptedAtUnixMs: number;
@@ -36,8 +37,7 @@ const ITEM_LIMIT = 20;
 const FACT_LIMIT = 20;
 
 function errorText(error: unknown): string {
-  return typeof error === "object" && error !== null && "message" in error && typeof error.message === "string"
-    ? error.message : "读取历史失败。";
+  return formatAppError(error, "读取历史失败。");
 }
 
 function time(value: number | null): string {
@@ -133,19 +133,23 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, onHistoryLoa
   const [highlight, setHighlight] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
   const locatedNonce = useRef<number | null>(null);
+  const loadedThreadId = useRef(threadId);
 
   useEffect(() => {
     let active = true;
-    setTurns(null);
-    setItems(null);
-    setSelectedTurnId(null);
-    setTurnOffset(0);
-    setItemOffset(0);
+    if (loadedThreadId.current !== threadId) {
+      loadedThreadId.current = threadId;
+      setTurns(null);
+      setItems(null);
+      setSelectedTurnId(null);
+      setTurnOffset(0);
+      setItemOffset(0);
+      setLookupTurn("");
+      setLookup("");
+      setLookupMessage("");
+      setHighlight(null);
+    }
     setError("");
-    setLookupTurn("");
-    setLookup("");
-    setLookupMessage("");
-    setHighlight(null);
     async function openHistory() {
       try {
         let page = await invoke<TurnPage>("get_history_turns", { threadId, offset: 0, limit: TURN_LIMIT });
