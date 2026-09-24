@@ -12,7 +12,7 @@ use reqwest::header;
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeMap, time::Duration};
 
-/// Bump when relation questions, evidence choices, or their interpretation change.
+/// 关系题目、证据选项或解释规则变化时递增，防止复用旧判断。
 pub const RELATION_RULES_VERSION: &str = "v1-12-choice-2";
 
 const KINDS: &[(InferredRelationKind, &str)] = &[

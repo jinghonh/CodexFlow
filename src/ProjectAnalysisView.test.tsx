@@ -107,3 +107,13 @@ test("Jev 设置版本变化后清除旧预览，取得新服务范围前不可�
   expect(screen.getByText("Jev / jev-new")).toBeTruthy();
   expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(false);
 });
+
+test("分析进度展示别名探测后固定的实际模型版本", async () => {
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") return preview;
+    if (command === "get_latest_analysis_run") return { ...run, state: "paused", jevPinnedModel: "jev-1.13.0", jevProbeAttempts: 2 };
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ProjectAnalysisView projectId="project" refreshVersion="1" />);
+  expect(await screen.findByText("Jev 本批固定版本：jev-1.13.0（合成探测 2 次）")).toBeTruthy();
+});

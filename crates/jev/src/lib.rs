@@ -15,6 +15,18 @@ pub use relation::{JevRelationAnalyzer, RELATION_RULES_VERSION};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 
+fn synthetic_inference_body(model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "state": {"ticket": "合成工单 A", "resolution": "已由小组甲处理"},
+        "model": model,
+        "questions": {"classification": {
+            "type": "choice",
+            "instructions": "这条合成工单是否已处理？",
+            "criteria": {"resolved": "已处理", "unresolved": "尚未处理"}
+        }}
+    })
+}
+
 fn error(code: ErrorCode, message: &'static str, retryable: bool) -> AppError {
     AppError::jev(code, message, retryable)
 }
@@ -120,6 +132,10 @@ pub struct JevClient {
 }
 
 impl JevClient {
+    pub fn synthetic_request_characters(model: &str) -> usize {
+        synthetic_inference_body(model).to_string().chars().count()
+    }
+
     pub fn new() -> Result<Self, AppError> {
         Self::with_timeout(Duration::from_secs(180))
     }
@@ -175,15 +191,7 @@ impl JevClient {
     ) -> Result<JevInferenceResult, AppError> {
         reject_secret_in_model(credential, model)?;
         let url = format!("{}/v1/systemone", normalize_base_url(&credential.base_url)?);
-        let body = serde_json::json!({
-            "state": {"ticket": "合成工单 A", "resolution": "已由小组甲处理"},
-            "model": model,
-            "questions": {"classification": {
-                "type": "choice",
-                "instructions": "这条合成工单是否已处理？",
-                "criteria": {"resolved": "已处理", "unresolved": "尚未处理"}
-            }}
-        });
+        let body = synthetic_inference_body(model);
         let response = self
             .client
             .post(url)

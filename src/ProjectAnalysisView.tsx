@@ -10,6 +10,7 @@ type Preview = { projectId: string; inputVersion: string; stages: Stage[]; cache
   pendingGroups: number | null; limits: Limits; jevConfigured: boolean };
 type Run = { id: string; projectId: string; state: "queued" | "running" | "cancelling" | "cancelled" | "paused" | "complete" | "partial" | "failed";
   pauseReason: string | null; batchNumber: number; batchCalls: number; totalCalls: number; totalQuestions: number;
+  jevPinnedModel?: string | null; jevProbeAttempts?: number;
   inputTokens: number | null; outputTokens: number | null; processed: number; succeeded: number; failed: number; pending: number;
   interrupted: boolean; error: { message: string } | null; limits: Limits;
   units: { id: string; state: string; attempts: number; actualModel: string | null; error: { message: string } | null }[] };
@@ -119,6 +120,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       <span>运行 {run.id}</span><span>已处理 {run.processed}；成功 {run.succeeded}；失败 {run.failed}；待处理 {run.pending}</span>
       <span>本批 {run.batchCalls} / {run.limits.callLimit} 次；累计 {run.totalCalls} 次调用，{run.totalQuestions} 道题</span>
       <span>实际模型：{[...new Set(run.units.map((unit) => unit.actualModel).filter(Boolean))].join("、") || "待确认"}</span>
+      {run.jevPinnedModel && <span>Jev 本批固定版本：{run.jevPinnedModel}{run.jevProbeAttempts ? `（合成探测 ${run.jevProbeAttempts} 次）` : "（固定版本无需探测）"}</span>}
       {(run.inputTokens !== null || run.outputTokens !== null) && <span>服务回报用量：输入 {run.inputTokens ?? "未知"}，输出 {run.outputTokens ?? "未知"} 令牌</span>}
       <small>此运行固定启动时的模型、超时、重试和输入上限；继续时仅使用上方新的调用上限。</small>
       {run.interrupted && <em>应用退出中断后已恢复状态，可继续未完成单元。</em>}

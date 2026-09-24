@@ -5,7 +5,7 @@ use codexflow_domain::{
     AnalysisStagePlan, AnalysisUnit, AnalysisUnitState, AppError, CapabilityState, ErrorCode,
     InferredPairOutcome, JevDecisionIdentity, RelationJudgment, SummaryRun, SummaryRunState,
 };
-use codexflow_jev::{JevRelationAnalyzer, RELATION_RULES_VERSION};
+use codexflow_jev::{JevClient, JevRelationAnalyzer, RELATION_RULES_VERSION};
 use sha2::{Digest, Sha256};
 use std::{
     sync::{
@@ -25,11 +25,20 @@ enum JevUnitResult {
 
 fn pinned_jev_model(model: &str) -> bool {
     model.strip_prefix("jev-").is_some_and(|version| {
-        let parts: Vec<_> = version.split('.').collect();
+        let (base, suffix) = version
+            .split_once('-')
+            .map_or((version, None), |(base, suffix)| (base, Some(suffix)));
+        let parts: Vec<_> = base.split('.').collect();
         parts.len() == 3
             && parts
                 .iter()
                 .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+            && suffix.is_none_or(|suffix| {
+                !suffix.is_empty()
+                    && suffix.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+            })
     })
 }
 
@@ -54,6 +63,9 @@ fn reusable_jev_outcome(
 }
 
 fn stamp_jev_outcome(result: &mut InferredPairOutcome, run: &AnalysisRun, actual_model: &str) {
+    for relation in &mut result.relations {
+        relation.requested_model = run.jev_model.clone();
+    }
     result.jev_identity = Some(JevDecisionIdentity {
         base_url: run.jev_base_url.clone(),
         requested_model: run.jev_model.clone(),
@@ -147,6 +159,22 @@ pub(crate) fn reserve_attempt(
     Ok(())
 }
 
+fn reserve_jev_probe(run: &mut AnalysisRun) -> Result<(), AppError> {
+    if run.batch_calls >= run.limits.call_limit {
+        return Err(core_error(
+            ErrorCode::AnalysisBudgetInvalid,
+            "本批调用达到上限。",
+            true,
+        ));
+    }
+    run.state = AnalysisRunState::Running;
+    run.jev_probe_attempts += 1;
+    run.batch_calls += 1;
+    run.total_calls += 1;
+    run.total_questions += 1;
+    Ok(())
+}
+
 impl SourceService {
     fn analysis_now(&self) -> i64 {
         (self.analysis_clock)()
@@ -223,6 +251,10 @@ impl SourceService {
             }
         }
         let attempts = u64::from(limits.retry_limit) + 1;
+        let alias_probe_calls = u64::from(
+            jev_configured && candidate_upper_bound > 0 && !pinned_jev_model(&jev.config.model),
+        )
+        .saturating_mul(attempts);
         let stages = vec![
             AnalysisStagePlan {
                 stage: AnalysisStage::Summary,
@@ -251,10 +283,14 @@ impl SourceService {
                     jev.config.base_url
                 ),
                 pending_items: pending_candidates,
-                maximum_calls: candidate_upper_bound.saturating_mul(attempts),
+                maximum_calls: candidate_upper_bound.saturating_mul(attempts).saturating_add(alias_probe_calls),
                 available: jev_configured,
                 note: if jev_configured {
-                    "每对候选一次分类 POST；重试另计。只复用服务、规则和实际版本一致的固定模型结果；别名会重新判断。"
+                    if alias_probe_calls > 0 {
+                        "别名先用一次合成 POST 探测并固定本批实际版本；探测和重试计入调用上限。每对候选另有一次分类 POST。"
+                    } else {
+                        "每对候选一次分类 POST；重试另计。只复用服务、规则和实际版本一致的固定模型结果。"
+                    }
                 } else {
                     "Jev 未配置，关系阶段暂不可执行。"
                 }
@@ -446,9 +482,15 @@ impl SourceService {
             codex_version: source.version,
             codex_model: preview.stages[0].model.clone(),
             jev_base_url: jev.jev.base_url,
-            jev_model: jev.jev.model,
+            jev_model: jev.jev.model.clone(),
             jev_rules_version: RELATION_RULES_VERSION.into(),
             jev_config_revision: jev.jev_revision,
+            jev_pinned_model: if pinned_jev_model(&jev.jev.model) {
+                Some(jev.jev.model.clone())
+            } else {
+                None
+            },
+            jev_probe_attempts: 0,
             limits,
             batch_number: 1,
             batch_calls: 0,
@@ -653,6 +695,12 @@ impl SourceService {
         run.limits = limits;
         run.batch_number += 1;
         run.batch_calls = 0;
+        run.jev_probe_attempts = 0;
+        run.jev_pinned_model = if pinned_jev_model(&run.jev_model) {
+            Some(run.jev_model.clone())
+        } else {
+            None
+        };
         let control = AnalysisControl {
             id: run.id.clone(),
             project_id: run.project_id.clone(),
@@ -829,6 +877,17 @@ impl SourceService {
                 run.units[index].stage,
                 AnalysisStage::Relation | AnalysisStage::EvidenceSelection
             ) {
+                if run.jev_pinned_model.is_none() {
+                    self.probe_jev_alias(control, run).await?;
+                    if self
+                        .sessions
+                        .analysis_run(&control.id)?
+                        .is_some_and(|run| run.state == AnalysisRunState::Paused)
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
                 self.run_jev_unit(control, index, run).await?;
                 if self
                     .sessions
@@ -1065,6 +1124,170 @@ impl SourceService {
         }
     }
 
+    async fn probe_jev_alias(
+        &self,
+        control: &AnalysisControl,
+        mut run: AnalysisRun,
+    ) -> Result<(), AppError> {
+        let credential_cancel = self.jev_cancel.lock().await.clone();
+        let permit = tokio::select! {
+            _ = control.cancel.cancelled() => return Ok(()),
+            _ = control.queue_pause.cancelled() => return Ok(()),
+            _ = credential_cancel.cancelled() => return Ok(()),
+            value = self.model_slots.acquire() => value.map_err(|_| core_error(ErrorCode::AnalysisUnavailable, "模型并发队列已关闭。", true))?,
+        };
+        let gate = tokio::select! {
+            _ = control.cancel.cancelled() => return Ok(()),
+            _ = credential_cancel.cancelled() => return Ok(()),
+            value = self.jev_gate.read() => value,
+        };
+        let (credential, configured_model) = match self.jev_request_settings().await {
+            Ok(settings) => settings,
+            Err(error) => {
+                run.state = AnalysisRunState::Paused;
+                run.pause_reason = Some(error.message.clone());
+                run.error = Some(error);
+                self.save_analysis(&mut run, &control.update)?;
+                return Ok(());
+            }
+        };
+        if self.preferences.lock().await.jev_revision != run.jev_config_revision
+            || credential.base_url != run.jev_base_url
+            || configured_model != run.jev_model
+            || run.jev_rules_version != RELATION_RULES_VERSION
+        {
+            run.state = AnalysisRunState::Paused;
+            run.pause_reason = Some("Jev 配置或判断规则已变化；请启动新运行。".into());
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        }
+        let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        if JevClient::synthetic_request_characters(&configured_model)
+            > run.limits.input_character_limit
+        {
+            run.state = AnalysisRunState::Paused;
+            run.pause_reason = Some("Jev 合成探测请求超过本次输入字符上限。".into());
+            run.error = Some(AppError::jev(
+                ErrorCode::JevInvalidRequest,
+                "请提高输入字符上限或缩短模型 ID。",
+                false,
+            ));
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        }
+        let client = JevClient::with_timeout(Duration::from_secs(run.limits.timeout_seconds))?;
+        reserve_jev_probe(&mut run)?;
+        self.save_analysis(&mut run, &control.update)?;
+        drop(dispatch);
+        let response = tokio::select! {
+            _ = control.cancel.cancelled() => Err(core_error(ErrorCode::JevCancelled, "Jev 本地探测已取消。", false)),
+            _ = credential_cancel.cancelled() => Err(core_error(ErrorCode::JevCancelled, "Jev 配置变化，探测已取消。", false)),
+            value = client.test_inference(&credential, &configured_model) => value,
+        };
+        drop(permit);
+        drop(gate);
+        let _dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        let mut current = self
+            .sessions
+            .analysis_run(&control.id)?
+            .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
+        if control.cancel.is_cancelled() || current.state == AnalysisRunState::Cancelling {
+            return Ok(());
+        }
+        if self.preferences.lock().await.jev_revision != current.jev_config_revision
+            || current.jev_rules_version != RELATION_RULES_VERSION
+        {
+            current.state = AnalysisRunState::Paused;
+            current.pause_reason = Some("Jev 配置或判断规则已变化；迟到探测结果已丢弃。".into());
+            current.error = Some(core_error(
+                ErrorCode::AnalysisConfigChanged,
+                "请启动新运行。",
+                false,
+            ));
+            self.save_analysis(&mut current, &control.update)?;
+            return Ok(());
+        }
+        let mut retry_after = None;
+        match response {
+            Ok(inference) => {
+                current.input_tokens = Some(
+                    current
+                        .input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(inference.input_tokens),
+                );
+                current.output_tokens = Some(
+                    current
+                        .output_tokens
+                        .unwrap_or(0)
+                        .saturating_add(inference.output_tokens),
+                );
+                if !pinned_jev_model(&inference.actual_model) {
+                    current.state = AnalysisRunState::Paused;
+                    current.pause_reason =
+                        Some("无法确认 Jev 别名对应的版本；请在设置中填写版本化模型 ID。".into());
+                    current.error = Some(core_error(
+                        ErrorCode::JevProtocolInvalid,
+                        "Jev 合成探测未返回可固定的实际模型版本。",
+                        false,
+                    ));
+                } else {
+                    for unit in &mut current.units {
+                        if unit.stage == AnalysisStage::EvidenceSelection
+                            && unit
+                                .relation_classification
+                                .as_ref()
+                                .is_some_and(|classification| {
+                                    classification.actual_model != inference.actual_model
+                                })
+                        {
+                            unit.stage = AnalysisStage::Relation;
+                            unit.state = AnalysisUnitState::Pending;
+                            unit.attempts = 0;
+                            unit.relation_classification = None;
+                            unit.actual_model = None;
+                            unit.error = None;
+                        }
+                    }
+                    current.jev_pinned_model = Some(inference.actual_model);
+                    current.error = None;
+                }
+            }
+            Err(error) => {
+                let temporary = matches!(
+                    error.code,
+                    ErrorCode::JevRateLimited
+                        | ErrorCode::JevOverloaded
+                        | ErrorCode::JevTimeout
+                        | ErrorCode::JevConnectionFailed
+                ) && error.retryable;
+                if temporary && current.jev_probe_attempts <= u32::from(current.limits.retry_limit)
+                {
+                    retry_after = Some(error.retry_after_ms.unwrap_or(0));
+                    current.error = Some(error);
+                } else {
+                    current.state = AnalysisRunState::Paused;
+                    current.pause_reason =
+                        Some(format!("无法确认 Jev 实际模型版本：{}", error.message));
+                    current.error = Some(error);
+                }
+            }
+        }
+        self.save_analysis(&mut current, &control.update)?;
+        if let Some(retry_after) = retry_after {
+            let delay = (250 * current.jev_probe_attempts.min(2) as u64).max(retry_after);
+            tokio::select! {
+                _ = control.cancel.cancelled() => {},
+                _ = control.queue_pause.cancelled() => {},
+                _ = tokio::time::sleep(Duration::from_millis(delay)) => {},
+            }
+        }
+        Ok(())
+    }
+
     async fn run_jev_unit(
         &self,
         control: &AnalysisControl,
@@ -1155,6 +1378,13 @@ impl SourceService {
         if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let model = run.jev_pinned_model.clone().ok_or_else(|| {
+            core_error(
+                ErrorCode::AnalysisUnavailable,
+                "Jev 本批实际模型尚未固定。",
+                false,
+            )
+        })?;
         let analyzer = JevRelationAnalyzer::with_timeout_and_material_limit(
             Duration::from_secs(run.limits.timeout_seconds),
             run.limits.input_character_limit,
@@ -1170,6 +1400,7 @@ impl SourceService {
             self.save_analysis(&mut run, &control.update)?;
             return Ok(());
         }
+        run.units[index].requested_model = model.clone();
         reserve_attempt(&mut run, index, questions)?;
         self.save_analysis(&mut run, &control.update)?;
         drop(dispatch);
@@ -1209,12 +1440,50 @@ impl SourceService {
             .transpose()?;
         if self.preferences.lock().await.jev_revision != current.jev_config_revision
             || latest_version.as_deref() != Some(current.units[index].input_version.as_str())
+            || current.jev_pinned_model.as_deref() != Some(model.as_str())
+            || current.jev_rules_version != RELATION_RULES_VERSION
         {
             current.units[index].state = AnalysisUnitState::Pending;
             current.state = AnalysisRunState::Paused;
             current.pause_reason = Some("Jev 配置或候选来源已变化；迟到结果已丢弃。".into());
             self.save_analysis(&mut current, &control.update)?;
             return Ok(());
+        }
+        let returned = match &response {
+            Ok(JevUnitResult::Classification(value)) => {
+                Some((&value.actual_model, value.input_tokens, value.output_tokens))
+            }
+            Ok(JevUnitResult::Evidence(value)) => {
+                Some((&value.actual_model, value.input_tokens, value.output_tokens))
+            }
+            Err(_) => None,
+        };
+        if let Some((actual, input_tokens, output_tokens)) = returned {
+            if actual != &model {
+                current.input_tokens = Some(
+                    current
+                        .input_tokens
+                        .unwrap_or(0)
+                        .saturating_add(input_tokens),
+                );
+                current.output_tokens = Some(
+                    current
+                        .output_tokens
+                        .unwrap_or(0)
+                        .saturating_add(output_tokens),
+                );
+                current.units[index].state = AnalysisUnitState::Pending;
+                current.units[index].attempts = 0;
+                current.units[index].error = Some(core_error(
+                    ErrorCode::AnalysisConfigChanged,
+                    "Jev 返回的实际版本与本批固定版本不同；已拒绝该结果。",
+                    false,
+                ));
+                current.state = AnalysisRunState::Paused;
+                current.pause_reason = Some("Jev 实际模型版本变化；请启动新批次。".into());
+                self.save_analysis(&mut current, &control.update)?;
+                return Ok(());
+            }
         }
         let mut outcome = None;
         match response {
@@ -1308,6 +1577,11 @@ impl SourceService {
                 current.units[index].error = None;
             }
             Err(error) => {
+                let alias_pin_failure = !pinned_jev_model(&current.jev_model)
+                    && matches!(
+                        error.code,
+                        ErrorCode::JevInvalidRequest | ErrorCode::JevProtocolInvalid
+                    );
                 let temporary = matches!(
                     error.code,
                     ErrorCode::JevRateLimited
@@ -1325,9 +1599,13 @@ impl SourceService {
                         | ErrorCode::AnalysisConfigChanged
                 );
                 current.units[index].error = Some(error.clone());
-                if pause {
+                if pause || alias_pin_failure {
                     current.state = AnalysisRunState::Paused;
-                    current.pause_reason = Some(error.message);
+                    current.pause_reason = Some(if alias_pin_failure {
+                        "Jev 固定版本请求被拒绝或响应无效；请检查网关是否支持该版本 ID。".into()
+                    } else {
+                        error.message
+                    });
                     current.units[index].state = AnalysisUnitState::Pending;
                 } else if temporary
                     && current.units[index].attempts <= u32::from(current.limits.retry_limit)
@@ -1430,6 +1708,65 @@ mod tests {
             *self.0.lock().unwrap() = None;
             Ok(())
         }
+    }
+
+    fn read_jev_post(stream: &mut std::net::TcpStream) -> serde_json::Value {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = stream.read(&mut buffer).unwrap();
+            bytes.extend_from_slice(&buffer[..count]);
+            let Some(split) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let header = String::from_utf8_lossy(&bytes[..split]);
+            assert!(header.starts_with("POST /v1/systemone HTTP/1.1"));
+            assert!(header
+                .to_ascii_lowercase()
+                .contains("authorization: bearer synthetic-key"));
+            let length: usize = header
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.parse().ok())
+                })
+                .unwrap();
+            if bytes.len() >= split + 4 + length {
+                return serde_json::from_slice(&bytes[split + 4..split + 4 + length]).unwrap();
+            }
+        }
+    }
+
+    fn write_jev_json(stream: &mut std::net::TcpStream, status: u16, body: serde_json::Value) {
+        let body = body.to_string();
+        write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nRetry-After: 0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+    }
+
+    fn synthetic_probe_response(model: &str) -> serde_json::Value {
+        serde_json::json!({"model":model,
+            "answers":{"classification":{"type":"choice","choice":"resolved","confidence":0.9,
+                "probabilities":{"resolved":0.9,"unresolved":0.1}}},
+            "usage":{"input_tokens":12,"output_tokens":3}})
+    }
+
+    fn rejected_relation_response(request: &serde_json::Value, model: &str) -> serde_json::Value {
+        let answers: serde_json::Map<String, serde_json::Value> = request["questions"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|key| {
+                (
+                    key.clone(),
+                    serde_json::json!({"type":"choice","choice":"REJECTS",
+                "confidence":0.8,"probabilities":{"SUPPORTS":0.1,"REJECTS":0.8,"UNKNOWN":0.1}}),
+                )
+            })
+            .collect();
+        serde_json::json!({"model":model,"answers":answers,"usage":{"input_tokens":20,"output_tokens":5}})
     }
 
     fn root(name: &str) -> PathBuf {
@@ -2122,6 +2459,15 @@ mod tests {
     }
 
     #[test]
+    fn versioned_jev_model_is_distinct_from_a_moving_alias() {
+        assert!(pinned_jev_model("jev-1.13.0"));
+        assert!(pinned_jev_model("jev-1.14.0-preview.1"));
+        for alias in ["jev-latest", "jev-preview", "jev-1.13", "jev-1.13.0-"] {
+            assert!(!pinned_jev_model(alias));
+        }
+    }
+
+    #[test]
     fn limits_reject_zero_and_more_than_two_shared_calls() {
         assert!(validate_limits(&AnalysisLimits {
             call_limit: 0,
@@ -2194,7 +2540,7 @@ mod tests {
             seen
         });
         service
-            .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+            .save_jev(base_url, "jev-1.13.0".into(), Some("synthetic-key".into()))
             .await
             .unwrap();
         let preview = service
@@ -2214,6 +2560,8 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(started.jev_pinned_model.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(started.jev_probe_attempts, 0);
         let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
         assert_eq!(paused.total_calls, 3);
         assert!(paused
@@ -2230,6 +2578,7 @@ mod tests {
         assert_eq!(completed.total_questions, 17);
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["model"], "jev-1.13.0");
         assert_eq!(requests[0]["questions"].as_object().unwrap().len(), 16);
         assert_eq!(requests[1]["questions"].as_object().unwrap().len(), 1);
         let graph = service.project_graph("project-test").unwrap();
@@ -2589,10 +2938,14 @@ mod tests {
                     .save_jev(base_url, "jev-new".into(), None)
                     .await
                     .unwrap();
-                wait_state(&service, &run.id, AnalysisRunState::Paused).await;
+                let paused = wait_state(&service, &run.id, AnalysisRunState::Paused).await;
+                assert!(paused.jev_pinned_model.is_none());
+                assert_eq!(paused.jev_probe_attempts, 1);
             } else {
                 service.cancel_analysis_run(&run.id).await.unwrap();
-                wait_state(&service, &run.id, AnalysisRunState::Cancelled).await;
+                let cancelled = wait_state(&service, &run.id, AnalysisRunState::Cancelled).await;
+                assert!(cancelled.jev_pinned_model.is_none());
+                assert_eq!(cancelled.jev_probe_attempts, 1);
             }
             release_tx.send(()).unwrap();
             server.join().unwrap();
@@ -2667,7 +3020,7 @@ mod tests {
                 }
             });
             service
-                .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+                .save_jev(base_url, "jev-1.13.0".into(), Some("synthetic-key".into()))
                 .await
                 .unwrap();
             let run = service
@@ -2852,6 +3205,355 @@ mod tests {
                 ..
             })
         ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn alias_probe_pins_one_actual_version_across_multiple_candidates() {
+        let root = root("jev-alias-pinned-batch");
+        let service = service(&root, "ok", 3).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for index in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_jev_post(&mut stream);
+                if index == 0 {
+                    assert_eq!(request["model"], "jev-latest");
+                    assert_eq!(request["state"]["ticket"], "合成工单 A");
+                    write_jev_json(&mut stream, 200, synthetic_probe_response("jev-1.13.0"));
+                } else {
+                    // 即使别名此刻已移至 1.14.0，后续候选仍应请求本批固定的 1.13.0。
+                    assert_eq!(request["model"], "jev-1.13.0");
+                    let response = if index == 1 {
+                        let mut response = rejected_relation_response(&request, "jev-1.13.0");
+                        response["answers"]["fixes_ab"] = serde_json::json!({"type":"choice","choice":"SUPPORTS",
+                            "confidence":0.8,"probabilities":{"SUPPORTS":0.8,"REJECTS":0.1,"UNKNOWN":0.1}});
+                        response
+                    } else if index == 2 {
+                        serde_json::json!({"model":"jev-1.13.0",
+                            "answers":{"fixes_ab":{"type":"choice","choice":"p0","confidence":0.9,
+                                "probabilities":{"p0":0.9,"INSUFFICIENT":0.1}}},
+                            "usage":{"input_tokens":20,"output_tokens":5}})
+                    } else {
+                        rejected_relation_response(&request, "jev-1.13.0")
+                    };
+                    write_jev_json(&mut stream, 200, response);
+                }
+                requests.push(request);
+            }
+            requests
+        });
+        service
+            .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let preview = service
+            .analysis_preview("project-test", AnalysisLimits::default())
+            .await
+            .unwrap();
+        assert_eq!(preview.stages[1].pending_items, 3);
+        assert_eq!(preview.stages[1].maximum_calls, 12); // 三对候选和一次探测，各自最多三次尝试
+        let started = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        let completed = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(completed.jev_pinned_model.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(completed.jev_probe_attempts, 1);
+        assert_eq!(completed.total_calls, 8); // 三次总结、一次探测、三次分类和一次证据选择
+        assert_eq!(completed.total_questions, 50);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[0].to_string().chars().count(),
+            JevClient::synthetic_request_characters("jev-latest")
+        );
+        let outcomes = service
+            .sessions
+            .inferred_pair_outcomes("project-test")
+            .unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|item| item
+            .jev_identity
+            .as_ref()
+            .is_some_and(|identity| identity.requested_model == "jev-latest"
+                && identity.actual_model == "jev-1.13.0")));
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|item| item.status == "valid")
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes.iter().filter(|item| item.status == "none").count(),
+            2
+        );
+        let graph = service.project_graph("project-test").unwrap();
+        assert_eq!(graph.inferred_relations.len(), 1);
+        assert_eq!(graph.inferred_relations[0].requested_model, "jev-latest");
+        assert_eq!(graph.inferred_relations[0].actual_model, "jev-1.13.0");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn alias_probe_without_a_version_pauses_before_classification() {
+        let root = root("jev-alias-no-version");
+        let service = service(&root, "ok", 2).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_jev_post(&mut stream);
+            write_jev_json(&mut stream, 200, synthetic_probe_response("jev-latest"));
+            request
+        });
+        service
+            .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(paused.total_calls, 3);
+        assert_eq!(paused.total_questions, 1);
+        assert_eq!(paused.jev_probe_attempts, 1);
+        assert!(paused.jev_pinned_model.is_none());
+        assert!(paused.pause_reason.unwrap().contains("无法确认"));
+        assert!(paused
+            .units
+            .iter()
+            .any(|unit| unit.stage == AnalysisStage::Relation
+                && unit.state == AnalysisUnitState::Pending));
+        assert!(service
+            .sessions
+            .inferred_pair_outcomes("project-test")
+            .unwrap()
+            .is_empty());
+        assert_eq!(server.join().unwrap()["model"], "jev-latest");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn oversized_synthetic_probe_is_rejected_without_spending_a_call() {
+        let root = root("jev-alias-probe-input-limit");
+        let service = service(&root, "ok", 2).await;
+        let model = format!("jev-{}", "x".repeat(2_500));
+        service
+            .save_jev(
+                "http://127.0.0.1:4343".into(),
+                model,
+                Some("synthetic-key".into()),
+            )
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis(
+                "project-test".into(),
+                AnalysisLimits {
+                    input_character_limit: 2_000,
+                    ..AnalysisLimits::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(paused.total_calls, 2);
+        assert_eq!(paused.jev_probe_attempts, 0);
+        assert!(paused.jev_pinned_model.is_none());
+        assert!(paused.pause_reason.unwrap().contains("输入字符上限"));
+        assert!(service
+            .sessions
+            .inferred_pair_outcomes("project-test")
+            .unwrap()
+            .is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn alias_probe_and_retry_each_consume_the_batch_call_limit() {
+        let root = root("jev-alias-probe-budget");
+        let service = service(&root, "ok", 2).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        service
+            .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 2,
+                    ..AnalysisLimits::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(paused.total_calls, 2);
+        assert_eq!(paused.jev_probe_attempts, 0);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        listener.set_nonblocking(false).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for attempt in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_jev_post(&mut stream);
+                match attempt {
+                    0 => {
+                        assert_eq!(request["model"], "jev-latest");
+                        write_jev_json(&mut stream, 429, serde_json::json!({}));
+                    }
+                    1 | 2 => {
+                        assert_eq!(request["model"], "jev-latest");
+                        write_jev_json(
+                            &mut stream,
+                            200,
+                            synthetic_probe_response(if attempt == 1 {
+                                "jev-1.13.0"
+                            } else {
+                                "jev-1.14.0"
+                            }),
+                        );
+                    }
+                    _ => {
+                        assert_eq!(request["model"], "jev-1.14.0");
+                        write_jev_json(
+                            &mut stream,
+                            200,
+                            rejected_relation_response(&request, "jev-1.14.0"),
+                        );
+                    }
+                }
+                requests.push(request);
+            }
+            requests
+        });
+        service
+            .continue_analysis_run(&started.id, 2, |_| {})
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(paused.batch_calls, 2);
+        assert_eq!(paused.total_calls, 4);
+        assert_eq!(paused.total_questions, 2);
+        assert_eq!(paused.jev_probe_attempts, 2);
+        assert_eq!(paused.jev_pinned_model.as_deref(), Some("jev-1.13.0"));
+        assert!(paused
+            .units
+            .iter()
+            .any(|unit| unit.stage == AnalysisStage::Relation
+                && unit.state == AnalysisUnitState::Pending));
+        service
+            .continue_analysis_run(&started.id, 2, |_| {})
+            .await
+            .unwrap();
+        let completed = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(completed.batch_calls, 2);
+        assert_eq!(completed.total_calls, 6);
+        assert_eq!(completed.jev_probe_attempts, 1);
+        assert_eq!(completed.jev_pinned_model.as_deref(), Some("jev-1.14.0"));
+        assert_eq!(
+            service
+                .sessions
+                .inferred_pair_outcomes("project-test")
+                .unwrap()[0]
+                .jev_identity
+                .as_ref()
+                .unwrap()
+                .actual_model,
+            "jev-1.14.0"
+        );
+        assert_eq!(server.join().unwrap().len(), 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn pinned_batch_rejects_a_later_response_from_another_version() {
+        let root = root("jev-alias-response-drift");
+        let service = service(&root, "ok", 2).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let probe = read_jev_post(&mut stream);
+            write_jev_json(&mut stream, 200, synthetic_probe_response("jev-1.13.0"));
+            let (mut stream, _) = listener.accept().unwrap();
+            let classification = read_jev_post(&mut stream);
+            assert_eq!(classification["model"], "jev-1.13.0");
+            write_jev_json(
+                &mut stream,
+                200,
+                rejected_relation_response(&classification, "jev-1.14.0"),
+            );
+            (probe, classification)
+        });
+        service
+            .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(paused.total_calls, 4);
+        assert_eq!(paused.jev_pinned_model.as_deref(), Some("jev-1.13.0"));
+        assert!(paused.pause_reason.unwrap().contains("实际模型版本变化"));
+        assert!(service
+            .sessions
+            .inferred_pair_outcomes("project-test")
+            .unwrap()
+            .is_empty());
+        assert_eq!(server.join().unwrap().0["model"], "jev-latest");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn alias_batch_pauses_if_the_gateway_rejects_the_fixed_version() {
+        let root = root("jev-alias-fixed-id-rejected");
+        let service = service(&root, "ok", 2).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let probe = read_jev_post(&mut stream);
+            write_jev_json(&mut stream, 200, synthetic_probe_response("jev-1.13.0"));
+            let (mut stream, _) = listener.accept().unwrap();
+            let classification = read_jev_post(&mut stream);
+            assert_eq!(classification["model"], "jev-1.13.0");
+            write_jev_json(&mut stream, 422, serde_json::json!({}));
+            (probe, classification)
+        });
+        service
+            .save_jev(base_url, "jev-latest".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(paused.total_calls, 4);
+        assert_eq!(paused.jev_pinned_model.as_deref(), Some("jev-1.13.0"));
+        assert!(paused.pause_reason.unwrap().contains("固定版本请求被拒绝"));
+        assert!(service
+            .sessions
+            .inferred_pair_outcomes("project-test")
+            .unwrap()
+            .is_empty());
+        assert_eq!(server.join().unwrap().0["model"], "jev-latest");
         let _ = fs::remove_dir_all(root);
     }
 }

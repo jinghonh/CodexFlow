@@ -229,6 +229,10 @@ pub struct AnalysisRun {
     #[serde(default)]
     pub jev_rules_version: String,
     pub jev_config_revision: u64,
+    #[serde(default)]
+    pub jev_pinned_model: Option<String>,
+    #[serde(default)]
+    pub jev_probe_attempts: u32,
     pub limits: AnalysisLimits,
     pub batch_number: u32,
     pub batch_calls: u32,
