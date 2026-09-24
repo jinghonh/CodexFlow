@@ -41,6 +41,8 @@ open -n --env CODEX_HOME=/tmp/codexflow-issue33-codex-home -a 'target/release/bu
 
 受控钥匙串测试后，检查了隔离应用数据、WebKit 和缓存目录：合成测试密钥 A/B 均未以明文出现。此检查覆盖这些目录与公开 UI 错误，不等于对系统全部日志或所有拒绝访问路径的穷尽证明。未锁定或改变用户的登录钥匙串；macOS 实际拒绝访问/锁定恢复路径仍未做桌面实测，相关失败行为只有可注入凭据存储的核心测试验证。
 
+原验收记录证明使用了独立应用标识、应用数据目录和 `CODEX_HOME`，**没有记录使用独立 macOS 测试用户**。因此无法证实上述钥匙串生命周期实测与该登录用户既有凭据完全隔离，也不能仅凭合成密钥的“由无到有、删除后为无”推断没有既有凭据风险。后续独立标识包显示固定服务名下已有凭据状态，见下文“隔离边界补充”；钥匙串隔离的证据缺口保留。
+
 ## 仅使用固定或合成夹具验证的桌面流程
 
 独立桌面包选择临时 Git 项目 `/tmp/codexflow-issue33-fixture/project`，另建其 worktree `/tmp/codexflow-issue33-fixture/worktree`。本机复制并改写仓库的 `fake_codex.py`，只把夹具工作目录指向上述临时路径并组合已有的列表与历史响应；原仓库夹具未改变。此流程不代表真实用户历史兼容性。
@@ -85,7 +87,7 @@ open -n --env CODEX_HOME=/tmp/codexflow-issue33-codex-home -a 'target/release/bu
 | 18 | 过滤与切换不改变身份及人工数据 | `通过公开应用查询联动时间线、关系图和详情，过滤后保留选择`（[探索器测试](../../src/ProjectExplorerFlow.test.tsx)）；受控桌面刷新后人工工作流修正仍在。 | 最终包多视图切换后裁决与成员核对。 |
 | 19 | 配置故障可修复且两种测试独立 | 本机 HTTP 夹具完成模型列表与固定推理；受控钥匙串保存/轮换/删除；`locked_keychain_keeps_saved_nonsecret_config_visible`（[核心测试](../../crates/core/src/lib.rs)）。 | 真实 Jev 错误与修复、钥匙串实际拒绝访问、独立 Codex 总结成功；依赖 #32 与受控认证。 |
 | 20 | 凭据生命周期与服务地址隔离、无泄露 | 受控桌面合成密钥保存、轮换、重启、删除和限定目录明文检查；`jev_credentials_are_separate_from_persisted_settings_and_scoped_to_address`（[核心测试](../../crates/core/src/lib.rs)）。 | 真实钥匙串拒绝访问；真实服务地址切换不发送旧密钥的桌面核对。 |
-| 21 | Jev 无关系/不确定/低分/证据不足与中英材料 | `inferred_outcomes_exclude_none_unknown_bad_evidence_and_conflicting_time`、`native_jev_two_post_path_persists_a_locatable_inferred_edge`（[批次测试](../../crates/core/src/analysis_batch.rs)）。 | #31 冻结的人工样本与 #32 真实固定版本质量报告；无法由夹具替代。 |
+| 21 | Jev 无关系/不确定/低分/证据不足与中英材料 | `inferred_outcomes_exclude_none_unknown_bad_evidence_and_conflicting_time`、`native_jev_two_post_path_persists_a_locatable_inferred_edge`（[批次测试](../../crates/core/src/analysis_batch.rs)）只覆盖状态与证据约束。 | 中文及中英混合技术文本仍待 #31 纳入冻结样本，并由 #32 用真实固定版本 Jev 评测；无法由夹具替代。 |
 | 22 | 双后端共享预算、别名/设置变更及旧结果隔离 | `alias_probe_and_retry_each_consume_the_batch_call_limit`、`changed_jev_settings_cannot_be_mixed_into_a_frozen_run`、`jev_cache_requires_matching_nonsecret_config_rules_and_pinned_actual_model`（[批次测试](../../crates/core/src/analysis_batch.rs)）。 | 最终包双后端连续路径及真实 Jev 版本确认，依赖 #32 与受控认证。 |
 
 以上 22 项都有可定位的现有证据或明确缺口；**没有一项因表中列出自动化测试而自动升级为完整 V1 通过**。最终验收应在每行补上包版本、隔离数据位置、实际操作与可复核结果，再判断是否通过。
@@ -94,7 +96,9 @@ open -n --env CODEX_HOME=/tmp/codexflow-issue33-codex-home -a 'target/release/bu
 
 本次基于 `bb890ca89b55bc0259584ca9fb4e58e2db9b1228` 构建另一个 `0.1.0`、`arm64` 包，标识 `dev.codexflow.acceptance.issue33.continuation`，应用名 `CodexFlow V1 Continuation.app`。`npm ci` 与带该标识的 `npm run tauri -- build --config ...` 成功；脚本对整个包作本机临时签名，将完整包复制到 `/tmp/codexflow-issue33-continuation-install/` 后 `codesign --verify --verbose=2` 成功。复制件可执行文件 SHA-256 为 `c4fc7386544d67fcbac0c213393c4cebc0b66a35a551cc6ab5cfe953b7b2d341`。这是本机包验证，签名与 Gatekeeper 边界同前述记录。
 
-可重建的受控来源由 [`scripts/prepare_issue33_fixture.py`](../../scripts/prepare_issue33_fixture.py)从仓库的 `fake_codex.py` 派生；只改写临时项目工作目录，并为 `list-rich` 模式启用已有的分页历史响应。它新建空 Git 仓库、一个 worktree、合成二进制和空 `CODEX_HOME`。本次运行命令为：
+可重建的受控来源由 [`scripts/prepare_issue33_fixture.py`](../../scripts/prepare_issue33_fixture.py)从仓库的 `fake_codex.py` 派生；只改写临时项目工作目录，并为 `list-rich` 模式启用已有的分页历史响应。它新建空 Git 仓库、一个 worktree、合成二进制和空 `CODEX_HOME`。脚本的 Git 子进程使用受控环境、空模板与钩子目录，屏蔽继承的 `GIT_*` 重定向和用户 Git 配置。本次运行命令为：
+
+修复后的定向隔离检查只使用一次性临时目录：向脚本进程注入指向夹具外临时仓库的 `GIT_DIR`、`GIT_WORK_TREE`、`GIT_COMMON_DIR`、索引和对象目录变量，同时注入自定义全局/系统配置、模板和提交/检出钩子。脚本完成后，外部临时仓库的提交与工作区状态未变，钩子标记未生成；新项目和 worktree 的根目录都在新夹具内。检查未接触真实用户仓库。
 
 ```sh
 python3 scripts/prepare_issue33_fixture.py /tmp/codexflow-issue33-continuation-fixture

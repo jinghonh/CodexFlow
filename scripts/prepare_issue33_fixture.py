@@ -2,12 +2,10 @@
 """Create disposable Git and Codex protocol fixtures for #33 desktop acceptance."""
 
 import argparse
+import os
 import pathlib
+import shutil
 import subprocess
-
-
-def git(*args: str) -> None:
-    subprocess.run(["git", *args], check=True, stdout=subprocess.DEVNULL)
 
 
 def main() -> None:
@@ -17,6 +15,31 @@ def main() -> None:
 
     root = args.root.expanduser().resolve()
     root.mkdir(parents=True, exist_ok=False)
+    git_executable = shutil.which("git", path=os.defpath)
+    if git_executable is None:
+        raise RuntimeError("system Git is required to prepare the #33 fixture")
+    git_home = root / "git-home"
+    template = root / "empty-template"
+    hooks = root / "empty-hooks"
+    for directory in (git_home, git_home / "config", template, hooks, root / "tmp"):
+        directory.mkdir()
+    git_env = {
+        "PATH": os.defpath,
+        "HOME": str(git_home),
+        "XDG_CONFIG_HOME": str(git_home / "config"),
+        "TMPDIR": str(root / "tmp"),
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TEMPLATE_DIR": str(template),
+    }
+
+    def git(*command: str) -> None:
+        subprocess.run(
+            [git_executable, "-c", f"core.hooksPath={hooks}", *command],
+            check=True, stdout=subprocess.DEVNULL, env=git_env,
+        )
+
     project = root / "project"
     worktree = root / "worktree"
     project.mkdir()
