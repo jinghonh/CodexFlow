@@ -59,6 +59,60 @@ open -n --env CODEX_HOME=/tmp/codexflow-issue33-codex-home -a 'target/release/bu
 3. 本轮没有完成从真实 Codex 历史到双后端分析、推断关系双侧证据、拒绝、重算、工作流整理的完整桌面连续流程。关系裁决、过期证据、预算暂停继续、协议不兼容、认证/额度故障、部分历史、保存冲突及迁移中途故障已有对应自动化边界测试，尚不能升级为正式包完整实测通过。实际钥匙串拒绝访问与真实来源的完整分页条目读取也未完成。
 4. 22 个父规格核心场景的自动化覆盖不等于最终逐项桌面验收；尤其第 19–22 项依赖真实 Jev、钥匙串拒绝访问或双后端连续运行。维护者应以 #11 的原始编号逐项补齐实际证据，不得用本轮合成结果勾选完整通过。
 
+## 父规格 22 项核心场景证据矩阵
+
+下表编号对应 [#11 的“至少覆盖以下验收场景”](https://github.com/jinghonh/CodexFlow/issues/11)。状态只说明截至本记录可追溯的证据强度；“受控桌面”使用隔离数据与合成来源，“自动化”使用测试替身。二者都不能替代真实后端质量和最终包逐项验收。源码测试名用于定位具体断言，不表示单凭测试名就已完成桌面实测。
+
+| # | 核心场景 | 当前证据 | 尚需补齐 |
+| --- | --- | --- | --- |
+| 1 | 已归档与子代理完整列表不重复 | 受控桌面读取 3 页、6 条并合并为 4 条；`complete_and_partial_lists_keep_one_cached_thread_per_id`（[核心测试](../../crates/core/src/lib.rs)）。 | 最终包在受控真实历史上逐项复核。 |
+| 2 | 分页中途失败不误删缓存 | `paged_refresh_can_be_cancelled_and_resumed_without_losing_cache_or_project`、`failed_thread_history_does_not_block_another_thread_or_erase_metadata`（[核心测试](../../crates/core/src/lib.rs)）。 | 桌面故障注入与恢复连续路径。 |
+| 3 | 隔日恢复保留时间空档 | 受控桌面显示两个可定位活动段；`跨日恢复保留空档`（[时间线测试](../../src/ProjectTimelineView.test.tsx)）。 | 用最终包复核真实来源时间。 |
+| 4 | 缺失时间只显示已知活动 | `跨日恢复保留空档，未知与无位置回合可检查`（[时间线测试](../../src/ProjectTimelineView.test.tsx)）；[核心来源时间测试](../../crates/codex/src/history.rs)覆盖无效时间。 | 桌面缺时来源实测。 |
+| 5 | `NONE`、无效端点与证据不入图 | `inferred_outcomes_exclude_none_unknown_bad_evidence_and_conflicting_time`（[批次测试](../../crates/core/src/analysis_batch.rs)）及[推断关系测试](../../crates/core/src/inferred.rs)。 | 真实 Jev 输出与最终图复核，依赖 #32。 |
+| 6 | 拒绝关系后重算仍拒绝 | `确认、拒绝和显式恢复立即更新图边`（[图测试](../../src/ProjectGraphView.test.tsx)）；[存储裁决并发测试](../../crates/store/src/lib.rs)。 | 双后端桌面重算连续路径。 |
+| 7 | 恢复会话的后续工作不只按创建时间否决 | [候选生成](../../crates/core/src/candidates.rs)用最近活动时间，[推断验证](../../crates/core/src/inferred.rs)用证据回合时间；尚无该完整场景的直接证据。 | 构造较早创建且隔日恢复的两条会话，验证候选、因果边及真实 Jev 结果；依赖 #32。 |
+| 8 | 分析失败保留事实和旧结果 | `partial_new_source_excludes_candidates_and_keeps_old_facts`（[批次测试](../../crates/core/src/analysis_batch.rs)）；受控桌面来源不可用仍可浏览 4 条缓存会话。 | 桌面模型失败后旧结果及事实连续检查。 |
+| 9 | 自身临时分析不进入普通索引 | 独立真实 app-server 中断后普通列表仍为 0；[Codex 适配器测试](../../crates/codex/src/lib.rs)覆盖临时会话排除。 | 真实成功终态总结及重启后再索引，依赖独立钥匙串认证。 |
+| 10 | worktree 合并，独立克隆与嵌套仓库分离 | 受控桌面项目/worktree 归属；`real_repositories_worktrees_clones_nested_repos_and_missing_paths`（[项目测试](../../crates/core/src/projects.rs)）。 | 最终包复核独立克隆和嵌套仓库。 |
+| 11 | 每条会话单泳道，跨工作流关系可见 | 受控桌面 4 条会话各一次；`工作流泳道按主要归属显示`（[时间线测试](../../src/ProjectTimelineView.test.tsx)）。 | 最终包跨工作流推断关系复核，依赖 #32。 |
+| 12 | 改名、移成员及解除修正 | 受控桌面改名、移成员、重启及刷新保留；`workstream_corrections_survive_regrouping_restart_and_restore_independently`（[核心测试](../../crates/core/src/lib.rs)）。 | 桌面显式恢复自动状态与双后端重算。 |
+| 13 | 预算暂停、继续、取消迟到结果 | `call_limit_pauses_and_continuation_only_handles_remaining_units`、`in_flight_jev_result_is_rejected_after_cancel_or_config_change`（[批次测试](../../crates/core/src/analysis_batch.rs)）；[分析视图测试](../../src/ProjectAnalysisView.test.tsx)。 | 真正双后端桌面连续运行，依赖受控认证和 #32。 |
+| 14 | Codex 与 Jev 分别确认取消终态 | 真实 Codex 临时回合从“取消中”到“已取消”；本机 Jev HTTP 夹具迟到结果被拒；`cancellation_waits_for_codex_terminal_and_can_continue`（[批次测试](../../crates/core/src/analysis_batch.rs)）。 | 真实 Jev HTTP 取消以及成功分析后的两侧桌面取消。 |
+| 15 | 重启保留缓存、裁决和人工修正，运行不误完成 | 受控桌面重启保留缓存与工作流修正；`reopening_marks_unfinished_run_interrupted_without_erasing_cache`、`unfinished_summary_run_is_recovered_after_restart`（[存储测试](../../crates/store/src/lib.rs)）。 | 桌面裁决和中断批次重启连续路径。 |
+| 16 | 迁移失败与旧版本打开新格式不破坏数据 | 受控桌面未来版本 16 显示 `DATABASE_TOO_NEW`，恢复版本 15 备份后数据可见；`failed_later_migration_rolls_back_earlier_schema_steps`（[存储测试](../../crates/store/src/lib.rs)）。 | 最终包迁移中途故障注入。 |
+| 17 | 无向反向去重，端点语义统一 | [推断关系测试](../../crates/core/src/inferred.rs)与[工作流规则测试](../../crates/core/src/workstreams.rs)覆盖去重及方向。 | 桌面反向输入及结构/因果边核对。 |
+| 18 | 过滤与切换不改变身份及人工数据 | `通过公开应用查询联动时间线、关系图和详情，过滤后保留选择`（[探索器测试](../../src/ProjectExplorerFlow.test.tsx)）；受控桌面刷新后人工工作流修正仍在。 | 最终包多视图切换后裁决与成员核对。 |
+| 19 | 配置故障可修复且两种测试独立 | 本机 HTTP 夹具完成模型列表与固定推理；受控钥匙串保存/轮换/删除；`locked_keychain_keeps_saved_nonsecret_config_visible`（[核心测试](../../crates/core/src/lib.rs)）。 | 真实 Jev 错误与修复、钥匙串实际拒绝访问、独立 Codex 总结成功；依赖 #32 与受控认证。 |
+| 20 | 凭据生命周期与服务地址隔离、无泄露 | 受控桌面合成密钥保存、轮换、重启、删除和限定目录明文检查；`jev_credentials_are_separate_from_persisted_settings_and_scoped_to_address`（[核心测试](../../crates/core/src/lib.rs)）。 | 真实钥匙串拒绝访问；真实服务地址切换不发送旧密钥的桌面核对。 |
+| 21 | Jev 无关系/不确定/低分/证据不足与中英材料 | `inferred_outcomes_exclude_none_unknown_bad_evidence_and_conflicting_time`、`native_jev_two_post_path_persists_a_locatable_inferred_edge`（[批次测试](../../crates/core/src/analysis_batch.rs)）。 | #31 冻结的人工样本与 #32 真实固定版本质量报告；无法由夹具替代。 |
+| 22 | 双后端共享预算、别名/设置变更及旧结果隔离 | `alias_probe_and_retry_each_consume_the_batch_call_limit`、`changed_jev_settings_cannot_be_mixed_into_a_frozen_run`、`jev_cache_requires_matching_nonsecret_config_rules_and_pinned_actual_model`（[批次测试](../../crates/core/src/analysis_batch.rs)）。 | 最终包双后端连续路径及真实 Jev 版本确认，依赖 #32 与受控认证。 |
+
+以上 22 项都有可定位的现有证据或明确缺口；**没有一项因表中列出自动化测试而自动升级为完整 V1 通过**。最终验收应在每行补上包版本、隔离数据位置、实际操作与可复核结果，再判断是否通过。
+
+## 2026-09-24 续作：隔离桌面连续路径
+
+本次基于 `bb890ca89b55bc0259584ca9fb4e58e2db9b1228` 构建另一个 `0.1.0`、`arm64` 包，标识 `dev.codexflow.acceptance.issue33.continuation`，应用名 `CodexFlow V1 Continuation.app`。`npm ci` 与带该标识的 `npm run tauri -- build --config ...` 成功；脚本对整个包作本机临时签名，将完整包复制到 `/tmp/codexflow-issue33-continuation-install/` 后 `codesign --verify --verbose=2` 成功。复制件可执行文件 SHA-256 为 `c4fc7386544d67fcbac0c213393c4cebc0b66a35a551cc6ab5cfe953b7b2d341`。这是本机包验证，签名与 Gatekeeper 边界同前述记录。
+
+可重建的受控来源由 [`scripts/prepare_issue33_fixture.py`](../../scripts/prepare_issue33_fixture.py)从仓库的 `fake_codex.py` 派生；只改写临时项目工作目录，并为 `list-rich` 模式启用已有的分页历史响应。它新建空 Git 仓库、一个 worktree、合成二进制和空 `CODEX_HOME`。本次运行命令为：
+
+```sh
+python3 scripts/prepare_issue33_fixture.py /tmp/codexflow-issue33-continuation-fixture
+open -n --env CODEX_HOME=/private/tmp/codexflow-issue33-continuation-fixture/codex-home \
+  -a '/tmp/codexflow-issue33-continuation-install/CodexFlow V1 Continuation.app'
+```
+
+应用数据使用独立标识对应的 `~/Library/Application Support/dev.codexflow.acceptance.issue33.continuation/`。在新启动的包内，先将 Codex 二进制设为 `/private/tmp/codexflow-issue33-continuation-fixture/fake-list-rich`，再选择该夹具的 `project`。桌面连续操作得到如下可观察结果：
+
+1. 来源诊断显示合成二进制与分页能力；项目列表读取 3 页、6 条并合并为 4 条。已归档的 `thread-a`、`thread-d`，`subAgent / review` 的 `thread-b` 和派生 `thread-c` 均可见；主工作区与 worktree 的归属都指向同一共享 Git 目录。
+2. 打开 `thread-a` 后，历史显示“读取方式：分页；已取得 2 回合、2 条目”，内容完整；时间线出现两个来源回合段，四条会话各只占一条泳道。切换关系图后布局完成，显示 4 个节点与 `FORKED_FROM`、`SUBAGENT_OF` 两条观察关系。
+3. 人工改名为“续作受控验收工作流”，将未分组 `thread-d` 移入；界面显示 4 名成员和“未分组会话 · 0”。关闭并重新打开同一隔离包后，项目缓存、该名称、四名成员与人工修正操作入口仍在，列表再次刷新仍为 3 页、6 条记录合并成 4 条会话。
+4. 把二进制改成不存在的夹具目录路径后，桌面显示 `BINARY_UNAVAILABLE`、可重试与“已有缓存保留”；四条会话和人工工作流仍可见，列表提示“缓存可能过期”。改回合成二进制后诊断重新连接，自动刷新恢复完整列表。此故障只作用于本轮合成来源。
+
+本次 `npm run test:ui` 在构建并行时曾出现 5 项超时和 2 项界面断言失败；构建结束后原样完整复跑，**9 个测试文件、44 项全部通过**，未修改产品代码。该首次失败与并行构建资源竞争相符，但未进行系统级性能归因，不计为产品缺陷修复。
+
+**隔离边界补充：**独立应用标识和空 `CODEX_HOME` 隔离了桌面缓存与 Codex 来源，却没有隔离 Jev 的系统钥匙串项目。`KeychainCredentialStore` 使用固定 `dev.codexflow.desktop.jev` 服务名；新标识的设置页仍显示默认地址的凭据“已保存”。本次没有读取、轮换、删除或发送该凭据，也没有点击 Jev 连接、推理或项目分析。若要在此包继续 Jev 凭据桌面实测，必须使用独立 macOS 测试用户或先实现经过迁移设计的凭据命名空间；仅换包标识与 `CODEX_HOME` 不够。该观察不证明凭据明文泄漏，但限制了本轮可安全执行的双后端路径。
+
 ## 性能沿用 #30 的已通过与暂缓口径
 
 本轮没有重新测量性能。沿用 [`issue-30-final-acceptance.md`](../performance/issue-30-final-acceptance.md) 的最后正式包结果：500 节点、2999 条关系的图 20 次桌面操作第 95 百分位 1.490 秒，低于 5 秒；缓存会话查询 20 次第 95 百分位 417 毫秒，低于 500 毫秒。正式包首次概览构建后首次样本 2.344 秒，超过 2 秒；归档过滤第 95 百分位 592 毫秒、证据回合首屏 1298 毫秒、证据条目与事实首屏 1861 毫秒，均未达到 500 毫秒。后三类及首次概览属于用户授权的本轮暂缓，不是性能全部通过。#30 已以 `NOT_PLANNED` 关闭；该口径不改变 #31、#32 和 #33 的真实性要求。
