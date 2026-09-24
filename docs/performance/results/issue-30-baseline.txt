@@ -1,0 +1,30 @@
+run=0 visible_relations=2999
+run=1 visible_relations=2999
+run=2 visible_relations=2999
+run=3 visible_relations=2999
+run=4 visible_relations=2999
+run=5 visible_relations=2999
+run=6 visible_relations=2999
+run=7 visible_relations=2999
+run=8 visible_relations=2999
+run=9 visible_relations=2999
+run=10 visible_relations=2999
+run=11 visible_relations=2999
+run=12 visible_relations=2999
+run=13 visible_relations=2999
+run=14 visible_relations=2999
+run=15 visible_relations=2999
+run=16 visible_relations=2999
+run=17 visible_relations=2999
+run=18 visible_relations=2999
+run=19 visible_relations=2999
+startup_ms=1744.978 dataset=issue-30-v1 runs=20
+catalog: min=0.301 median=0.316 p95=0.435 max=0.462
+sessions: min=0.934 median=1.021 p95=1.127 max=1.451
+timeline: min=11.094 median=11.764 p95=13.848 max=14.299
+graph: min=1755.412 median=1885.369 p95=2044.721 max=2312.890
+query: min=44.928 median=46.958 p95=54.889 max=55.048
+filter: min=44.443 median=46.573 p95=51.276 max=52.866
+evidence_turns_first_page: min=0.223 median=0.237 p95=0.259 max=0.264
+evidence_items_first_page: min=0.213 median=0.225 p95=0.260 max=0.286
+facts_first_page: min=0.582 median=0.601 p95=0.659 max=0.714

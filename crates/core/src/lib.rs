@@ -1118,6 +1118,24 @@ impl SourceService {
                 ))
             })
             .collect::<Result<_, AppError>>()?;
+        let mut hasher = Sha256::new();
+        hasher.update(candidates::CANDIDATE_RULE_VERSION);
+        hasher.update(facts::RULE_VERSION);
+        hasher.update(
+            serde_json::to_vec(sessions).map_err(|_| AppError::store("序列化候选输入失败。"))?,
+        );
+        hasher.update(
+            serde_json::to_vec(&expected).map_err(|_| AppError::store("序列化候选版本失败。"))?,
+        );
+        let input_version = format!("{:x}", hasher.finalize());
+        if let Some(saved) = self.sessions.cached_automatic_candidate_view_if_current(
+            &sessions.project.id,
+            &input_version,
+            &expected,
+            facts::RULE_VERSION,
+        )? {
+            return Ok(saved);
+        }
         let material = self
             .sessions
             .project_material(&sessions.project.id, &expected, facts::RULE_VERSION)?
@@ -1129,6 +1147,7 @@ impl SourceService {
                 )
             })?;
         let mut result = candidates::build(&readable, material);
+        result.0.input_version = input_version;
         result.0.unavailable_threads = (sessions.threads.len() - readable.threads.len()) as u64;
         for candidate in &result.0.candidates {
             result.0.candidate_versions.insert(

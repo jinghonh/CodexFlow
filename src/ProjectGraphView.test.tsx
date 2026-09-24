@@ -4,11 +4,12 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectGraphView } from "./ProjectGraphView";
 
-const layoutControl = vi.hoisted(() => ({ fail: false }));
+const layoutControl = vi.hoisted(() => ({ fail: false, edgeCount: 0 }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("elkjs/lib/elk.bundled.js", () => ({
   default: class {
-    async layout(graph: { children: { id: string }[] }) {
+    async layout(graph: { children: { id: string }[]; edges: unknown[] }) {
+      layoutControl.edgeCount = graph.edges.length;
       if (layoutControl.fail) throw new Error("布局失败");
       return { children: graph.children.map((node, index) => ({ ...node, x: index * 300, y: 0 })) };
     }
@@ -34,7 +35,21 @@ vi.mock("@xyflow/react", () => ({
   </div>,
 }));
 
-afterEach(() => { cleanup(); vi.clearAllMocks(); layoutControl.fail = false; });
+afterEach(() => { cleanup(); vi.clearAllMocks(); layoutControl.fail = false; layoutControl.edgeCount = 0; });
+
+test("密集关系使用结构骨架定位且保留全部可见关系", async () => {
+  const edge = (id: string, fromThreadId: string, toThreadId: string) => ({
+    id, projectId: "project", fromThreadId, toThreadId, kind: "FORKED_FROM",
+    source: "observed", sourceField: "forkedFromId", confidence: 1,
+    parentEndpoint: "inProject",
+  });
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: ["a", "b", "c"].map((id) => ({ id, title: id, referenceOnly: false })),
+    relations: [edge("ab", "a", "b"), edge("bc", "b", "c"), edge("ca", "c", "a")], diagnostics: [] });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  await waitFor(() => expect(document.querySelectorAll("[data-source]")).toHaveLength(3));
+  expect(layoutControl.edgeCount).toBe(2);
+});
 
 test("固定项目图展示来源方向、双关系、缺失端点诊断和选择详情", async () => {
   vi.mocked(invoke).mockResolvedValue({
@@ -87,6 +102,31 @@ test("布局器失败时仍显示全部结构关系", async () => {
   expect(edge.dataset.source).toBe("second");
   expect(edge.dataset.target).toBe("first");
   expect(screen.getByText("自动布局未完成，已按固定顺序展示全部会话和关系。")).toBeTruthy();
+});
+
+test("同一项目图刷新失败时保留已加载关系和缓存提示", async () => {
+  const graph = {
+    project: { id: "project", name: "示例项目" },
+    nodes: [
+      { id: "first", title: "甲", referenceOnly: false },
+      { id: "second", title: "乙", referenceOnly: false },
+    ],
+    relations: [{ id: "cached-edge", projectId: "project", fromThreadId: "first", toThreadId: "second",
+      kind: "FORKED_FROM", source: "observed", sourceField: "forkedFromId", confidence: 1, parentEndpoint: "inProject" }],
+    diagnostics: [],
+  };
+  vi.mocked(invoke)
+    .mockResolvedValueOnce(graph)
+    .mockRejectedValueOnce({ code: "STORAGE_FAILED", message: "关系图读取失败。", retryable: true,
+      cachePreserved: true, nextStep: "检查数据库后重试。" });
+  const { rerender } = render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  const edgeName = "观察 · 派生 · 1.0";
+  expect(await screen.findByRole("button", { name: edgeName })).toBeTruthy();
+
+  rerender(<ProjectGraphView projectId="project" refreshVersion={1} />);
+  expect(await screen.findByText(/STORAGE_FAILED：关系图读取失败/)).toBeTruthy();
+  expect(screen.getByText(/已有缓存保留/)).toBeTruthy();
+  expect(screen.getByRole("button", { name: edgeName })).toBeTruthy();
 });
 
 test("规则关系显示灰色事实依据和来源定位", async () => {

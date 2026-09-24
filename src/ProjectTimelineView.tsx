@@ -119,6 +119,7 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
   const [error, setError] = useState("");
   const [grain, setGrain] = useState<Grain>("day");
   const [zoom, setZoom] = useState(1);
+  const [rowLimit, setRowLimit] = useState(40);
   const [selected, setSelected] = useState<{ threadId: string; turnId: string | null } | null>(null);
   const [loading, setLoading] = useState<{ done: number; total: number } | null>(null);
   const [loadError, setLoadError] = useState("");
@@ -152,6 +153,13 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
     const height = Math.max(72, 28 + (Math.max(0, ...placed.map(({ lane }) => lane)) + 1) * 20);
     return { thread, placed, height, group: owners.get(thread.threadId) ?? "ungrouped" };
   }), [visible, owners]);
+  useEffect(() => { setRowLimit(40); }, [projectId, visibleThreadIds]);
+  useEffect(() => {
+    if (!selectedThreadId) return;
+    const index = rows.findIndex((row) => row.thread.threadId === selectedThreadId);
+    if (index >= 0) setRowLimit((previous) => Math.max(previous, index + 1));
+  }, [rows, selectedThreadId]);
+  const shownRows = rows.slice(0, rowLimit);
   const scale = useMemo(() => makeScale(visible, grain, zoom), [visible, grain, zoom]);
   const position = (at: number) => scale ? ((at - scale.start) / (scale.end - scale.start)) * scale.width : 0;
   const effectiveSelectedId = selectedThreadId ?? selected?.threadId;
@@ -218,7 +226,7 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
             {scale?.ticks.map((tick) => <span key={tick.at} className="timeline-tick" style={{ left: position(tick.at) }}>{tick.label}</span>)}
             {!scale && <span className="timeline-axis-unknown">位置未知</span>}
           </div></div>
-      {rows.map(({ thread, placed, height, group }, index) => <Fragment key={thread.threadId}>{(index === 0 || rows[index - 1].group !== group) && <div className="timeline-group" style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px` }}><strong>{workstreams.find((stream) => stream.id === group)?.name ?? "未分组会话"}</strong><span>{rows.filter((row) => row.group === group).length} 条会话</span></div>}<div className="timeline-row" style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px`, minHeight: height }}>
+      {shownRows.map(({ thread, placed, height, group }, index) => <Fragment key={thread.threadId}>{(index === 0 || shownRows[index - 1].group !== group) && <div className="timeline-group" style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px` }}><strong>{workstreams.find((stream) => stream.id === group)?.name ?? "未分组会话"}</strong><span>{rows.filter((row) => row.group === group).length} 条会话</span></div>}<div className="timeline-row" style={{ gridTemplateColumns: `${labelWidth}px ${scale?.width ?? 620}px`, minHeight: height }}>
             <button className={`timeline-row-label ${effectiveSelectedId === thread.threadId ? "selected" : ""}`} onClick={() => choose(thread.threadId, null)} title={thread.title}>
               <strong>{thread.title}</strong><span className={`timeline-quality quality-${thread.quality}`}>{qualityText[thread.quality]}</span><small title={thread.knownDurationMs === null ? "来源未提供可累计时长" : `${thread.knownDurationMs.toLocaleString("zh-CN")} 毫秒`}>{thread.knownDurationMs === null ? "已知时长：未知" : `已知时长：${duration(thread.knownDurationMs)}`}</small>
             </button>
@@ -232,6 +240,7 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
               })}
             </div>
           </div></Fragment>)}
+          {shownRows.length < rows.length && <button className="timeline-load" onClick={() => setRowLimit((previous) => previous + 40)}>显示更多会话（已显示 {shownRows.length} / {rows.length}）</button>}
         </div>
       </div>}
       <div className="timeline-details" aria-live="polite">
