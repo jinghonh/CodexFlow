@@ -206,6 +206,11 @@ pub(crate) fn build(graph: &ProjectGraph, old: &[Workstream]) -> ProjectWorkstre
             } else {
                 None
             },
+            name_actual_model: if keep_name {
+                prior.unwrap().name_actual_model.clone()
+            } else {
+                None
+            },
             name_error,
             predecessor_ids,
         };

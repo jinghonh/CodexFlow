@@ -801,6 +801,8 @@ pub struct Workstream {
     pub relation_ids: Vec<String>,
     pub algorithm_version: String,
     pub name_input_version: Option<String>,
+    #[serde(default)]
+    pub name_actual_model: Option<String>,
     pub name_error: Option<String>,
     pub predecessor_ids: Vec<String>,
 }

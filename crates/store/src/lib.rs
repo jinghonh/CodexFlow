@@ -574,6 +574,7 @@ impl SessionStore {
         }
         stream.name = name.into();
         stream.name_input_version = Some(input_version.into());
+        stream.name_actual_model = None;
         stream.name_error = None;
         let json =
             serde_json::to_string(&stream).map_err(|_| AppError::store("序列化工作流失败。"))?;
@@ -635,6 +636,7 @@ impl SessionStore {
         members: &[String],
         name: &str,
         input_version: &str,
+        actual_model: &str,
     ) -> Result<bool, AppError> {
         let mut connection = self.connection()?;
         let transaction = connection
@@ -670,6 +672,7 @@ impl SessionStore {
         }
         stream.name = name.into();
         stream.name_input_version = Some(input_version.into());
+        stream.name_actual_model = Some(actual_model.into());
         stream.name_error = None;
         let stream_json =
             serde_json::to_string(&stream).map_err(|_| AppError::store("序列化工作流失败。"))?;
@@ -2604,6 +2607,7 @@ mod tests {
             relation_ids: vec!["ab".into()],
             algorithm_version: "test".into(),
             name_input_version: None,
+            name_actual_model: None,
             name_error: None,
             predecessor_ids: Vec::new(),
         };
