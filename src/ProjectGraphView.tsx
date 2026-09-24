@@ -178,7 +178,9 @@ async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{
       return true;
     });
     const layoutOnMain = async () => {
+      if (signal?.aborted) throw new Error("布局已取消");
       const { default: ELK } = await import("elkjs/lib/elk.bundled.js");
+      if (signal?.aborted) throw new Error("布局已取消");
       const result = await new ELK().layout({
         id: "project",
         layoutOptions: { "elk.algorithm": "layered", "elk.direction": "RIGHT",
@@ -210,7 +212,14 @@ async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{
         // The spanning forest keeps the fallback layout short enough to run
         // after yielding the UI for a frame.
         return new Promise<{ id: string; x?: number; y?: number }[]>((resolve, reject) => {
-          requestAnimationFrame(() => { void layoutOnMain().then(resolve, reject); });
+          if (signal?.aborted) { reject(new Error("布局已取消")); return; }
+          const abort = () => { cancelAnimationFrame(frame); reject(new Error("布局已取消")); };
+          signal?.addEventListener("abort", abort, { once: true });
+          const frame = requestAnimationFrame(() => {
+            signal?.removeEventListener("abort", abort);
+            if (signal?.aborted) { reject(new Error("布局已取消")); return; }
+            void layoutOnMain().then(resolve, reject);
+          });
         });
       });
       coordinates = new Map(positions.map((node) => [node.id, node]));

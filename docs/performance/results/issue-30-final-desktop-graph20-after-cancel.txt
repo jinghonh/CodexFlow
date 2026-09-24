@@ -1,0 +1,27 @@
+构建：Tauri 0.1.0，dev.codexflow.performance.final，二进制 SHA-256 f29aecc0a5ed6a58d5d2abf52ce8b1a1f780921923899c74d531f368c3a40d87
+数据：issue-30-v1，500 会话 / 10000 回合 / 100000 条目，500 图节点 / 2999 条可见关系。
+路径：审查后正式桌面包中从时间线切换至关系图；每次重新挂载图组件、查询项目图，等待“关系图布局完成”和 2999 条关系的可访问状态，确认无布局失败提示。
+计时：从发送点击前到收到可访问状态；包含计算机操作和状态采集开销，是该次桌面操作完成时间的保守上界，不是应用内部精确耗时。旧包结果单独保留在 issue-30-final-desktop-graph20.txt。
+
+run=00 elapsed_ms=1489
+run=01 elapsed_ms=1462
+run=02 elapsed_ms=1447
+run=03 elapsed_ms=1469
+run=04 elapsed_ms=1444
+run=05 elapsed_ms=1445
+run=06 elapsed_ms=1439
+run=07 elapsed_ms=1452
+run=08 elapsed_ms=1436
+run=09 elapsed_ms=1462
+run=10 elapsed_ms=1450
+run=11 elapsed_ms=1514
+run=12 elapsed_ms=1451
+run=13 elapsed_ms=1443
+run=14 elapsed_ms=1433
+run=15 elapsed_ms=1464
+run=16 elapsed_ms=1450
+run=17 elapsed_ms=1449
+run=18 elapsed_ms=1451
+run=19 elapsed_ms=1490
+
+min_ms=1433 median_ms=1450.5 p95_ms=1490 max_ms=1514

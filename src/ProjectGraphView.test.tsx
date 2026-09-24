@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, expect, test, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectGraphView } from "./ProjectGraphView";
 
@@ -72,6 +72,33 @@ test("筛选变化会终止旧布局 Worker", async () => {
   await screen.findByText("正在布局关系图…");
   rerender(<ProjectGraphView projectId="project" refreshVersion={0} relationSource="observed" />);
   await waitFor(() => expect(terminated).toBeGreaterThanOrEqual(1));
+});
+
+test("Worker 失败后排队的旧布局在筛选变化时取消", async () => {
+  const frames: FrameRequestCallback[] = [];
+  const cancelled: number[] = [];
+  let workers = 0;
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => { frames.push(callback); return frames.length; });
+  vi.stubGlobal("cancelAnimationFrame", (frame: number) => { cancelled.push(frame); });
+  vi.stubGlobal("Worker", class {
+    onmessage: ((event: MessageEvent) => void) | null = null;
+    onerror: ((event: ErrorEvent) => void) | null = null;
+    postMessage() { if (++workers === 1) this.onerror?.({ message: "Worker 中 ELK 不可用" } as ErrorEvent); }
+    terminate() {}
+  });
+  vi.mocked(invoke).mockResolvedValue({ project: { id: "project", name: "项目" },
+    nodes: [{ id: "a", title: "甲", referenceOnly: false }, { id: "b", title: "乙", referenceOnly: false }],
+    relations: [{ id: "ab", projectId: "project", fromThreadId: "a", toThreadId: "b",
+      kind: "FORKED_FROM", source: "observed", sourceField: "forkedFromId", confidence: 1,
+      parentEndpoint: "inProject" }], diagnostics: [],
+  });
+  const { rerender } = render(<ProjectGraphView projectId="project" refreshVersion={0} relationSource="all" />);
+  await waitFor(() => expect(frames).toHaveLength(1));
+  rerender(<ProjectGraphView projectId="project" refreshVersion={0} relationSource="observed" />);
+  await waitFor(() => expect(workers).toBe(2));
+  expect(cancelled).toContain(1);
+  await act(async () => { frames[0](0); await Promise.resolve(); });
+  expect(layoutControl.edgeCount).toBe(0);
 });
 
 test("大图默认仅绘制当前视口并保留全部关系输入", async () => {
