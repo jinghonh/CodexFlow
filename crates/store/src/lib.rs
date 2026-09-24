@@ -529,6 +529,46 @@ impl SessionStore {
         let transaction = connection
             .transaction()
             .map_err(|_| AppError::store("读取工作流修正失败。"))?;
+        let corrections = Self::workstream_corrections_in(&transaction, project_id)?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("完成读取工作流修正失败。"))?;
+        Ok(corrections)
+    }
+
+    /// Read the automatic groups and corrections from one SQLite snapshot.
+    pub fn workstream_snapshot(
+        &self,
+        project_id: &str,
+    ) -> Result<(Vec<Workstream>, WorkstreamCorrections), AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| AppError::store("读取工作流快照失败。"))?;
+        let streams = {
+            let mut statement = transaction
+                .prepare("SELECT stream_json FROM workstreams WHERE project_id=?1 ORDER BY id")
+                .map_err(|_| AppError::store("读取工作流失败。"))?;
+            let rows = statement
+                .query_map([project_id], |row| row.get::<_, String>(0))
+                .map_err(|_| AppError::store("读取工作流失败。"))?;
+            rows.map(|row| {
+                let json = row.map_err(|_| AppError::store("读取工作流失败。"))?;
+                serde_json::from_str(&json).map_err(|_| AppError::store("解析工作流失败。"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        let corrections = Self::workstream_corrections_in(&transaction, project_id)?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("完成读取工作流快照失败。"))?;
+        Ok((streams, corrections))
+    }
+
+    fn workstream_corrections_in(
+        transaction: &rusqlite::Transaction<'_>,
+        project_id: &str,
+    ) -> Result<WorkstreamCorrections, AppError> {
         let revision: i64 = transaction
             .query_row(
                 "SELECT revision FROM workstream_revisions WHERE project_id=?1",
@@ -564,9 +604,6 @@ impl SessionStore {
                 .map_err(|_| AppError::store("读取会话归属修正失败。"))?;
             entries
         };
-        transaction
-            .commit()
-            .map_err(|_| AppError::store("完成读取工作流修正失败。"))?;
         Ok(WorkstreamCorrections {
             revision: revision as u64,
             names,
@@ -656,12 +693,25 @@ impl SessionStore {
     pub fn replace_workstreams(
         &self,
         project_id: &str,
+        expected_revision: u64,
         streams: &[Workstream],
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let mut connection = self.connection()?;
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AppError::store("开始保存工作流失败。"))?;
+        let current: i64 = transaction
+            .query_row(
+                "SELECT revision FROM workstream_revisions WHERE project_id=?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取工作流修订号失败。"))?
+            .unwrap_or(0);
+        if current != i64::try_from(expected_revision).unwrap_or(-1) {
+            return Ok(false);
+        }
         transaction
             .execute("DELETE FROM workstreams WHERE project_id=?1", [project_id])
             .map_err(|_| AppError::store("清理旧工作流失败。"))?;
@@ -681,7 +731,8 @@ impl SessionStore {
         bump_workstream_revision(&transaction, project_id)?;
         transaction
             .commit()
-            .map_err(|_| AppError::store("提交工作流失败。"))
+            .map_err(|_| AppError::store("提交工作流失败。"))?;
+        Ok(true)
     }
 
     pub fn save_workstream_name(
@@ -2466,7 +2517,7 @@ mod tests {
             predecessor_ids: Vec::new(),
         };
         store
-            .replace_workstreams("project", &[stream.clone()])
+            .replace_workstreams("project", 0, &[stream.clone()])
             .unwrap();
         store
             .save_workstream_name_error("project", "stream", &stream.members, "模型失败")
@@ -2504,6 +2555,7 @@ mod tests {
         store
             .replace_workstreams(
                 "project",
+                0,
                 &[Workstream {
                     id: "stream".into(),
                     project_id: "project".into(),

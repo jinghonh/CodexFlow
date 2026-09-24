@@ -757,13 +757,18 @@ impl SourceService {
     pub fn project_workstreams(&self, project_id: &str) -> Result<ProjectWorkstreams, AppError> {
         let graph = self.project_graph(project_id)?;
         let _guard = self.lock_project_updates();
-        let automatic = self.automatic_workstreams_for_graph(&graph)?;
-        let corrections = self.sessions.workstream_corrections(project_id)?;
-        Ok(workstreams::apply_corrections(
-            &graph,
-            automatic,
-            &corrections,
-        ))
+        for _ in 0..8 {
+            let automatic = self.automatic_workstreams_for_graph(&graph)?;
+            let corrections = self.sessions.workstream_corrections(project_id)?;
+            if automatic.revision == corrections.revision {
+                return Ok(workstreams::apply_corrections(
+                    &graph,
+                    automatic,
+                    &corrections,
+                ));
+            }
+        }
+        Err(AppError::workstream_conflict())
     }
 
     fn automatic_workstreams(&self, project_id: &str) -> Result<ProjectWorkstreams, AppError> {
@@ -776,32 +781,53 @@ impl SourceService {
         &self,
         graph: &ProjectGraph,
     ) -> Result<ProjectWorkstreams, AppError> {
+        self.automatic_workstreams_for_graph_with_hook(graph, || {})
+    }
+
+    fn automatic_workstreams_for_graph_with_hook<F: FnOnce()>(
+        &self,
+        graph: &ProjectGraph,
+        before_first_replace: F,
+    ) -> Result<ProjectWorkstreams, AppError> {
         let project_id = &graph.project.id;
-        let previous = self.sessions.workstreams(project_id)?;
-        let corrections = self.sessions.workstream_corrections(project_id)?;
-        let mut result = workstreams::build(graph, &previous);
-        for old in &previous {
-            if result.workstreams.iter().any(|stream| stream.id == old.id) {
-                continue;
+        let mut before_first_replace = Some(before_first_replace);
+        for _ in 0..8 {
+            let (previous, corrections) = self.sessions.workstream_snapshot(project_id)?;
+            let mut result = workstreams::build(graph, &previous);
+            for old in &previous {
+                if result.workstreams.iter().any(|stream| stream.id == old.id) {
+                    continue;
+                }
+                if corrections.names.contains_key(&old.id)
+                    || corrections
+                        .members
+                        .values()
+                        .any(|target| target.as_deref() == Some(&old.id))
+                {
+                    let mut retained = old.clone();
+                    retained.members.clear();
+                    retained.relation_ids.clear();
+                    result.workstreams.push(retained);
+                }
             }
-            if corrections.names.contains_key(&old.id)
-                || corrections
-                    .members
-                    .values()
-                    .any(|target| target.as_deref() == Some(&old.id))
-            {
-                let mut retained = old.clone();
-                retained.members.clear();
-                retained.relation_ids.clear();
-                result.workstreams.push(retained);
+            result.workstreams.sort_by(|a, b| a.id.cmp(&b.id));
+            if result.workstreams == previous {
+                result.revision = corrections.revision;
+                return Ok(result);
+            }
+            if let Some(hook) = before_first_replace.take() {
+                hook();
+            }
+            if self.sessions.replace_workstreams(
+                project_id,
+                corrections.revision,
+                &result.workstreams,
+            )? {
+                result.revision = corrections.revision.saturating_add(1);
+                return Ok(result);
             }
         }
-        result.workstreams.sort_by(|a, b| a.id.cmp(&b.id));
-        if result.workstreams != previous {
-            self.sessions
-                .replace_workstreams(project_id, &result.workstreams)?;
-        }
-        Ok(result)
+        Err(AppError::workstream_conflict())
     }
 
     pub fn rename_workstream(
@@ -3186,6 +3212,112 @@ mod tests {
             ["c", "d"]
         );
         assert_eq!(view.ungrouped_thread_ids, ["x"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regroup_retries_when_a_correction_commits_after_its_snapshot() {
+        use codexflow_domain::ThreadMetadata;
+        let root = temp_data_dir();
+        let project_path = root.join("project");
+        fs::create_dir_all(&project_path).unwrap();
+        let service = SourceService::with_credentials(
+            root.join("data"),
+            Arc::new(MemoryCredentials::default()),
+        )
+        .unwrap();
+        let thread = |id: &str, parent: Option<&str>, updated_at| ThreadMetadata {
+            id: id.into(),
+            session_id: id.into(),
+            title: Some(id.into()),
+            preview: id.into(),
+            cwd: project_path.to_string_lossy().into_owned(),
+            project_id: None,
+            source_kind: "cli".into(),
+            source_detail: None,
+            thread_source: None,
+            parent_thread_id: parent.map(str::to_owned),
+            forked_from_id: None,
+            git: None,
+            created_at: 1,
+            updated_at,
+            archived: false,
+            metadata_complete: true,
+            turns_complete: false,
+            items_complete: false,
+            missing_from_source: false,
+            content_complete: false,
+            read_error: None,
+            observed_at_unix_ms: updated_at,
+        };
+        service
+            .sessions
+            .save_collection(
+                &[
+                    thread("a", None, 2),
+                    thread("b", Some("a"), 2),
+                    thread("x", None, 2),
+                ],
+                &[],
+            )
+            .unwrap();
+        let project_id = service
+            .choose_project(project_path.to_str().unwrap())
+            .unwrap()
+            .selected_project_id
+            .unwrap();
+        let first = service.project_workstreams(&project_id).unwrap();
+        let target = first.workstreams[0].id.clone();
+        assert_eq!(first.workstreams[0].members, ["a", "b"]);
+
+        service
+            .sessions
+            .save_collection(&[thread("b", None, 3)], &[])
+            .unwrap();
+        service.reconcile_projects().unwrap();
+        let changed_graph = service.project_graph(&project_id).unwrap();
+        assert!(changed_graph.relations.is_empty());
+        let automatic = service
+            .automatic_workstreams_for_graph_with_hook(&changed_graph, || {
+                // This lands after the regroup has read its old stream and correction snapshot,
+                // before its replacement transaction. The old implementation deleted target.
+                let revision = service
+                    .sessions
+                    .save_workstream_correction(
+                        &project_id,
+                        first.revision,
+                        WorkstreamChange::Rename {
+                            id: &target,
+                            name: "保留的人工名称",
+                        },
+                    )
+                    .unwrap();
+                service
+                    .sessions
+                    .save_workstream_correction(
+                        &project_id,
+                        revision,
+                        WorkstreamChange::Move {
+                            thread_id: "x",
+                            target_id: Some(&target),
+                        },
+                    )
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(automatic.workstreams.len(), 1);
+        assert_eq!(automatic.workstreams[0].id, target);
+        assert!(automatic.workstreams[0].members.is_empty());
+        let view = service.project_workstreams(&project_id).unwrap();
+        let retained = view
+            .workstreams
+            .iter()
+            .find(|stream| stream.id == target)
+            .unwrap();
+        assert_eq!(retained.name, "保留的人工名称");
+        assert_eq!(retained.members, ["x"]);
+        assert_eq!(view.ungrouped_thread_ids, ["a", "b"]);
+        assert_eq!(view.revision, first.revision + 3);
         let _ = fs::remove_dir_all(root);
     }
 }
