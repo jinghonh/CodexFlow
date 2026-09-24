@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub(crate) const NEIGHBOR_LIMIT: usize = 10;
-pub(crate) const CANDIDATE_RULE_VERSION: &str = "candidate-signals-v2";
+pub(crate) const CANDIDATE_RULE_VERSION: &str = "candidate-signals-v3";
 const EVIDENCE_LIMIT: usize = 20;
 
 fn stable_id(prefix: &str, parts: &[&str]) -> String {
@@ -280,7 +280,7 @@ fn sample(left: &Signals, right: &Signals, reasons: &[CandidateReason]) -> Evide
     let mut pairs = Vec::with_capacity(count);
     for i in 0..count {
         let a = left_all[i % left_sampled].clone();
-        let b = right_all[i % right_sampled].clone();
+        let b = right_all[(i / left_sampled + i % left_sampled) % right_sampled].clone();
         pairs.push(EvidencePair {
             id: stable_id(
                 "evidence-pair",
@@ -298,7 +298,7 @@ fn sample(left: &Signals, right: &Signals, reasons: &[CandidateReason]) -> Evide
         left_sampled: left_sampled as u32,
         right_sampled: right_sampled as u32,
         sampling_rule:
-            "双方有效来源摘录按相关性和稳定标识排序，各取前 20 条；按稳定轮转抽取最多 20 组。"
+            "双方有效来源摘录按相关性和稳定标识排序，各取前 20 条；交错枚举不重复的双侧组合，最多 20 组。"
                 .into(),
         pairs,
     }
@@ -778,6 +778,16 @@ mod tests {
         let (preview, _) = build(&sessions, file_material(vec![left, right]));
         assert!(preview.candidates[0].evidence.pairs.len() <= 20);
         assert_eq!(preview.candidates[0].evidence.combinations_available, 4);
+        let pairs = &preview.candidates[0].evidence.pairs;
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(
+            pairs
+                .iter()
+                .map(|pair| &pair.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            4
+        );
     }
 
     #[test]

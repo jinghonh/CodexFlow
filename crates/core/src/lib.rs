@@ -33,6 +33,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 pub use summary::SummaryAnalyzer;
+pub const EVALUATION_CANDIDATE_RULES_VERSION: &str = candidates::CANDIDATE_RULE_VERSION;
+pub const EVALUATION_FACT_RULES_VERSION: &str = facts::RULE_VERSION;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -3860,10 +3862,12 @@ mod tests {
                         actual_model: None,
                         error: None,
                         relation_classification: None,
+                        relation_evidence_selection: None,
                     })
                     .collect(),
                 relations_planned: false,
                 names_planned: false,
+                relation_only: false,
                 started_at_unix_ms: 7,
                 finished_at_unix_ms: None,
                 interrupted: false,

@@ -2846,6 +2846,21 @@ impl PreferenceStore {
         Ok(legacy)
     }
 
+    /// Read configured settings for an external evaluation without importing legacy data.
+    pub fn load_current(&self) -> Result<Preferences, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT preferences_json FROM app_preferences WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取应用设置失败。"))?;
+        let json = json.ok_or_else(|| AppError::store("请先在应用中保存 Jev 配置。"))?;
+        serde_json::from_str(&json).map_err(|_| AppError::store("应用设置数据损坏。"))
+    }
+
     pub fn save(&self, preferences: &Preferences) -> Result<(), AppError> {
         let json = serde_json::to_string(preferences)
             .map_err(|_| AppError::store("编码应用设置失败。"))?;
@@ -2959,7 +2974,22 @@ mod tests {
         .unwrap();
         SessionStore::new(dir.clone()).unwrap();
         let settings = PreferenceStore::new(dir.clone());
+        assert!(
+            settings.load_current().is_err(),
+            "评测只读入口不得迁移旧设置"
+        );
+        let before: Option<String> = Connection::open(dir.join("sessions.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT preferences_json FROM app_preferences WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert!(before.is_none());
         assert_eq!(settings.load().unwrap().jev.model, "jev-1.13.0");
+        assert_eq!(settings.load_current().unwrap().jev.model, "jev-1.13.0");
         fs::remove_file(dir.join("preferences.json")).unwrap();
         let restored = PreferenceStore::new(dir.clone()).load().unwrap();
         assert_eq!(restored.jev.base_url, "https://api.typesafe.ai/gateway");

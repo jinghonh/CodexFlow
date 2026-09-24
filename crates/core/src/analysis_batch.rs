@@ -649,6 +649,7 @@ impl SourceService {
                 actual_model: None,
                 error: None,
                 relation_classification: None,
+                relation_evidence_selection: None,
             })
             .collect();
         let codex_binary_fingerprint = source
@@ -689,6 +690,7 @@ impl SourceService {
             units,
             relations_planned: false,
             names_planned: false,
+            relation_only: false,
             started_at_unix_ms: self.analysis_now(),
             finished_at_unix_ms: None,
             interrupted: false,
@@ -697,6 +699,131 @@ impl SourceService {
         active.insert(project_id.clone(), control.clone());
         if let Err(error) = self.save_analysis(&mut run, &control.update) {
             active.remove(&project_id);
+            return Err(error);
+        }
+        drop(active);
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            service.drive_analysis(control).await;
+        });
+        Ok(run)
+    }
+
+    /// A manually selected benchmark pair uses the same Jev dispatch and core outcome path
+    /// as project analysis, without starting Codex summaries or workstream naming.
+    pub async fn start_relation_evaluation(
+        self: &Arc<Self>,
+        project_id: String,
+        candidate_id: String,
+        limits: AnalysisLimits,
+        on_update: impl Fn(AnalysisRun) + Send + Sync + 'static,
+    ) -> Result<AnalysisRun, AppError> {
+        validate_limits(&limits)?;
+        let preview = self.candidate_preview(&project_id)?;
+        let version = preview
+            .candidate_versions
+            .get(&candidate_id)
+            .ok_or_else(|| {
+                core_error(
+                    ErrorCode::AnalysisUnavailable,
+                    "评测样本未进入核心候选集。",
+                    false,
+                )
+            })?;
+        let jev = self.jev_status().await?;
+        if !jev.credential_configured || jev.credential_error.is_some() {
+            return Err(core_error(
+                ErrorCode::AnalysisUnavailable,
+                "请先在应用中配置 Jev。",
+                false,
+            ));
+        }
+        if !pinned_jev_model(&jev.config.model) {
+            return Err(core_error(
+                ErrorCode::AnalysisUnavailable,
+                "评测必须使用版本化 Jev 模型 ID。",
+                false,
+            ));
+        }
+        let preferences = self.preferences.lock().await.clone();
+        let mut active = self.analysis_active.lock().unwrap();
+        if active.contains_key(&project_id)
+            || self
+                .sessions
+                .latest_analysis_run(&project_id)?
+                .is_some_and(|run| run.state == AnalysisRunState::Paused)
+        {
+            return Err(core_error(
+                ErrorCode::AnalysisAlreadyRunning,
+                "此样本已有可继续的评测运行。",
+                true,
+            ));
+        }
+        let id = format!(
+            "evaluation-{}-{}",
+            now_ms(),
+            NEXT_BATCH.fetch_add(1, Ordering::Relaxed)
+        );
+        let control = AnalysisControl {
+            id: id.clone(),
+            project_id: project_id.clone(),
+            cancel: CancellationToken::new(),
+            pause: Arc::new(AtomicBool::new(false)),
+            queue_pause: CancellationToken::new(),
+            dispatch: Arc::new(tokio::sync::Mutex::new(())),
+            update: Arc::new(on_update),
+        };
+        let mut run = AnalysisRun {
+            id,
+            project_id,
+            state: AnalysisRunState::Queued,
+            pause_reason: None,
+            input_version: preview.input_version,
+            codex_binary: None,
+            codex_binary_fingerprint: None,
+            codex_version: None,
+            codex_model: DEFAULT_CODEX_MODEL.into(),
+            jev_base_url: jev.config.base_url,
+            jev_model: jev.config.model.clone(),
+            jev_rules_version: RELATION_RULES_VERSION.into(),
+            jev_config_revision: preferences.jev_revision,
+            jev_pinned_model: Some(jev.config.model),
+            jev_probe_attempts: 0,
+            limits,
+            batch_number: 1,
+            batch_calls: 0,
+            total_calls: 0,
+            total_questions: 0,
+            input_tokens: None,
+            output_tokens: None,
+            processed: 0,
+            succeeded: 0,
+            failed: 0,
+            pending: 1,
+            units: vec![AnalysisUnit {
+                id: candidate_id,
+                stage: AnalysisStage::Relation,
+                input_version: version.clone(),
+                state: AnalysisUnitState::Pending,
+                attempts: 0,
+                active_summary_run_id: None,
+                requested_model: preferences.jev.model,
+                actual_model: None,
+                error: None,
+                relation_classification: None,
+                relation_evidence_selection: None,
+            }],
+            relations_planned: true,
+            names_planned: true,
+            relation_only: true,
+            started_at_unix_ms: self.analysis_now(),
+            finished_at_unix_ms: None,
+            interrupted: false,
+            error: None,
+        };
+        active.insert(run.project_id.clone(), control.clone());
+        if let Err(error) = self.save_analysis(&mut run, &control.update) {
+            active.remove(&run.project_id);
             return Err(error);
         }
         drop(active);
@@ -814,20 +941,34 @@ impl SourceService {
         let mut limits = run.limits.clone();
         limits.call_limit = call_limit;
         validate_limits(&limits)?;
-        let (preview, _) = self
-            .analysis_material(&run.project_id, limits.clone())
-            .await?;
+        let analysis_preview = if run.relation_only {
+            None
+        } else {
+            Some(
+                self.analysis_material(&run.project_id, limits.clone())
+                    .await?
+                    .0,
+            )
+        };
+        let preview_version = if let Some(preview) = &analysis_preview {
+            preview.input_version.clone()
+        } else {
+            self.candidate_preview(&run.project_id)?.input_version
+        };
         let source = self.status().await;
         let jev_revision = self.preferences.lock().await.jev_revision;
-        if preview.input_version != run.input_version
-            || source.resolved_binary != run.codex_binary
-            || source
-                .resolved_binary
-                .as_deref()
-                .and_then(|path| self.binary_fingerprint(path))
-                != run.codex_binary_fingerprint
-            || source.version != run.codex_version
-            || preview.stages[0].model != run.codex_model
+        if preview_version != run.input_version
+            || (!run.relation_only
+                && (source.resolved_binary != run.codex_binary
+                    || source
+                        .resolved_binary
+                        .as_deref()
+                        .and_then(|path| self.binary_fingerprint(path))
+                        != run.codex_binary_fingerprint
+                    || source.version != run.codex_version))
+            || analysis_preview
+                .as_ref()
+                .is_some_and(|preview| preview.stages[0].model != run.codex_model)
             || jev_revision != run.jev_config_revision
             || run.jev_rules_version != RELATION_RULES_VERSION
         {
@@ -837,7 +978,9 @@ impl SourceService {
                 false,
             ));
         }
-        if !preview.stages[0].available
+        if analysis_preview
+            .as_ref()
+            .is_some_and(|preview| !preview.stages[0].available)
             && run.units.iter().any(|unit| {
                 unit.stage == AnalysisStage::Summary && unit.state != AnalysisUnitState::Succeeded
             })
@@ -873,7 +1016,7 @@ impl SourceService {
             // Retried summaries and relations can change both the communities and their
             // naming input. Keep already saved names only when the replanned version matches.
             run.units.retain(|unit| unit.stage != AnalysisStage::Naming);
-            run.names_planned = false;
+            run.names_planned = run.relation_only;
         }
         let reset_pending_attempts = run.state == AnalysisRunState::Cancelled || run.interrupted;
         for unit in &mut run.units {
@@ -1046,6 +1189,7 @@ impl SourceService {
                             actual_model: None,
                             error: None,
                             relation_classification: None,
+                            relation_evidence_selection: None,
                         });
                     }
                 }
@@ -1091,6 +1235,7 @@ impl SourceService {
                         actual_model: None,
                         error: None,
                         relation_classification: None,
+                        relation_evidence_selection: None,
                     });
                 }
                 run.names_planned = true;
@@ -2060,6 +2205,7 @@ impl SourceService {
                 }
             }
             Ok(JevUnitResult::Evidence(selection)) => {
+                current.units[index].relation_evidence_selection = Some(selection.clone());
                 current.input_tokens = Some(
                     current
                         .input_tokens
@@ -3343,6 +3489,107 @@ mod tests {
             .unwrap();
         assert_ne!(final_version, first_version);
         assert_eq!(complete.total_calls, partial.total_calls + 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn relation_evaluation_resumes_two_stage_jev_without_codex_calls() {
+        let root = root("relation-evaluation");
+        let service = service(&root, "ok", 2).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for stage in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_jev_post(&mut stream);
+                let answers: serde_json::Map<String, serde_json::Value> = request["questions"]
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, question)| {
+                        let choices: Vec<_> =
+                            question["criteria"].as_object().unwrap().keys().collect();
+                        let chosen = if stage == 0 {
+                            if key == "related_ab" {
+                                "SUPPORTS"
+                            } else {
+                                "REJECTS"
+                            }
+                        } else {
+                            "p0"
+                        };
+                        let probabilities: serde_json::Map<String, serde_json::Value> = choices
+                            .iter()
+                            .map(|choice| {
+                                (
+                                    choice.to_string(),
+                                    serde_json::json!(if choice.as_str() == chosen {
+                                        0.8
+                                    } else {
+                                        0.2 / (choices.len() - 1) as f64
+                                    }),
+                                )
+                            })
+                            .collect();
+                        (
+                            key.clone(),
+                            serde_json::json!({"type":"choice","choice":chosen,
+                            "confidence":0.76,"probabilities":probabilities}),
+                        )
+                    })
+                    .collect();
+                write_jev_json(
+                    &mut stream,
+                    200,
+                    serde_json::json!({"model":"jev-1.13.0",
+                    "answers":answers,"usage":{"input_tokens":25,"output_tokens":7}}),
+                );
+            }
+        });
+        service
+            .save_jev(base_url, "jev-1.13.0".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let candidate = service
+            .candidate_preview("project-test")
+            .unwrap()
+            .candidates
+            .remove(0);
+        let started = service
+            .start_relation_evaluation(
+                "project-test".into(),
+                candidate.id,
+                AnalysisLimits {
+                    call_limit: 1,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert!(paused.relation_only);
+        assert_eq!(paused.total_calls, 1);
+        assert!(paused.units[0].relation_classification.is_some());
+        assert!(paused.units[0].relation_evidence_selection.is_none());
+        service
+            .continue_analysis_run(&started.id, 1, |_| {})
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(complete.total_calls, 2);
+        assert!(complete.units[0].relation_evidence_selection.is_some());
+        assert!(complete
+            .units
+            .iter()
+            .all(|unit| unit.stage != AnalysisStage::Naming));
+        assert!(service
+            .project_graph("project-test")
+            .unwrap()
+            .reviewed_relations
+            .iter()
+            .any(|relation| relation.evidence_valid));
+        server.join().unwrap();
         let _ = fs::remove_dir_all(root);
     }
 

@@ -316,6 +316,8 @@ pub struct AnalysisUnit {
     pub error: Option<AppError>,
     #[serde(default)]
     pub relation_classification: Option<JevRelationClassification>,
+    #[serde(default)]
+    pub relation_evidence_selection: Option<JevEvidenceSelection>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -356,6 +358,8 @@ pub struct AnalysisRun {
     pub relations_planned: bool,
     #[serde(default)]
     pub names_planned: bool,
+    #[serde(default)]
+    pub relation_only: bool,
     pub started_at_unix_ms: i64,
     pub finished_at_unix_ms: Option<i64>,
     pub interrupted: bool,
