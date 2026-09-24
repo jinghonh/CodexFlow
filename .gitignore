@@ -10,4 +10,5 @@ docs/*
 !docs/adr/
 !docs/agents/
 !docs/performance/
+!docs/release/
 .codexflow-orchestration/
