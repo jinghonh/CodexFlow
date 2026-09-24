@@ -9,7 +9,12 @@ use codexflow_domain::{
 use codexflow_store::SessionStore;
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::{env, fs, path::Path, time::Instant};
+use std::{
+    env, fs,
+    path::Path,
+    sync::{Arc, Barrier},
+    time::Instant,
+};
 
 const THREADS: usize = 500;
 const TURNS_PER_THREAD: usize = 20;
@@ -291,6 +296,42 @@ fn measure(dir: &Path, runs: usize) {
     }
 }
 
+fn race_candidates(dir: &Path) {
+    let service = Arc::new(SourceService::new(dir.to_path_buf()).unwrap());
+    let project_id = service
+        .project_catalog()
+        .unwrap()
+        .selected_project_id
+        .unwrap();
+    service.candidate_preview(&project_id).unwrap();
+    let db = Connection::open(dir.join("sessions.sqlite3")).unwrap();
+    db.execute(
+        "UPDATE threads SET metadata_json=json_set(metadata_json, '$.updatedAt', updated_at+1), updated_at=updated_at+1 WHERE id='perf-thread-0499'",
+        [],
+    ).unwrap();
+    drop(db);
+    let barrier = Arc::new(Barrier::new(4));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let service = Arc::clone(&service);
+            let project_id = project_id.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                service.candidate_preview(&project_id)
+            })
+        })
+        .collect();
+    for (index, worker) in workers.into_iter().enumerate() {
+        let preview = worker.join().unwrap().unwrap();
+        assert_eq!(preview.thread_count, (THREADS - 1) as u64);
+        println!(
+            "candidate_writer={index} status=ok candidates={}",
+            preview.candidate_count
+        );
+    }
+}
+
 fn main() {
     let args: Vec<_> = env::args().collect();
     assert_eq!(
@@ -300,12 +341,13 @@ fn main() {
         } else {
             3
         },
-        "usage: performance generate DIR | performance measure DIR RUNS | performance export-graph DIR"
+        "usage: performance generate DIR | performance measure DIR RUNS | performance export-graph DIR | performance race-candidates DIR (mutates disposable DIR)"
     );
     let dir = Path::new(&args[2]);
     match args[1].as_str() {
         "generate" => generate(dir),
         "measure" => measure(dir, args[3].parse().unwrap()),
+        "race-candidates" => race_candidates(dir),
         "export-graph" => {
             let service = SourceService::new(dir.to_path_buf()).unwrap();
             let project_id = service

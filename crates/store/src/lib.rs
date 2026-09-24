@@ -2409,7 +2409,7 @@ impl SessionStore {
     ) -> Result<bool, AppError> {
         let mut connection = self.connection()?;
         let tx = connection
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| AppError::store("开始保存候选清单失败。"))?;
         for (thread_id, source_updated_at, generation) in expected {
             let owner: Option<Option<String>> = tx
