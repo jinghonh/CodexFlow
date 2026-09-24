@@ -6,9 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "build:macos:local": "tauri build && bash scripts/sign_macos_local.sh",
+    "build:macos:local": "npm run tauri -- build && bash scripts/sign_macos_local.sh",
     "test:ui": "vitest run",
-    "tauri": "tauri"
+    "tauri": "env -u AR -u CC -u CXX -u CPP -u LD -u NM -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u LDFLAGS tauri"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
