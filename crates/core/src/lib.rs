@@ -3855,6 +3855,7 @@ mod tests {
                 jev_pinned_model: Some("jev-1.13.0".into()),
                 jev_probe_attempts: 0,
                 limits: Default::default(),
+                stage_selection: codexflow_domain::AnalysisStageSelection::default(),
                 batch_number: 1,
                 batch_calls: 1,
                 total_calls: 1,

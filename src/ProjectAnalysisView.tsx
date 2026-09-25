@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { formatAppError } from "./appError";
 
 type Limits = { callLimit: number; concurrencyLimit: number; timeoutSeconds: number; retryLimit: number; inputCharacterLimit: number };
+type StageSelection = { summary: boolean; relations: boolean; naming: boolean };
 type Stage = { stage: "summary" | "relation" | "evidenceSelection" | "naming"; service: string; model: string;
   sendScope: string; pendingItems: number; maximumCalls: number; available: boolean; note: string };
 type Preview = { projectId: string; inputVersion: string; stages: Stage[]; cachedSummaries: number;
@@ -11,24 +12,42 @@ type Preview = { projectId: string; inputVersion: string; stages: Stage[]; cache
   pendingGroups: number | null; limits: Limits; jevConfigured: boolean };
 type Run = { id: string; projectId: string; state: "queued" | "running" | "cancelling" | "cancelled" | "paused" | "complete" | "partial" | "failed";
   pauseReason: string | null; batchNumber: number; batchCalls: number; totalCalls: number; totalQuestions: number;
+  stageSelection?: StageSelection;
   jevPinnedModel?: string | null; jevProbeAttempts?: number;
   inputTokens: number | null; outputTokens: number | null; processed: number; succeeded: number; failed: number; pending: number;
   interrupted: boolean; error: { message: string } | null; limits: Limits;
   units: { id: string; stage: Stage["stage"]; state: string; attempts: number; actualModel: string | null; error: { message: string } | null }[] };
 const initialLimits: Limits = { callLimit: 100, concurrencyLimit: 2, timeoutSeconds: 180, retryLimit: 2, inputCharacterLimit: 40000 };
+const initialStageSelection: StageSelection = { summary: true, relations: true, naming: true };
 const stageNames: Record<Stage["stage"], string> = { summary: "会话总结", relation: "候选分类", evidenceSelection: "证据选择", naming: "工作流命名" };
 const stateNames: Record<Run["state"], string> = { queued: "待执行", running: "执行中", cancelling: "取消中", cancelled: "已取消",
   paused: "已暂停", complete: "完成", partial: "部分完成", failed: "失败" };
 function message(error: unknown): string {
   return formatAppError(error, "分析操作失败。");
 }
+function selectedForStage(stage: Stage["stage"], selection: StageSelection): boolean {
+  if (stage === "summary") return selection.summary;
+  if (stage === "naming") return selection.naming;
+  return selection.relations;
+}
+function selectionDescription(selection?: StageSelection): string {
+  if (!selection) return "会话总结、候选关系判断和工作流命名";
+  const selected = [
+    selection.summary ? "会话总结" : null,
+    selection.relations ? "候选关系判断及必要的证据选择" : null,
+    selection.naming ? "工作流命名" : null,
+  ].filter((item): item is string => item !== null);
+  return selected.join("、") || "无阶段";
+}
 
 export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0, onRelationResultsChanged }: {
   projectId: string; refreshVersion: string; settingsRevision?: number; onRelationResultsChanged?: () => void;
 }) {
   const [limits, setLimits] = useState<Limits>(initialLimits);
+  const [stageSelection, setStageSelection] = useState<StageSelection>(initialStageSelection);
   const [previewState, setPreviewState] = useState<{ key: string; value: Preview } | null>(null);
   const [run, setRun] = useState<Run | null>(null);
+  const [runLoaded, setRunLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const succeededRelationUnits = run?.units
@@ -40,13 +59,13 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   }, [relationResultsRevision, onRelationResultsChanged]);
   const terminalRun = run && ["paused", "cancelled", "complete", "partial", "failed"].includes(run.state)
     ? `${run.id}:${run.state}:${run.totalCalls}:${run.processed}` : "";
-  const previewKey = JSON.stringify([projectId, refreshVersion, settingsRevision, limits, terminalRun]);
+  const previewKey = JSON.stringify([projectId, refreshVersion, settingsRevision, limits, stageSelection, terminalRun]);
   const preview = previewState?.key === previewKey ? previewState.value : null;
 
   useEffect(() => {
     let active = true;
     setPreviewState(null); setError("");
-    invoke<Preview>("get_analysis_preview", { projectId, limits })
+    invoke<Preview>("get_analysis_preview", { projectId, limits, stageSelection })
       .then((value) => { if (active) setPreviewState({ key: previewKey, value }); })
       .catch((caught) => { if (active) setError(message(caught)); });
     return () => { active = false; };
@@ -56,9 +75,17 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
     let active = true;
     let unlisten: (() => void) | undefined;
     setRun(null);
+    setRunLoaded(false);
+    setStageSelection(initialStageSelection);
     invoke<Run | null>("get_latest_analysis_run", { projectId })
-      .then((value) => { if (active) setRun(value); })
-      .catch((caught) => { if (active) setError(message(caught)); });
+      .then((value) => {
+        if (active) {
+          setRun(value);
+          setStageSelection(value?.stageSelection ?? initialStageSelection);
+        }
+      })
+      .catch((caught) => { if (active) setError(message(caught)); })
+      .finally(() => { if (active) setRunLoaded(true); });
     listen<Run>("analysis-run", (event) => {
       if (active && event.payload.projectId === projectId) setRun(event.payload);
     }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});
@@ -84,12 +111,24 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   }
 
   const active = run?.state === "queued" || run?.state === "running" || run?.state === "cancelling";
-  const summary = preview?.stages[0];
-  const canStart = (!!summary?.available || (summary?.pendingItems ?? 0) === 0) &&
-    (((summary?.pendingItems ?? 0) > 0) ||
-      (!!preview?.stages[1]?.available && (preview?.stages[1]?.pendingItems ?? 0) > 0) ||
-      (!!preview?.stages[3]?.available && (preview?.stages[3]?.pendingItems ?? 0) > 0)) &&
+  const summaryStage = preview?.stages.find((stage) => stage.stage === "summary");
+  const relationStage = preview?.stages.find((stage) => stage.stage === "relation");
+  const namingStage = preview?.stages.find((stage) => stage.stage === "naming");
+  const summary = summaryStage;
+  const namingMayRun = stageSelection.naming &&
+    ((preview?.pendingGroups ?? 0) > 0 || (preview?.pendingGroups === null && stageSelection.relations));
+  const selectedWorkPending = (stageSelection.summary && (summaryStage?.pendingItems ?? 0) > 0) ||
+    (stageSelection.relations && !!relationStage?.available && relationStage.pendingItems > 0) ||
+    (namingMayRun && !!namingStage?.available);
+  const textWorkUnavailable =
+    (stageSelection.summary && (summaryStage?.pendingItems ?? 0) > 0 && !summaryStage?.available) ||
+    (namingMayRun && !namingStage?.available);
+  const relationWorkUnavailable = stageSelection.relations &&
+    (relationStage?.pendingItems ?? 0) > 0 && !relationStage?.available;
+  const hasSelectedStage = stageSelection.summary || stageSelection.relations || stageSelection.naming;
+  const canStart = hasSelectedStage && selectedWorkPending && !textWorkUnavailable && !relationWorkUnavailable &&
     !active && run?.state !== "paused" && !busy;
+  const selectionLocked = !runLoaded || active || run?.state === "paused" || busy;
   const valid = Number.isInteger(limits.callLimit) && limits.callLimit > 0 && Number.isInteger(limits.timeoutSeconds) && limits.timeoutSeconds > 0 &&
     Number.isInteger(limits.concurrencyLimit) && limits.concurrencyLimit >= 1 && limits.concurrencyLimit <= 2 &&
     Number.isInteger(limits.retryLimit) && limits.retryLimit >= 0 && limits.retryLimit <= 2 &&
@@ -106,26 +145,50 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       <label>自动重试次数<input aria-label="自动重试次数" type="number" min="0" max="2" value={limits.retryLimit} onChange={(event) => setLimits({ ...limits, retryLimit: Number(event.target.value) })} /></label>
       <label>单次输入字符上限<input aria-label="单次输入字符上限" type="number" min="2000" value={limits.inputCharacterLimit} onChange={(event) => setLimits({ ...limits, inputCharacterLimit: Number(event.target.value) })} /></label>
     </div>
+    <fieldset className="analysis-stage-selection" disabled={selectionLocked}>
+        <legend>本批执行阶段</legend>
+        <label><input type="checkbox" checked={stageSelection.summary}
+          onChange={(event) => setStageSelection({ ...stageSelection, summary: event.target.checked })} />会话总结</label>
+        <label><input type="checkbox" checked={stageSelection.relations}
+          onChange={(event) => setStageSelection({ ...stageSelection, relations: event.target.checked })} />候选关系判断</label>
+        <label><input type="checkbox" checked={stageSelection.naming}
+          onChange={(event) => setStageSelection({ ...stageSelection, naming: event.target.checked })} />工作流命名</label>
+        <small>证据选择依赖候选关系判断，会在该项选中且模型找到支持关系时自动执行。</small>
+    </fieldset>
+    {!hasSelectedStage && <p className="page-error" role="alert">至少选择一个执行阶段。</p>}
+    {relationWorkUnavailable && <p className="analysis-note">当前有待处理候选，但 Jev 尚不可用。配置 Jev，或取消选择候选关系判断。</p>}
+    {textWorkUnavailable && <p className="analysis-note">所选文本阶段有待处理任务，但文本服务尚不可用。配置文本服务，或取消选择对应阶段。</p>}
+    {run?.state === "paused" && <p className="analysis-note">已暂停批次会按启动时的阶段选择继续。若要更改选择，请先取消该批次。</p>}
+    {run && ["cancelled", "partial", "failed"].includes(run.state) && <p className="analysis-note">启动新批次使用当前选择；继续未完成项会沿用已保存选择：{selectionDescription(run.stageSelection)}。</p>}
     {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；总并发为 1–2，自动重试为 0–2，输入至少 2000 字符。</p>}
     {error && <p className="page-error" role="alert">{error}</p>}
     {!preview && !error && <p>正在计算分析预览…</p>}
     {preview && <>
-      <div className="candidate-summary"><strong>{summary?.pendingItems ?? 0} 条待总结</strong><span>{preview.cachedSummaries} 条有效缓存</span><span>{preview.unavailableSummaries} 条来源内容暂不可用</span></div>
-      <div className="analysis-stage-list">{preview.stages.map((stage) => <div className="analysis-stage" key={stage.stage}>
-        <strong>{stageNames[stage.stage]} · {stage.available ? "可执行" : "尚不可执行"}</strong>
-        <span>{stage.service} / {stage.model}</span>
-        <span>待处理 {stage.pendingItems}；调用上界 {stage.maximumCalls}</span>
-        <small>{stage.sendScope}</small><small>{stage.note}</small>
-      </div>)}</div>
-      <p className="analysis-note">候选最多 {preview.maximumCandidates} 对，证据选择最多 {preview.evidenceSelectionCallLimit} 次 Jev POST；每对两阶段合计最多两次推理请求。待命名分组尚未知。Jev {preview.jevConfigured ? "已配置" : "未配置"}，关系材料将发送到预览所示服务。缓存命中不计推理，重试另计调用。</p>
+      <div className="candidate-summary">{stageSelection.summary
+        ? <><strong>{summary?.pendingItems ?? 0} 条待总结</strong><span>{preview.cachedSummaries} 条有效缓存</span><span>{preview.unavailableSummaries} 条来源内容暂不可用</span></>
+        : <strong>本批未选择会话总结</strong>}</div>
+      <div className="analysis-stage-list">{preview.stages.map((stage) => {
+        const selected = selectedForStage(stage.stage, stageSelection);
+        const status = !selected ? "未选择"
+          : stage.stage === "evidenceSelection" && stage.available ? "条件执行"
+            : stage.available ? "可执行" : "尚不可执行";
+        return <div className="analysis-stage" key={stage.stage}>
+          <strong>{stageNames[stage.stage]} · {status}</strong>
+          <span>{stage.service} / {stage.model}</span>
+          <span>待处理 {stage.pendingItems}；调用上界 {stage.maximumCalls}</span>
+          <small>{stage.sendScope}</small><small>{stage.note}</small>
+        </div>;
+      })}</div>
+      <p className="analysis-note">候选最多 {preview.maximumCandidates} 对，证据选择最多 {preview.evidenceSelectionCallLimit} 次 Jev POST；每对两阶段合计最多两次推理请求。{preview.pendingGroups === null ? "关系分析完成后待命名分组数会变化。" : `待命名工作流 ${preview.pendingGroups} 组。`} Jev {preview.jevConfigured ? "已配置" : "未配置"}，关系材料将发送到预览所示服务。缓存命中不计推理，重试另计调用。</p>
     </>}
-    <div className="summary-actions"><button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits })}>启动项目分析</button>
+    <div className="summary-actions"><button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits, stageSelection })}>启动项目分析</button>
       {active && run?.state !== "cancelling" && <button className="browse-button" disabled={busy || !!run.pauseReason} onClick={() => void operate("pause_analysis_run", { runId: run.id })}>暂停</button>}
       {(active || run?.state === "paused") && <button className="browse-button" disabled={busy || run?.state === "cancelling"} onClick={() => void operate("cancel_analysis_run", { runId: run!.id })}>取消</button>}
       {run && ["paused", "cancelled", "partial", "failed"].includes(run.state) && <button className="browse-button" disabled={busy || !valid} onClick={() => void operate("continue_analysis_run", { runId: run.id, callLimit: limits.callLimit })}>继续未完成项</button>}
     </div>
     {run && <div className="analysis-progress" role="status"><strong>分析{stateNames[run.state]} · 第 {run.batchNumber} 批</strong>
       <span>运行 {run.id}</span><span>已处理 {run.processed}；成功 {run.succeeded}；失败 {run.failed}；待处理 {run.pending}</span>
+      <span>本次选择：{selectionDescription(run.stageSelection)}</span>
       <span>本批 {run.batchCalls} / {run.limits.callLimit} 次；累计 {run.totalCalls} 次调用，{run.totalQuestions} 道题</span>
       <span>实际模型：{[...new Set(run.units.map((unit) => unit.actualModel).filter(Boolean))].join("、") || "待确认"}</span>
       {run.jevPinnedModel && <span>Jev 本批固定版本：{run.jevPinnedModel}{run.jevProbeAttempts ? `（合成探测 ${run.jevProbeAttempts} 次）` : "（固定版本无需探测）"}</span>}

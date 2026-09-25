@@ -1,11 +1,11 @@
 use codexflow_core::{ProjectThreadQuery, ProjectThreadQueryResult, SourceService};
 use codexflow_domain::{
-    AnalysisLimits, AnalysisPreview, AnalysisRun, AppError, CandidatePreview, DisplayTheme,
-    EvidenceCheck, EvidencePage, FactPage, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
-    HistoryTurnPage, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
-    ProjectGraph, ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview,
-    SessionList, SourceStatus, SummaryEvidenceCheck, SummaryPreview, SummaryRun, TextStatus,
-    TextValidation, UserRelationDecision,
+    AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisStageSelection, AppError,
+    CandidatePreview, DisplayTheme, EvidenceCheck, EvidencePage, FactPage, HistoryCoverage,
+    HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, JevConnectionResult,
+    JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph, ProjectSessions, ProjectTimeline,
+    ProjectWorkstreams, RelationReview, SessionList, SourceStatus, SummaryEvidenceCheck,
+    SummaryPreview, SummaryRun, TextStatus, TextValidation, UserRelationDecision,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -461,8 +461,11 @@ async fn get_analysis_preview(
     state: tauri::State<'_, AppState>,
     project_id: String,
     limits: AnalysisLimits,
+    stage_selection: AnalysisStageSelection,
 ) -> Result<AnalysisPreview, AppError> {
-    service(&state)?.analysis_preview(&project_id, limits).await
+    service(&state)?
+        .analysis_preview_with_selection(&project_id, limits, stage_selection)
+        .await
 }
 
 #[tauri::command]
@@ -471,10 +474,11 @@ async fn start_project_analysis(
     app: tauri::AppHandle,
     project_id: String,
     limits: AnalysisLimits,
+    stage_selection: AnalysisStageSelection,
 ) -> Result<AnalysisRun, AppError> {
     service(&state)?
         .clone()
-        .start_project_analysis(project_id, limits, move |run| {
+        .start_project_analysis_with_selection(project_id, limits, stage_selection, move |run| {
             let _ = app.emit("analysis-run", run);
         })
         .await

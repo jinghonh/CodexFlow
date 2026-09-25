@@ -251,6 +251,32 @@ pub enum AnalysisStage {
     Naming,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnalysisStageSelection {
+    pub summary: bool,
+    /// Enables both candidate classification and any dependent evidence selection.
+    pub relations: bool,
+    pub naming: bool,
+}
+
+impl Default for AnalysisStageSelection {
+    fn default() -> Self {
+        // Preserve the former all-stages behavior for saved runs without this field.
+        Self {
+            summary: true,
+            relations: true,
+            naming: true,
+        }
+    }
+}
+
+impl AnalysisStageSelection {
+    pub fn any_selected(self) -> bool {
+        self.summary || self.relations || self.naming
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisLimits {
@@ -369,6 +395,8 @@ pub struct AnalysisRun {
     #[serde(default)]
     pub jev_probe_attempts: u32,
     pub limits: AnalysisLimits,
+    #[serde(default)]
+    pub stage_selection: AnalysisStageSelection,
     pub batch_number: u32,
     pub batch_calls: u32,
     pub total_calls: u32,

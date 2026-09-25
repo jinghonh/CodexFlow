@@ -2,8 +2,9 @@ use super::summary::SummaryBatchSnapshot;
 use super::{inferred, now_ms, SourceService};
 use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisRunState, AnalysisStage,
-    AnalysisStagePlan, AnalysisUnit, AnalysisUnitState, AppError, ErrorCode, InferredPairOutcome,
-    JevDecisionIdentity, RelationJudgment, SummaryRun, SummaryRunState, TextConfig, Workstream,
+    AnalysisStagePlan, AnalysisStageSelection, AnalysisUnit, AnalysisUnitState, AppError,
+    ErrorCode, InferredPairOutcome, JevDecisionIdentity, RelationJudgment, SummaryRun,
+    SummaryRunState, TextConfig, Workstream,
 };
 use codexflow_jev::{JevClient, JevRelationAnalyzer, RELATION_RULES_VERSION};
 use sha2::{Digest, Sha256};
@@ -302,12 +303,16 @@ impl SourceService {
         &self,
         project_id: &str,
         limits: AnalysisLimits,
+        stage_selection: AnalysisStageSelection,
     ) -> Result<(AnalysisPreview, Vec<(String, String)>), AppError> {
         validate_limits(&limits)?;
         let sessions = self.project_sessions(project_id)?;
         let text = self.text_status().await;
         let jev = self.jev_status().await?;
-        let candidate = self.candidate_preview(project_id)?;
+        let candidate = stage_selection
+            .relations
+            .then(|| self.candidate_preview(project_id))
+            .transpose()?;
         let mut hasher = Sha256::new();
         let mut pending = Vec::new();
         let mut cached = 0;
@@ -321,6 +326,9 @@ impl SourceService {
                 "{}:{}:{}\n",
                 thread.id, thread.updated_at, generation
             ));
+            if !stage_selection.summary {
+                continue;
+            }
             match self
                 .summary_preview_limited(&thread.id, limits.input_character_limit)
                 .await
@@ -343,55 +351,59 @@ impl SourceService {
             && !text.config.base_url.is_empty()
             && !text.config.model.is_empty();
         let jev_configured = jev.credential_configured && jev.credential_error.is_none();
-        let max_pairs = candidate
-            .thread_count
-            .saturating_mul(candidate.thread_count.saturating_sub(1))
-            / 2;
-        let candidate_upper_bound = max_pairs.min(
-            candidate
+        let candidate_upper_bound = candidate.as_ref().map_or(0, |candidate| {
+            let max_pairs = candidate
                 .thread_count
-                .saturating_mul(u64::from(candidate.neighbor_limit))
-                / 2,
-        );
+                .saturating_mul(candidate.thread_count.saturating_sub(1))
+                / 2;
+            max_pairs.min(
+                candidate
+                    .thread_count
+                    .saturating_mul(u64::from(candidate.neighbor_limit))
+                    / 2,
+            )
+        });
         let existing = self.sessions.inferred_pair_outcomes(project_id)?;
         let mut pending_candidates = 0;
-        for pair in &candidate.candidates {
-            let version = candidate
-                .candidate_versions
-                .get(&pair.id)
-                .ok_or_else(|| AppError::store("候选输入版本缺失。"))?;
-            if !existing.iter().any(|result| {
-                reusable_jev_outcome(
-                    result,
-                    &pair.id,
-                    version,
-                    &jev.config.base_url,
-                    &jev.config.model,
-                    None,
-                    limits.input_character_limit,
-                )
-            }) {
-                pending_candidates += 1;
+        if let Some(candidate) = &candidate {
+            for pair in &candidate.candidates {
+                let version = candidate
+                    .candidate_versions
+                    .get(&pair.id)
+                    .ok_or_else(|| AppError::store("候选输入版本缺失。"))?;
+                if !existing.iter().any(|result| {
+                    reusable_jev_outcome(
+                        result,
+                        &pair.id,
+                        version,
+                        &jev.config.base_url,
+                        &jev.config.model,
+                        None,
+                        limits.input_character_limit,
+                    )
+                }) {
+                    pending_candidates += 1;
+                }
             }
         }
         let attempts = u64::from(limits.retry_limit) + 1;
-        let streams = self.automatic_workstreams(project_id)?;
-        let manual_names = self.sessions.workstream_corrections(project_id)?.names;
-        let naming_graph = self.project_graph(project_id)?;
         let naming_config = NamingConfig {
             model: &model,
             base_url: &text.config.base_url,
             limit: limits.input_character_limit,
         };
         let mut pending_groups = 0;
-        for stream in streams
-            .workstreams
-            .iter()
-            .filter(|stream| !stream.members.is_empty() && !manual_names.contains_key(&stream.id))
-        {
-            let (version, _) = self.naming_material(&naming_graph, stream, naming_config)?;
-            if !reusable_name(stream, &version, naming_config) {
-                pending_groups += 1;
+        if stage_selection.naming {
+            let streams = self.automatic_workstreams(project_id)?;
+            let manual_names = self.sessions.workstream_corrections(project_id)?.names;
+            let naming_graph = self.project_graph(project_id)?;
+            for stream in streams.workstreams.iter().filter(|stream| {
+                !stream.members.is_empty() && !manual_names.contains_key(&stream.id)
+            }) {
+                let (version, _) = self.naming_material(&naming_graph, stream, naming_config)?;
+                if !reusable_name(stream, &version, naming_config) {
+                    pending_groups += 1;
+                }
             }
         }
         let alias_probe_calls = u64::from(
@@ -412,10 +424,20 @@ impl SourceService {
                     "单条会话的已读取历史、事实与可定位证据；每次最多 {} 字符。",
                     limits.input_character_limit
                 ),
-                pending_items: pending.len() as u64,
-                maximum_calls: (pending.len() as u64).saturating_mul(attempts),
+                pending_items: if stage_selection.summary {
+                    pending.len() as u64
+                } else {
+                    0
+                },
+                maximum_calls: if stage_selection.summary {
+                    (pending.len() as u64).saturating_mul(attempts)
+                } else {
+                    0
+                },
                 available: text_available,
-                note: if text_available {
+                note: if !stage_selection.summary {
+                    "本批未选择会话总结。"
+                } else if text_available {
                     "本批可执行；缓存命中不计调用。"
                 } else {
                     "文本服务尚未配置当前地址的密钥，暂不可执行。"
@@ -430,10 +452,22 @@ impl SourceService {
                     "候选关系材料将发送到配置的 Jev 服务 {}。",
                     jev.config.base_url
                 ),
-                pending_items: pending_candidates,
-                maximum_calls: candidate_upper_bound.saturating_mul(attempts).saturating_add(alias_probe_calls),
+                pending_items: if stage_selection.relations {
+                    pending_candidates
+                } else {
+                    0
+                },
+                maximum_calls: if stage_selection.relations {
+                    candidate_upper_bound
+                        .saturating_mul(attempts)
+                        .saturating_add(alias_probe_calls)
+                } else {
+                    0
+                },
                 available: jev_configured,
-                note: if jev_configured {
+                note: if !stage_selection.relations {
+                    "本批未选择候选分类。"
+                } else if jev_configured {
                     if alias_probe_calls > 0 {
                         "别名先用一次合成 POST 探测并固定本批实际版本；探测和重试计入调用上限。每对候选另有一次分类 POST。"
                     } else {
@@ -449,11 +483,23 @@ impl SourceService {
                 service: "Jev".into(),
                 model: jev.config.model.clone(),
                 send_scope: "最多 20 组候选两侧证据发送到配置的 Jev 服务。".into(),
-                pending_items: pending_candidates,
-                maximum_calls: candidate_upper_bound.saturating_mul(attempts),
+                pending_items: if stage_selection.relations {
+                    pending_candidates
+                } else {
+                    0
+                },
+                maximum_calls: if stage_selection.relations {
+                    candidate_upper_bound.saturating_mul(attempts)
+                } else {
+                    0
+                },
                 available: jev_configured,
-                note: "每对有支持关系的候选最多一次证据选择 POST；两阶段合计最多两次推理请求。"
-                    .into(),
+                note: if stage_selection.relations {
+                    "随候选分类自动执行；每对仅对支持关系选择证据，两阶段合计最多两次推理请求。"
+                } else {
+                    "未选择候选分类，本批不执行证据选择。"
+                }
+                .into(),
             },
             AnalysisStagePlan {
                 stage: AnalysisStage::Naming,
@@ -461,10 +507,24 @@ impl SourceService {
                 model,
                 send_scope: "发送已确定分组的成员标题、可用总结与内部来源关系；每次受输入字符上限约束。".into(),
                 pending_items: pending_groups,
-                maximum_calls: (if pending_candidates > 0 { candidate.thread_count / 2 }
-                    else { pending_groups }).saturating_mul(attempts),
+                maximum_calls: if stage_selection.naming {
+                    (if stage_selection.relations && jev_configured && pending_candidates > 0 {
+                        candidate.as_ref().map_or(0, |candidate| candidate.thread_count / 2)
+                    } else {
+                        pending_groups
+                    })
+                    .saturating_mul(attempts)
+                } else {
+                    0
+                },
                 available: text_available,
-                note: if text_available && pending_candidates > 0 {
+                note: if !stage_selection.naming {
+                    "本批未选择工作流命名。"
+                } else if text_available
+                    && stage_selection.relations
+                    && jev_configured
+                    && pending_candidates > 0
+                {
                     "当前数量只含已有分组；Jev 关系完成后可能增加。每组一次文本请求，重试计入共享预算。"
                 } else if text_available { "分组先由关系图确定；每组一次文本请求，重试计入共享预算。" }
                     else { "文本服务未配置，分组仍可浏览。" }.into(),
@@ -478,7 +538,15 @@ impl SourceService {
             unavailable_summaries: unavailable,
             maximum_candidates: candidate_upper_bound,
             evidence_selection_call_limit: candidate_upper_bound,
-            pending_groups: (pending_candidates == 0).then_some(pending_groups),
+            pending_groups: if stage_selection.naming
+                && stage_selection.relations
+                && jev_configured
+                && pending_candidates > 0
+            {
+                None
+            } else {
+                Some(pending_groups)
+            },
             limits,
             jev_configured,
         };
@@ -490,7 +558,20 @@ impl SourceService {
         project_id: &str,
         limits: AnalysisLimits,
     ) -> Result<AnalysisPreview, AppError> {
-        Ok(self.analysis_material(project_id, limits).await?.0)
+        self.analysis_preview_with_selection(project_id, limits, AnalysisStageSelection::default())
+            .await
+    }
+
+    pub async fn analysis_preview_with_selection(
+        &self,
+        project_id: &str,
+        limits: AnalysisLimits,
+        stage_selection: AnalysisStageSelection,
+    ) -> Result<AnalysisPreview, AppError> {
+        Ok(self
+            .analysis_material(project_id, limits, stage_selection)
+            .await?
+            .0)
     }
 
     pub fn analysis_run(&self, id: &str) -> Result<Option<AnalysisRun>, AppError> {
@@ -553,11 +634,50 @@ impl SourceService {
         limits: AnalysisLimits,
         on_update: impl Fn(AnalysisRun) + Send + Sync + 'static,
     ) -> Result<AnalysisRun, AppError> {
-        let (preview, pending) = self.analysis_material(&project_id, limits.clone()).await?;
-        if !preview.stages[0].available && !pending.is_empty() {
+        self.start_project_analysis_with_selection(
+            project_id,
+            limits,
+            AnalysisStageSelection::default(),
+            on_update,
+        )
+        .await
+    }
+
+    pub async fn start_project_analysis_with_selection(
+        self: &Arc<Self>,
+        project_id: String,
+        limits: AnalysisLimits,
+        stage_selection: AnalysisStageSelection,
+        on_update: impl Fn(AnalysisRun) + Send + Sync + 'static,
+    ) -> Result<AnalysisRun, AppError> {
+        if !stage_selection.any_selected() {
+            return Err(core_error(
+                ErrorCode::AnalysisBudgetInvalid,
+                "至少选择一个分析阶段。",
+                false,
+            ));
+        }
+        let (preview, pending) = self
+            .analysis_material(&project_id, limits.clone(), stage_selection)
+            .await?;
+        let pending_naming = preview.stages[3].maximum_calls > 0;
+        if stage_selection.relations
+            && preview.stages[1].pending_items > 0
+            && !preview.stages[1].available
+        {
             return Err(core_error(
                 ErrorCode::AnalysisUnavailable,
-                "文本服务总结尚不可用；请先配置当前地址的 API Key。",
+                "候选关系判断尚不可用；请配置 Jev 或取消选择该阶段。",
+                false,
+            ));
+        }
+        if !preview.stages[0].available
+            && ((stage_selection.summary && !pending.is_empty())
+                || (stage_selection.naming && pending_naming))
+        {
+            return Err(core_error(
+                ErrorCode::AnalysisUnavailable,
+                "所选阶段需要文本服务；请先配置当前地址的 API Key。",
                 false,
             ));
         }
@@ -653,6 +773,7 @@ impl SourceService {
             },
             jev_probe_attempts: 0,
             limits,
+            stage_selection,
             batch_number: 1,
             batch_calls: 0,
             total_calls: 0,
@@ -664,8 +785,8 @@ impl SourceService {
             failed: 0,
             pending: units.len() as u32,
             units,
-            relations_planned: false,
-            names_planned: false,
+            relations_planned: !stage_selection.relations,
+            names_planned: !stage_selection.naming,
             relation_only: false,
             started_at_unix_ms: self.analysis_now(),
             finished_at_unix_ms: None,
@@ -768,6 +889,11 @@ impl SourceService {
             jev_pinned_model: Some(jev.config.model),
             jev_probe_attempts: 0,
             limits,
+            stage_selection: AnalysisStageSelection {
+                summary: false,
+                relations: true,
+                naming: false,
+            },
             batch_number: 1,
             batch_calls: 0,
             total_calls: 0,
@@ -923,7 +1049,7 @@ impl SourceService {
             None
         } else {
             Some(
-                self.analysis_material(&run.project_id, limits.clone())
+                self.analysis_material(&run.project_id, limits.clone(), run.stage_selection)
                     .await?
                     .0,
             )
@@ -934,15 +1060,19 @@ impl SourceService {
             self.candidate_preview(&run.project_id)?.input_version
         };
         let preferences = self.preferences.lock().await.clone();
+        let uses_text = run.stage_selection.summary || run.stage_selection.naming;
+        let uses_relations = run.stage_selection.relations || run.relation_only;
         if preview_version != run.input_version
-            || (!run.relation_only
+            || (uses_text
                 && (preferences.text.base_url != run.text_base_url
                     || preferences.text_revision != run.text_config_revision))
-            || analysis_preview
-                .as_ref()
-                .is_some_and(|preview| preview.stages[0].model != run.codex_model)
-            || preferences.jev_revision != run.jev_config_revision
-            || run.jev_rules_version != RELATION_RULES_VERSION
+            || (uses_text
+                && analysis_preview
+                    .as_ref()
+                    .is_some_and(|preview| preview.stages[0].model != run.codex_model))
+            || (uses_relations
+                && (preferences.jev_revision != run.jev_config_revision
+                    || run.jev_rules_version != RELATION_RULES_VERSION))
         {
             return Err(core_error(
                 ErrorCode::AnalysisConfigChanged,
@@ -950,16 +1080,17 @@ impl SourceService {
                 false,
             ));
         }
+        let text_work_pending = run.units.iter().any(|unit| {
+            matches!(unit.stage, AnalysisStage::Summary | AnalysisStage::Naming)
+                && unit.state != AnalysisUnitState::Succeeded
+        });
         if analysis_preview
             .as_ref()
-            .is_some_and(|preview| !preview.stages[0].available)
-            && run.units.iter().any(|unit| {
-                unit.stage == AnalysisStage::Summary && unit.state != AnalysisUnitState::Succeeded
-            })
+            .is_some_and(|preview| !preview.stages[0].available && text_work_pending)
         {
             return Err(core_error(
                 ErrorCode::AnalysisUnavailable,
-                "文本服务总结当前不可用。",
+                "所选文本阶段当前不可用。",
                 false,
             ));
         }
@@ -988,7 +1119,7 @@ impl SourceService {
             // Retried summaries and relations can change both the communities and their
             // naming input. Keep already saved names only when the replanned version matches.
             run.units.retain(|unit| unit.stage != AnalysisStage::Naming);
-            run.names_planned = run.relation_only;
+            run.names_planned = run.relation_only || !run.stage_selection.naming;
         }
         let reset_pending_attempts = run.state == AnalysisRunState::Cancelled || run.interrupted;
         for unit in &mut run.units {
