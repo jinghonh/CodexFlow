@@ -4,7 +4,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ProjectGraphView } from "./ProjectGraphView";
-import { CandidatePreviewView } from "./CandidatePreviewView";
 import { ProjectAnalysisView } from "./ProjectAnalysisView";
 import { ProjectTimelineView } from "./ProjectTimelineView";
 import { ProjectWorkstreamsView } from "./ProjectWorkstreamsView";
@@ -68,6 +67,21 @@ type ThreadMatchesState = { queryKey: string; value: ThreadMatches };
 type IndexRun = { id: string; projectId: string | null; state: "queued" | "running" | "complete" | "partial" | "failed" | "cancelled"; startedAtUnixMs: number; finishedAtUnixMs: number | null; pagesSaved: number; threadsSeen: number; error: AppError | null; interrupted: boolean };
 const runLabels: Record<IndexRun["state"], string> = { queued: "待执行", running: "执行中", complete: "完成", partial: "部分完成", failed: "失败", cancelled: "已取消" };
 
+type WorkspacePanel = "connections" | "projects" | "sessions" | "workstreams" | "relations";
+const workspacePanels: { id: WorkspacePanel; title: string; index: string }[] = [
+  { id: "connections", title: "来源与分析连接", index: "01" },
+  { id: "projects", title: "本地项目", index: "02" },
+  { id: "sessions", title: "项目会话", index: "03" },
+  { id: "workstreams", title: "工作流", index: "04" },
+  { id: "relations", title: "关系图", index: "05" },
+];
+const panelStorageKey = "codexflow.active-panel";
+
+function initialWorkspacePanel(): WorkspacePanel {
+  const saved = window.localStorage.getItem(panelStorageKey);
+  return workspacePanels.some((panel) => panel.id === saved) ? saved as WorkspacePanel : "connections";
+}
+
 const labels: { key: keyof SourceStatus["capabilities"]; title: string; number: string }[] = [
   { key: "metadata", title: "会话元数据", number: "01" },
   { key: "history", title: "历史读取", number: "02" },
@@ -79,6 +93,7 @@ function errorText(error: unknown): string {
 }
 
 export function App() {
+  const [activePanel, setActivePanel] = useState<WorkspacePanel>(initialWorkspacePanel);
   const [source, setSource] = useState<SourceStatus | null>(null);
   const [path, setPath] = useState("");
   const [theme, setTheme] = useState<Theme>("system");
@@ -121,7 +136,6 @@ export function App() {
   const [workspaceFilter, setWorkspaceFilter] = useState("");
   const [archiveFilter, setArchiveFilter] = useState("all");
   const [completeFilter, setCompleteFilter] = useState("all");
-  const [viewMode, setViewMode] = useState<"timeline" | "graph">("timeline");
   const [relationSource, setRelationSource] = useState("all");
   const [relationKind, setRelationKind] = useState("all");
   const [minimumConfidence, setMinimumConfidence] = useState(0.7);
@@ -136,10 +150,17 @@ export function App() {
   const evidenceNonce = useRef(0);
   const projectEpoch = useRef(0);
   const workstreamProjectId = useRef<string | null>(null);
+  const previousThreadSelection = useRef<string | null>(null);
 
   useEffect(() => {
-    if (selectedThreadId) document.getElementById("thread-detail")?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [selectedThreadId]);
+    window.localStorage.setItem(panelStorageKey, activePanel);
+  }, [activePanel]);
+
+  useEffect(() => {
+    const selectionChanged = previousThreadSelection.current !== selectedThreadId;
+    previousThreadSelection.current = selectedThreadId;
+    if (selectionChanged && activePanel === "relations" && selectedThreadId) document.getElementById("thread-detail")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [selectedThreadId, activePanel]);
 
   useEffect(() => {
     const projectId = projectSessions?.project.id;
@@ -161,6 +182,7 @@ export function App() {
   }, [projectSessions?.project.id, showUnassigned, graphVersion]);
 
   useEffect(() => {
+    if (activePanel !== "sessions") return;
     const projectId = projectSessions?.project.id;
     if (!projectId || showUnassigned) { setThreadMatches(null); setQueryError(null); return; }
     let active = true;
@@ -177,7 +199,7 @@ export function App() {
         .catch((error) => { if (active) setQueryError({ queryKey, message: errorText(error) }); });
     }, textChanged ? 180 : 0);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [projectSessions?.project.id, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, graphVersion, workstreams?.revision]);
+  }, [activePanel, projectSessions?.project.id, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, graphVersion, workstreams?.revision]);
 
   function selectEvidence(evidence: { threadId: string; turnId: string; itemId: string }) {
     setSelectedThreadId(evidence.threadId);
@@ -503,6 +525,7 @@ export function App() {
   useEffect(() => { if (currentThreadMatches) finishResponse(); }, [currentThreadMatches]);
   const currentQueryError = queryError?.queryKey === threadQueryKey ? queryError.message : "";
   const visibleIds = React.useMemo(() => new Set(currentThreadMatches?.matches.map((item) => item.threadId) ?? []), [currentThreadMatches]);
+  const projectThreadIds = React.useMemo(() => new Set(projectSessions?.threads.map(({ thread }) => thread.id) ?? []), [projectSessions]);
   const visibleThreads = (showUnassigned ? projectCatalog?.unassigned ?? [] : projectSessions?.threads ?? []).filter(({ thread }) =>
     showUnassigned ? [thread.title, thread.preview, thread.id].some((value) => value?.toLowerCase().includes(query.toLowerCase())) : visibleIds.has(thread.id)
   );
@@ -513,6 +536,32 @@ export function App() {
     .find(({ thread }) => thread.id === selectedThreadId)?.attribution;
   const selectionHidden = !!selectedThread && (showUnassigned || !!currentThreadMatches) && !visibleThreads.some(({ thread }) => thread.id === selectedThread.id);
   const clearFilters = () => { setQuery(""); setWorkstreamFilter(""); setWorkspaceFilter(""); setArchiveFilter("all"); setCompleteFilter("all"); setRelationSource("all"); setRelationKind("all"); setMinimumConfidence(0.7); };
+  function resetPanelState(panel: WorkspacePanel) {
+    if (panel === "connections") {
+      setPath(source?.selectedBinary ?? "");
+      setPageError("");
+      setJevBaseUrl(jevStatus?.config.baseUrl ?? "https://api.typesafe.ai");
+      setJevModel(jevStatus?.config.model ?? "jev-latest");
+      setJevKey(""); setJevError(""); setJevConnection(null); setJevInference(null);
+      setTextBaseUrl(textStatus?.config.baseUrl ?? ""); setTextModel(textStatus?.config.model ?? "");
+      setTextKey(""); setTextError(""); setTextValidation(null);
+    } else if (panel === "projects") {
+      setProjectPath(""); setProjectError("");
+    } else if (panel === "sessions") {
+      clearFilters(); previousQuery.current = ""; setThreadLimit(40); setListError(""); setShowUnassigned(false);
+      setSelectedThreadId(null); setEvidenceLocation(null);
+    } else if (panel === "workstreams") {
+      setWorkstreamFilter("");
+    } else if (panel === "relations") {
+      setRelationSource("all"); setRelationKind("all"); setMinimumConfidence(0.7);
+    }
+  }
+  function selectPanel(panel: WorkspacePanel) {
+    if (panel === activePanel) return;
+    resetPanelState(activePanel);
+    setActivePanel(panel);
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }
   const projectState = !projectSessions ? "首次使用：请选择本地项目并连接数据源。"
     : refreshing ? "读取中：正在刷新来源；已有缓存仍可查看。"
     : indexRun?.state === "failed" ? "读取失败：已保存缓存仍可查看，请检查来源并重试。"
@@ -528,20 +577,22 @@ export function App() {
     const bIndex = recent.indexOf(b.id);
     return (aIndex < 0 ? 1000 : aIndex) - (bIndex < 0 ? 1000 : bIndex) || a.name.localeCompare(b.name);
   });
+  const activePanelInfo = workspacePanels.find((panel) => panel.id === activePanel)!;
 
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">C<span>F</span></span><div><strong>CodexFlow</strong><small>本地工作过程</small></div></div>
-      <div className="side-group"><span className="side-caption">工作空间</span><div className="side-link active"><span className="side-dot" />来源与分析连接 <span className="side-index">01</span></div><a className="side-link" href="#projects"><span className="side-dot" />本地项目 <span className="side-index">02</span></a><a className="side-link" href="#sessions"><span className="side-dot" />项目会话 <span className="side-index">03</span></a><a className="side-link" href="#workstreams"><span className="side-dot" />工作流 <span className="side-index">04</span></a><a className="side-link" href="#relations"><span className="side-dot" />关系图 <span className="side-index">05</span></a></div>
+      <nav className="side-group" aria-label="工作空间面板"><span className="side-caption">工作空间</span>{workspacePanels.map((panel) => <button key={panel.id} className={`side-link ${activePanel === panel.id ? "active" : ""}`} aria-current={activePanel === panel.id ? "page" : undefined} onClick={() => selectPanel(panel.id)}><span className="side-dot" />{panel.title}<span className="side-index">{panel.index}</span></button>)}</nav>
       <div className="side-note"><span className="side-note-line" />同一仓库的主工作区与 worktree 合并展示。会话的实际工作区和归属依据仍可逐条查看。</div>
       <div className="sidebar-bottom"><span className="sidebar-bottom-symbol">↗</span><div>本机运行<br /><strong>数据留在你的设备</strong></div></div>
     </aside>
 
     <main className="content">
-      <header className="topbar"><span>设置 / 连接</span><div className="topbar-right"><span className="topbar-pulse" />本地桌面应用</div></header>
+      <header className="topbar"><span>工作空间 / {activePanelInfo.title}</span><div className="topbar-right"><span className="topbar-pulse" />本地桌面应用</div></header>
       <div className="page-body">
+        {activePanel === "connections" && <>
         <div className="eyebrow">SOURCE / 01 <span /></div>
-        <div className="page-heading"><div><h1>连接 Codex 数据源<span className="accent">.</span></h1><p>确认应用实际使用的二进制，以及可以安全读取的能力。</p></div><div className="heading-badge">本机连接诊断<br /><strong>不会启动模型</strong></div></div>
+        <div className="page-heading"><div><h1>来源与分析连接<span className="accent">.</span></h1><p>配置 Codex 来源、分析服务和本机显示偏好。</p></div><div className="heading-badge">连接与模型设置<br /><strong>数据留在本机</strong></div></div>
 
         <section className="status-banner" data-state={failed ? "failed" : connected ? "connected" : "pending"} aria-live="polite">
           <div className="status-icon">{failed ? "!" : connected ? "✓" : "·"}</div>
@@ -603,7 +654,7 @@ export function App() {
         <section className="panel jev-panel" aria-label="文本生成服务设置">
           <div className="panel-kicker">04 / 总结与命名服务</div>
           <h2>文本模型连接设置</h2>
-          <p className="panel-intro">会话总结和工作流命名共用此服务。验证只发送固定合成文字；项目历史仅在手动启动总结或项目分析后发送。</p>
+          <p className="panel-intro">会话总结和工作流命名共用此服务。验证只发送固定合成文字；项目历史仅在对应面板手动启动分析后发送。</p>
           <div className="jev-fields">
             <label htmlFor="text-url">服务地址<input id="text-url" spellCheck={false} value={textBaseUrl} onChange={(event) => setTextBaseUrl(event.target.value)} placeholder="https://example.com/v1" /></label>
             <label htmlFor="text-model">模型 ID<input id="text-model" spellCheck={false} value={textModel} onChange={(event) => setTextModel(event.target.value)} placeholder="模型名称" /></label>
@@ -624,6 +675,11 @@ export function App() {
         </section>
 
         <section className="footer-panel"><div><div className="panel-kicker">显示偏好</div><h3>界面外观</h3></div><div className="theme-picker" role="group" aria-label="界面外观">{(["system", "light", "dark"] as const).map((value) => <button key={value} className={theme === value ? "selected" : ""} onClick={() => changeTheme(value)}>{value === "system" ? "跟随系统" : value === "light" ? "浅色" : "深色"}</button>)}</div><small>保存于应用管理的本机用户数据目录</small></section>
+        <p className="disclaimer">来源诊断不会启动模型；文本服务与 Jev 的验证只发送固定合成材料。列表刷新读取会话元数据，查看回合或运行分析时才会读取相应内容。</p>
+        </>}
+        {activePanel === "projects" && <>
+        <div className="eyebrow">PROJECTS / 02 <span /></div>
+        <div className="page-heading"><div><h1>本地项目<span className="accent">.</span></h1><p>选择要浏览会话、工作流和关系的本机项目。</p></div></div>
         <section id="projects" className="panel project-panel">
           <div className="panel-kicker">02 / 本地项目</div><h2>选择项目</h2>
           <p className="panel-intro">选择真实目录。Git 项目按共享 Git 目录识别，独立克隆分别显示；非 Git 项目按所选目录归属。</p>
@@ -632,6 +688,10 @@ export function App() {
           <div className="project-list">{projects.length === 0 ? <p className="empty-list">尚无项目。选择目录，或连接来源并刷新以发现 Git 项目。</p> : projects.map((project) => <button key={project.id} className={`project-choice ${project.id === projectCatalog?.selectedProjectId && !showUnassigned ? "selected" : ""}`} onClick={() => void chooseExistingProject(project.id)}><strong>{project.name}</strong><small>{project.root}</small><span>{project.gitCommonDir ? "Git 仓库" : "非 Git 目录"}{projectCatalog?.recentProjectIds.includes(project.id) ? " · 最近打开" : ""}</span></button>)}</div>
           <button className={`unassigned-choice ${showUnassigned ? "selected" : ""}`} onClick={() => setShowUnassigned(true)}>未归属会话：{projectCatalog?.unassigned.length ?? 0} 条</button>
         </section>
+        </>}
+        {activePanel === "sessions" && <>
+        <div className="eyebrow">SESSIONS / 03 <span /></div>
+        <div className="page-heading"><div><h1>项目会话<span className="accent">.</span></h1><p>{projectSessions?.project.name ?? "浏览所选本地项目的会话、摘要和来源事实。"}</p></div><div className="heading-badge">按需读取<br /><strong>列表仅含元数据</strong></div></div>
         <section id="sessions" className="panel session-panel">
           <div className="session-heading"><div><div className="panel-kicker">03 / 项目会话</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
           {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}</div>}
@@ -653,16 +713,29 @@ export function App() {
           <div className="thread-list">{visibleThreads.length === 0 ? <p className="empty-list">{!showUnassigned && !currentThreadMatches && !currentQueryError ? "正在查找会话…" : query || workstreamFilter || workspaceFilter || archiveFilter !== "all" || completeFilter !== "all" ? "没有匹配的会话；可以清除过滤。" : refreshing ? "正在刷新；缓存中暂无会话。" : !connected && attempted ? "来源当前不可用；缓存中暂无会话。" : showUnassigned ? "当前没有未归属会话。" : projectSessions ? "此项目暂无会话。" : "请先选择一个本地项目。"}</p> : shownThreads.map(({ thread, attribution }) => <article className={`thread-row ${selectedThreadId === thread.id ? "selected" : ""}`} key={thread.id}><div className="thread-main"><strong>{threadDisplayTitle(thread)}</strong><button className="browse-button history-open" onClick={() => { startEvidence(thread.id); setSelectedThreadId(thread.id); }} aria-label={`查看会话 ${thread.id} 的历史`}>查看回合与条目</button><div className="thread-badges"><span>{thread.archived ? "已归档" : "未归档"}</span><span>{thread.sourceKind}{thread.sourceDetail ? ` / ${thread.sourceDetail}` : ""}</span>{thread.missingFromSource && <span className="thread-warning">完整列表中未再次出现</span>}{thread.readError && <span className="thread-warning" title={thread.readError}>单条读取不可用</span>}</div><small>{thread.id}</small></div><div className="thread-meta"><div><span>工作目录</span><code>{thread.cwd}</code></div><div><span>工作区根</span><code>{attribution.workspaceRoot ?? "无法确认"}</code></div><div><span>归属依据</span><code>{attribution.detail}</code></div>{attribution.diagnostic && <div className="attribution-diagnostic"><span>归属诊断</span><strong>{attribution.diagnostic}</strong></div>}<div><span>来源项目标识</span><code>{thread.projectId ?? "未提供"}</code></div><div><span>父会话 / 派生自</span><code>{thread.parentThreadId ?? thread.forkedFromId ?? "—"}</code></div><div><span>Git 分支</span><code>{thread.git?.branch ?? "—"}</code></div><div><span>最近更新</span><time>{new Date(thread.updatedAt * 1000).toLocaleString("zh-CN")}</time></div><div><span>元数据 / 回合 / 条目 / 内容</span><code>{thread.metadataComplete ? "完整" : "不完整"} / {thread.turnsComplete ? "完整" : "待采集"} / {thread.itemsComplete ? "完整" : "待采集"} / {thread.contentComplete ? "完整" : "不完整"}</code></div><div><span>列表采集</span><time>{new Date(thread.observedAtUnixMs).toLocaleString("zh-CN")}</time></div></div></article>)}</div>
           {threadLimit < visibleThreads.length && <button className="browse-button" onClick={() => setThreadLimit((limit) => limit + 40)}>显示更多会话（{shownThreads.length} / {visibleThreads.length}）</button>}
         </section>
-        {!showUnassigned && projectSessions && <ProjectWorkstreamsView projectId={projectSessions.project.id}
-          refreshVersion={graphVersion} onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} activeWorkstreamId={workstreamFilter} onFilterWorkstream={setWorkstreamFilter} onChanged={refreshGraphForAnalysis} />}
-        {!showUnassigned && projectSessions && <div className="project-view-switch" role="group" aria-label="项目视图"><button aria-pressed={viewMode === "timeline"} onClick={() => setViewMode("timeline")}>时间线</button><button aria-pressed={viewMode === "graph"} onClick={() => setViewMode("graph")}>关系图</button></div>}
-        {!showUnassigned && projectSessions && viewMode === "timeline" && <ProjectTimelineView key={projectSessions.project.id} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} connected={connected} onSelectThread={setSelectedThreadId} selectedThreadId={selectedThreadId} visibleThreadIds={visibleIds} workstreams={workstreams?.workstreams ?? []} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />}
-        {selectedThread && selectedAttribution && projectSessions && !showUnassigned && <ProjectThreadDetailsView projectId={projectSessions.project.id} thread={selectedThread} attribution={selectedAttribution} refreshVersion={graphVersion} hidden={selectionHidden} onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} relationSource={relationSource} relationKind={relationKind} minimumConfidence={minimumConfidence} />}
         {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} settingsRevision={analysisSettingsRevision} locationRequest={evidenceLocation} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />}
-        {!showUnassigned && projectSessions && viewMode === "graph" && <ProjectGraphView projectId={projectSessions.project.id} refreshVersion={graphVersion} onSelectEvidence={selectEvidence} selectedThreadId={selectedThreadId} onSelectThread={setSelectedThreadId} visibleThreadIds={visibleIds} relationSource={relationSource} onRelationSourceChange={setRelationSource} relationKind={relationKind} onRelationKindChange={setRelationKind} minimumConfidence={minimumConfidence} onMinimumConfidenceChange={setMinimumConfidence} />}
-        {!showUnassigned && projectSessions && <CandidatePreviewView projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} onSelectEvidence={selectEvidence} />}
-        {!showUnassigned && projectSessions && <ProjectAnalysisView projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} onRelationResultsChanged={refreshGraphForAnalysis} />}
-        <p className="disclaimer">来源连接诊断不运行模型；列表刷新读取元数据，不恢复会话或读取会话正文。文本服务验证和 Jev 合成测试只发送固定合成材料，只有手动操作才会发起模型调用。</p>
+        {!showUnassigned && projectSessions && <ProjectAnalysisView key={`${projectSessions.project.id}:summary`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="summary" />}
+        <p className="disclaimer">会话列表只包含来源元数据。查看回合会按需读取会话正文；项目总结需要在本面板手动启动。</p>
+        </>}
+        {activePanel === "workstreams" && <>
+        <div className="eyebrow">WORKFLOWS / 04 <span /></div>
+        <div className="page-heading"><div><h1>工作流<span className="accent">.</span></h1><p>整理项目工作流、活动时间线，并按需命名关系分组。</p></div></div>
+        {!showUnassigned && projectSessions ? <>
+          <ProjectWorkstreamsView key={`${projectSessions.project.id}:workstreams`} projectId={projectSessions.project.id}
+            refreshVersion={graphVersion} onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} activeWorkstreamId={workstreamFilter} onFilterWorkstream={setWorkstreamFilter} onChanged={refreshGraphForAnalysis} />
+          <ProjectTimelineView key={`${projectSessions.project.id}:timeline`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} connected={connected} onSelectThread={setSelectedThreadId} selectedThreadId={selectedThreadId} visibleThreadIds={projectThreadIds} workstreams={workstreams?.workstreams ?? []} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />
+          <ProjectAnalysisView key={`${projectSessions.project.id}:naming`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="naming" />
+        </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>工作流和时间线按项目整理。先选择一个本地项目即可查看。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
+        </>}
+        {activePanel === "relations" && <>
+        <div className="eyebrow">RELATIONS / 05 <span /></div>
+        <div className="page-heading"><div><h1>关系图<span className="accent">.</span></h1><p>查看已保存关系、证据和项目间的连接，并按需判断待处理候选。</p></div></div>
+        {!showUnassigned && projectSessions ? <>
+          <ProjectGraphView key={`${projectSessions.project.id}:relations`} projectId={projectSessions.project.id} refreshVersion={graphVersion} onSelectEvidence={selectEvidence} selectedThreadId={selectedThreadId} onSelectThread={setSelectedThreadId} visibleThreadIds={projectThreadIds} relationSource={relationSource} onRelationSourceChange={setRelationSource} relationKind={relationKind} onRelationKindChange={setRelationKind} minimumConfidence={minimumConfidence} onMinimumConfidenceChange={setMinimumConfidence} />
+          {selectedThread && selectedAttribution && <ProjectThreadDetailsView projectId={projectSessions.project.id} thread={selectedThread} attribution={selectedAttribution} refreshVersion={graphVersion} hidden={selectionHidden} onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} relationSource={relationSource} relationKind={relationKind} minimumConfidence={minimumConfidence} />}
+          <ProjectAnalysisView key={`${projectSessions.project.id}:relations-analysis`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="relations" onRelationResultsChanged={refreshGraphForAnalysis} />
+        </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>关系图按项目生成。先选择一个本地项目即可查看关系和来源证据。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
+        </>}
       </div>
     </main>
   </div>;
