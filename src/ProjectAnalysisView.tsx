@@ -156,8 +156,8 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；总并发为 1–2，自动重试为 0–2，输入至少 2000 字符。</p>}
       <small className="analysis-note">参数仅用于本阶段新启动的批次；继续已有批次时沿用原有参数，仅更新调用上限。</small>
     </details>
-    {textWorkUnavailable && <p className="analysis-note">待处理任务需要文本服务。请先在“来源与分析连接”面板配置文本服务。</p>}
-    {relationWorkUnavailable && <p className="analysis-note">待处理候选需要 Jev。请先在“来源与分析连接”面板配置 Jev。</p>}
+    {textWorkUnavailable && <p className="analysis-note">待处理任务需要文本服务。请先在“来源设置”面板配置文本服务。</p>}
+    {relationWorkUnavailable && <p className="analysis-note">待处理候选需要 Jev。请先在“来源设置”面板配置 Jev。</p>}
     {run?.state === "paused" && runBelongsHere && <p className="analysis-note">已暂停批次继续时沿用启动时的阶段选择与运行参数。</p>}
     {run && ["cancelled", "partial", "failed"].includes(run.state) && runBelongsHere && <p className="analysis-note">继续未完成项会沿用已保存阶段与运行参数；新批次会使用当前设置。</p>}
     {blockingRun && <p className="analysis-note" role="status">此项目的{selectionDescription(run?.stageSelection)}批次{run?.state === "paused" ? "已暂停" : "正在运行"}。请到所属阶段面板继续或取消后再启动当前阶段。</p>}

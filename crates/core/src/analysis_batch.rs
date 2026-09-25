@@ -3929,6 +3929,7 @@ mod tests {
                     ]),
                 },
             }],
+            evidence_options: Vec::new(),
             input_tokens: 10,
             output_tokens: 2,
         };

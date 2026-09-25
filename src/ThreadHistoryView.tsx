@@ -254,7 +254,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, settingsRevi
 
   const coverage = turns?.coverage ?? null;
   return <section id="thread-history" className="panel history-panel" aria-label="会话历史">
-    <div className="history-heading"><div><div className="panel-kicker">04 / 会话详情</div><h2>回合与条目</h2><small className="history-thread-id">{threadId}</small></div>
+    <div className="history-heading"><div><div className="panel-kicker">探索 / 会话历史</div><h2>回合与条目</h2><small className="history-thread-id">{threadId}</small></div>
       <button className="browse-button" disabled={!connected || loading} onClick={() => void reload()}>{loading ? "正在读取…" : coverage ? "重新读取历史" : "读取历史"}</button></div>
     <div className="history-status" role="status"><strong>{status(coverage, updatedAt)}</strong>
       <span>{coverage ? `读取方式：${coverage.path === "paginated" ? "分页" : coverage.path === "fullRead" ? "完整读取兼容路径" : "未取得内容"}；已取得 ${coverage.loadedTurns} 回合、${coverage.loadedItems} 条目` : "打开详情后按需读取，按页浏览本地缓存。"}</span>

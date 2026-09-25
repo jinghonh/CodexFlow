@@ -480,6 +480,8 @@ mod tests {
             probabilities: BTreeMap::new(),
             evidence_confidence: 0.9,
             evidence_probabilities: BTreeMap::new(),
+            evidence_options: Vec::new(),
+            selected_evidence_option: None,
             evidence: EvidencePair {
                 id: "pair".into(),
                 left: evidence(a),

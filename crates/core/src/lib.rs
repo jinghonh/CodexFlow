@@ -3785,6 +3785,8 @@ mod tests {
             probabilities: Default::default(),
             evidence_confidence: 0.8,
             evidence_probabilities: Default::default(),
+            evidence_options: Vec::new(),
+            selected_evidence_option: None,
             evidence: EvidencePair {
                 id: "pair".into(),
                 left: candidate_evidence("a"),

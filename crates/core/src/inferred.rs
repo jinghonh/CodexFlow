@@ -261,6 +261,8 @@ pub(crate) fn outcome(
                 probabilities: choice.answer.probabilities.clone(),
                 evidence_confidence: picked.answer.confidence,
                 evidence_probabilities: picked.answer.probabilities.clone(),
+                evidence_options: selected.evidence_options.clone(),
+                selected_evidence_option: Some(picked.answer.choice.clone()),
                 evidence: EvidencePair {
                     id: pair.id.clone(),
                     left: pair.left.clone(),

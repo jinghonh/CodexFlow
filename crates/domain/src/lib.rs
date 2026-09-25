@@ -1015,6 +1015,13 @@ pub struct EvidencePair {
     pub right: CandidateEvidence,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceOption {
+    pub key: String,
+    pub pair: EvidencePair,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EvidenceSample {
@@ -1161,6 +1168,8 @@ pub struct JevEvidenceChoice {
 pub struct JevEvidenceSelection {
     pub actual_model: String,
     pub choices: Vec<JevEvidenceChoice>,
+    #[serde(default)]
+    pub evidence_options: Vec<EvidenceOption>,
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
@@ -1188,6 +1197,10 @@ pub struct InferredRelation {
     pub probabilities: std::collections::BTreeMap<String, f64>,
     pub evidence_confidence: f64,
     pub evidence_probabilities: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    pub evidence_options: Vec<EvidenceOption>,
+    #[serde(default)]
+    pub selected_evidence_option: Option<String>,
     pub evidence: EvidencePair,
     pub time_check: CausalTimeCheck,
     pub explanation: String,

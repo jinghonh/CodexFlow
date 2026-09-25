@@ -112,7 +112,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
     </div>;
   };
   return <section id="workstreams" className="panel workstreams-panel" aria-label="项目工作流">
-    <div className="panel-kicker">04 / 工作流</div><h2>工作流导航</h2>
+    <div className="panel-kicker">探索 / 工作流</div><h2>工作流导航</h2>
     <p className="panel-intro">分组由有效关系生成，自动名称来自所配置的文本服务。可改名或调整会话的主要工作流；跨组联系与未分组会话保留在这里。</p>
     {error && <p className="page-error" role="alert">{error} <button className="browse-button" onClick={refresh}>刷新工作流</button></p>}
     {saved && <p role="status">{saved}</p>}

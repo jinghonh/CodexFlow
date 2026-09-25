@@ -69,17 +69,22 @@ const runLabels: Record<IndexRun["state"], string> = { queued: "待执行", runn
 
 type WorkspacePanel = "connections" | "projects" | "sessions" | "workstreams" | "relations";
 const workspacePanels: { id: WorkspacePanel; title: string; index: string }[] = [
-  { id: "connections", title: "来源与分析连接", index: "01" },
-  { id: "projects", title: "本地项目", index: "02" },
-  { id: "sessions", title: "项目会话", index: "03" },
-  { id: "workstreams", title: "工作流", index: "04" },
-  { id: "relations", title: "关系图", index: "05" },
+  { id: "connections", title: "来源设置", index: "01" },
+  { id: "projects", title: "选择项目", index: "02" },
+  { id: "sessions", title: "会话浏览", index: "03" },
+  { id: "workstreams", title: "工作流回顾", index: "04" },
+  { id: "relations", title: "关系审查", index: "05" },
+];
+const workspaceGroups: { title: string; panels: WorkspacePanel[] }[] = [
+  { title: "准备", panels: ["connections", "projects"] },
+  { title: "探索", panels: ["sessions", "workstreams"] },
+  { title: "审查", panels: ["relations"] },
 ];
 const panelStorageKey = "codexflow.active-panel";
 
 function initialWorkspacePanel(): WorkspacePanel {
   const saved = window.localStorage.getItem(panelStorageKey);
-  return workspacePanels.some((panel) => panel.id === saved) ? saved as WorkspacePanel : "connections";
+  return workspacePanels.some((panel) => panel.id === saved) ? saved as WorkspacePanel : "projects";
 }
 
 const labels: { key: keyof SourceStatus["capabilities"]; title: string; number: string }[] = [
@@ -147,20 +152,21 @@ export function App() {
   const [analysisState, setAnalysisState] = useState<string | null>(null);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
   const [evidenceLocation, setEvidenceLocation] = useState<{ threadId: string; turnId: string; itemId: string; nonce: number } | null>(null);
+  const [reviewHistoryOpen, setReviewHistoryOpen] = useState(false);
   const evidenceNonce = useRef(0);
   const projectEpoch = useRef(0);
+  const checkedInitialProject = useRef(false);
   const workstreamProjectId = useRef<string | null>(null);
-  const previousThreadSelection = useRef<string | null>(null);
 
   useEffect(() => {
     window.localStorage.setItem(panelStorageKey, activePanel);
   }, [activePanel]);
 
   useEffect(() => {
-    const selectionChanged = previousThreadSelection.current !== selectedThreadId;
-    previousThreadSelection.current = selectedThreadId;
-    if (selectionChanged && activePanel === "relations" && selectedThreadId) document.getElementById("thread-detail")?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [selectedThreadId, activePanel]);
+    if (!projectCatalog || checkedInitialProject.current) return;
+    checkedInitialProject.current = true;
+    if (!projectCatalog.selectedProjectId) setActivePanel("projects");
+  }, [projectCatalog]);
 
   useEffect(() => {
     const projectId = projectSessions?.project.id;
@@ -582,7 +588,15 @@ export function App() {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">C<span>F</span></span><div><strong>CodexFlow</strong><small>本地工作过程</small></div></div>
-      <nav className="side-group" aria-label="工作空间面板"><span className="side-caption">工作空间</span>{workspacePanels.map((panel) => <button key={panel.id} className={`side-link ${activePanel === panel.id ? "active" : ""}`} aria-current={activePanel === panel.id ? "page" : undefined} onClick={() => selectPanel(panel.id)}><span className="side-dot" />{panel.title}<span className="side-index">{panel.index}</span></button>)}</nav>
+      <nav className="side-group" aria-label="工作任务">
+        {workspaceGroups.map((group) => <div className="side-section" key={group.title}>
+          <span className="side-caption">{group.title}</span>
+          {group.panels.map((id) => {
+            const panel = workspacePanels.find((item) => item.id === id)!;
+            return <button key={panel.id} className={`side-link ${activePanel === panel.id ? "active" : ""}`} aria-current={activePanel === panel.id ? "page" : undefined} onClick={() => selectPanel(panel.id)}><span className="side-dot" />{panel.title}<span className="side-index">{panel.index}</span></button>;
+          })}
+        </div>)}
+      </nav>
       <div className="side-note"><span className="side-note-line" />同一仓库的主工作区与 worktree 合并展示。会话的实际工作区和归属依据仍可逐条查看。</div>
       <div className="sidebar-bottom"><span className="sidebar-bottom-symbol">↗</span><div>本机运行<br /><strong>数据留在你的设备</strong></div></div>
     </aside>
@@ -591,8 +605,8 @@ export function App() {
       <header className="topbar"><span>工作空间 / {activePanelInfo.title}</span><div className="topbar-right"><span className="topbar-pulse" />本地桌面应用</div></header>
       <div className="page-body">
         {activePanel === "connections" && <>
-        <div className="eyebrow">SOURCE / 01 <span /></div>
-        <div className="page-heading"><div><h1>来源与分析连接<span className="accent">.</span></h1><p>配置 Codex 来源、分析服务和本机显示偏好。</p></div><div className="heading-badge">连接与模型设置<br /><strong>数据留在本机</strong></div></div>
+        <div className="eyebrow">准备 / 来源设置 <span /></div>
+        <div className="page-heading"><div><h1>来源与模型设置<span className="accent">.</span></h1><p>配置来源、分析服务和本机显示偏好。</p></div><div className="heading-badge">本机分析工作台<br /><strong>数据留在你的设备</strong></div></div>
 
         <section className="status-banner" data-state={failed ? "failed" : connected ? "connected" : "pending"} aria-live="polite">
           <div className="status-icon">{failed ? "!" : connected ? "✓" : "·"}</div>
@@ -678,10 +692,10 @@ export function App() {
         <p className="disclaimer">来源诊断不会启动模型；文本服务与 Jev 的验证只发送固定合成材料。列表刷新读取会话元数据，查看回合或运行分析时才会读取相应内容。</p>
         </>}
         {activePanel === "projects" && <>
-        <div className="eyebrow">PROJECTS / 02 <span /></div>
+        <div className="eyebrow">准备 / 选择项目 <span /></div>
         <div className="page-heading"><div><h1>本地项目<span className="accent">.</span></h1><p>选择要浏览会话、工作流和关系的本机项目。</p></div></div>
         <section id="projects" className="panel project-panel">
-          <div className="panel-kicker">02 / 本地项目</div><h2>选择项目</h2>
+          <div className="panel-kicker">准备 / 项目</div><h2>选择项目</h2>
           <p className="panel-intro">选择真实目录。Git 项目按共享 Git 目录识别，独立克隆分别显示；非 Git 项目按所选目录归属。</p>
           <div className="project-picker"><input aria-label="本地项目目录" spellCheck={false} value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="/本机/项目目录" /><button className="browse-button" onClick={() => void selectDirectory()}>浏览…</button><button className="primary-button" onClick={() => void chooseProject()} disabled={!projectPath.trim()}>选择目录<span>↗</span></button></div>
           {projectError && <div className="page-error" role="alert">{projectError}</div>}
@@ -690,10 +704,10 @@ export function App() {
         </section>
         </>}
         {activePanel === "sessions" && <>
-        <div className="eyebrow">SESSIONS / 03 <span /></div>
-        <div className="page-heading"><div><h1>项目会话<span className="accent">.</span></h1><p>{projectSessions?.project.name ?? "浏览所选本地项目的会话、摘要和来源事实。"}</p></div><div className="heading-badge">按需读取<br /><strong>列表仅含元数据</strong></div></div>
+        <div className="eyebrow">探索 / 会话浏览 <span /></div>
+        <div className="page-heading"><div><h1>会话浏览<span className="accent">.</span></h1><p>{projectSessions?.project.name ?? "浏览所选本地项目的会话、摘要和来源事实。"}</p></div><div className="heading-badge">按需读取<br /><strong>列表仅含元数据</strong></div></div>
         <section id="sessions" className="panel session-panel">
-          <div className="session-heading"><div><div className="panel-kicker">03 / 项目会话</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
+          <div className="session-heading"><div><div className="panel-kicker">探索 / 会话清单</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
           {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}</div>}
           {!showUnassigned && projectSessions && <div className="workspace-list"><strong>实际工作区</strong>{projectSessions.workspaces.length ? projectSessions.workspaces.map((workspace) => <code key={workspace}>{workspace}</code>) : <span>当前没有可验证的工作区</span>}</div>}
           <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{refreshing ? "刷新中；缓存可浏览" : !attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>选择会话后按需读取回合与条目</span></div>
@@ -718,7 +732,7 @@ export function App() {
         <p className="disclaimer">会话列表只包含来源元数据。查看回合会按需读取会话正文；项目总结需要在本面板手动启动。</p>
         </>}
         {activePanel === "workstreams" && <>
-        <div className="eyebrow">WORKFLOWS / 04 <span /></div>
+        <div className="eyebrow">探索 / 工作流回顾 <span /></div>
         <div className="page-heading"><div><h1>工作流<span className="accent">.</span></h1><p>整理项目工作流、活动时间线，并按需命名关系分组。</p></div></div>
         {!showUnassigned && projectSessions ? <>
           <ProjectWorkstreamsView key={`${projectSessions.project.id}:workstreams`} projectId={projectSessions.project.id}
@@ -728,16 +742,23 @@ export function App() {
         </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>工作流和时间线按项目整理。先选择一个本地项目即可查看。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
         </>}
         {activePanel === "relations" && <>
-        <div className="eyebrow">RELATIONS / 05 <span /></div>
-        <div className="page-heading"><div><h1>关系图<span className="accent">.</span></h1><p>查看已保存关系、证据和项目间的连接，并按需判断待处理候选。</p></div></div>
+        <div className="eyebrow">审查 / 关系审查 <span /></div>
+        <div className="page-heading"><div><h1>关系审查<span className="accent">.</span></h1><p>从模型判断进入证据，再回到会话来源核实上下文。</p></div></div>
         {!showUnassigned && projectSessions ? <>
-          <ProjectGraphView key={`${projectSessions.project.id}:relations`} projectId={projectSessions.project.id} refreshVersion={graphVersion} onSelectEvidence={selectEvidence} selectedThreadId={selectedThreadId} onSelectThread={setSelectedThreadId} visibleThreadIds={projectThreadIds} relationSource={relationSource} onRelationSourceChange={setRelationSource} relationKind={relationKind} onRelationKindChange={setRelationKind} minimumConfidence={minimumConfidence} onMinimumConfidenceChange={setMinimumConfidence} />
-          {selectedThread && selectedAttribution && <ProjectThreadDetailsView projectId={projectSessions.project.id} thread={selectedThread} attribution={selectedAttribution} refreshVersion={graphVersion} hidden={selectionHidden} onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} relationSource={relationSource} relationKind={relationKind} minimumConfidence={minimumConfidence} />}
+          <ProjectGraphView key={`${projectSessions.project.id}:relations`} projectId={projectSessions.project.id} refreshVersion={graphVersion} onSelectEvidence={selectEvidence} selectedThreadId={selectedThreadId} onSelectThread={setSelectedThreadId} visibleThreadIds={projectThreadIds} relationSource={relationSource} onRelationSourceChange={setRelationSource} relationKind={relationKind} onRelationKindChange={setRelationKind} minimumConfidence={minimumConfidence} onMinimumConfidenceChange={setMinimumConfidence}
+            renderSessionInspector={({ onSelectEvidence, onSelectThread }) => selectedThread && selectedAttribution
+              ? <ProjectThreadDetailsView projectId={projectSessions.project.id} thread={selectedThread} attribution={selectedAttribution} refreshVersion={graphVersion} hidden={selectionHidden} onSelectThread={onSelectThread} onSelectEvidence={onSelectEvidence} relationSource={relationSource} relationKind={relationKind} minimumConfidence={minimumConfidence} />
+              : <p className="inspector-empty">此会话不在当前项目的可读列表中。</p>}
+            onOpenFullHistory={selectedThread ? () => setReviewHistoryOpen(true) : undefined} />
           <ProjectAnalysisView key={`${projectSessions.project.id}:relations-analysis`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="relations" onRelationResultsChanged={refreshGraphForAnalysis} />
         </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>关系图按项目生成。先选择一个本地项目即可查看关系和来源证据。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
         </>}
       </div>
     </main>
+    {reviewHistoryOpen && activePanel === "relations" && selectedThread && <div className="history-overlay" role="dialog" aria-modal="true" aria-label="完整会话历史">
+      <div className="history-overlay-header"><div><span className="panel-kicker">审查 / 完整历史</span><strong>{threadDisplayTitle(selectedThread)}</strong></div><button className="primary-button" onClick={() => setReviewHistoryOpen(false)}>返回关系检查 <span>↩</span></button></div>
+      <ThreadHistoryView key={`review-history:${selectedThread.id}`} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} settingsRevision={analysisSettingsRevision} locationRequest={evidenceLocation} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />
+    </div>}
   </div>;
 }
 

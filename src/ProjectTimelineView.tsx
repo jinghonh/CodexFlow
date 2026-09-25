@@ -205,7 +205,7 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
   }
 
   return <section id="project-timeline" className="panel timeline-panel" aria-label="项目活动时间线">
-    <div className="timeline-heading"><div><div className="panel-kicker">04 / 真实活动时间线</div><h2>回合活动</h2>
+    <div className="timeline-heading"><div><div className="panel-kicker">探索 / 活动时间线</div><h2>回合活动</h2>
       <p className="panel-intro">每段色条来自一个回合的有效起止时间。恢复间隔留白；重叠回合分层显示。</p></div>
       <div className="timeline-controls" aria-label="时间线视图控制">
         {connected && visible.some((thread) => !thread.turnsComplete) && <button className="timeline-load" onClick={() => loading ? stopLoading.current = true : void loadMissingTurns()}>{loading ? `停止读取 · ${loading.done}/${loading.total}` : "读取缺失回合"}</button>}

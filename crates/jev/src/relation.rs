@@ -4,7 +4,7 @@ use super::{
     InferenceResponse, JevClient,
 };
 use codexflow_domain::{
-    AppError, ErrorCode, InferredRelationKind, JevChoiceAnswer, JevEvidenceChoice,
+    AppError, ErrorCode, EvidenceOption, InferredRelationKind, JevChoiceAnswer, JevEvidenceChoice,
     JevEvidenceSelection, JevRelationClassification, RelationCandidate, RelationChoice,
     RelationJudgment,
 };
@@ -247,7 +247,7 @@ impl JevRelationAnalyzer {
         candidate: &RelationCandidate,
         supported: &[RelationChoice],
         model: &str,
-    ) -> Result<(Value, Map<String, Value>, Vec<String>), AppError> {
+    ) -> Result<(Value, Map<String, Value>, Vec<String>, Vec<EvidenceOption>), AppError> {
         if supported.is_empty() || candidate.evidence.pairs.len() > 20 {
             return Err(protocol_error());
         }
@@ -255,7 +255,18 @@ impl JevRelationAnalyzer {
             let (_, state) = Self::states(candidate, count);
             let (questions, options) = selection_questions(supported, count);
             if request_characters(&state, model, &questions) <= self.material_limit {
-                return Ok((state, questions, options));
+                let evidence_options = candidate
+                    .evidence
+                    .pairs
+                    .iter()
+                    .take(count)
+                    .enumerate()
+                    .map(|(index, pair)| EvidenceOption {
+                        key: format!("p{index}"),
+                        pair: pair.clone(),
+                    })
+                    .collect();
+                return Ok((state, questions, options, evidence_options));
             }
         }
         Err(input_limit_error())
@@ -358,7 +369,8 @@ impl JevRelationAnalyzer {
         candidate: &RelationCandidate,
         supported: &[RelationChoice],
     ) -> Result<JevEvidenceSelection, AppError> {
-        let (state, questions, keys) = self.prepare_selection(candidate, supported, model)?;
+        let (state, questions, keys, evidence_options) =
+            self.prepare_selection(candidate, supported, model)?;
         let body = self.submit(credential, model, state, questions).await?;
         let mut choices = Vec::new();
         for relation in supported {
@@ -394,6 +406,7 @@ impl JevRelationAnalyzer {
         Ok(JevEvidenceSelection {
             actual_model: body.model,
             choices,
+            evidence_options,
             input_tokens: body.usage.input_tokens,
             output_tokens: body.usage.output_tokens,
         })
