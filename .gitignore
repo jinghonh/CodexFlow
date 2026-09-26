@@ -12,3 +12,5 @@ docs/*
 !docs/performance/
 !docs/release/
 .codexflow-orchestration/
+.agents
+skills-lock.json
