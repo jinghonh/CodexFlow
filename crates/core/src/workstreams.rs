@@ -1,12 +1,12 @@
 use codexflow_domain::{
-    DerivedRelationKind, ParentEndpoint, ProjectGraph, ProjectWorkstreams, UserRelationDecision,
-    Workstream,
+    ExecutionStage, InferredRelationKind, ParentEndpoint, ProjectGraph, ProjectWorkstreams,
+    UserRelationDecision, Workstream,
 };
 use codexflow_store::WorkstreamCorrections;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) const ALGORITHM_VERSION: &str = "greedy-modularity-v1-seed-0";
+pub(crate) const ALGORITHM_VERSION: &str = "greedy-modularity-v2-jev-stage-weighted";
 
 #[derive(Clone)]
 struct Edge {
@@ -46,43 +46,41 @@ pub(crate) fn build(graph: &ProjectGraph, old: &[Workstream]) -> ProjectWorkstre
             );
         }
     }
-    for relation in &graph.derived_relations {
-        let from_has_evidence = relation
-            .evidence
-            .iter()
-            .any(|item| item.thread_id == relation.from_thread_id);
-        let to_has_evidence = relation
-            .evidence
-            .iter()
-            .any(|item| item.thread_id == relation.to_thread_id);
-        let evidence_valid = match relation.kind {
-            DerivedRelationKind::ExplicitReference => from_has_evidence || to_has_evidence,
-            DerivedRelationKind::SharedFile | DerivedRelationKind::SharedArtifact => {
-                from_has_evidence && to_has_evidence
-            }
-        };
-        if !relation.basis.trim().is_empty() && evidence_valid {
-            add(
-                &relation.id,
-                &relation.from_thread_id,
-                &relation.to_thread_id,
-                2,
-            );
-        }
-    }
     for relation in &graph.reviewed_relations {
-        if relation.evidence_valid
+        if !matches!(
+            relation.relation.kind,
+            InferredRelationKind::AlternativeTo | InferredRelationKind::Related
+        ) && relation.evidence_valid
             && relation.review.decision != UserRelationDecision::Rejected
-            && (relation.relation.confidence >= 0.70
-                || (relation.review.decision == UserRelationDecision::Confirmed
-                    && relation.review.confirmed_evidence_version.as_deref()
-                        == Some(&relation.evidence_version)))
+            && relation.relation.confidence.is_finite()
+            && (0.0..=1.0).contains(&relation.relation.confidence)
         {
+            let type_weight = match relation.relation.kind {
+                InferredRelationKind::Investigates | InferredRelationKind::MotivatedBy => 2.0,
+                _ => 4.0,
+            };
+            let execution_weight = match relation.relation.execution_stage {
+                ExecutionStage::Planned => 0.75,
+                ExecutionStage::Started => 1.0,
+                ExecutionStage::Completed => 1.4,
+                ExecutionStage::Unknown => 0.9,
+            };
+            let review_weight = if relation.review.decision == UserRelationDecision::Confirmed {
+                1.25
+            } else {
+                1.0
+            };
+            let raw_weight =
+                type_weight * execution_weight * review_weight * relation.relation.confidence;
+            if raw_weight <= 0.0 {
+                continue;
+            }
+            let weight = raw_weight.round().max(1.0) as i64;
             add(
                 &relation.relation.id,
                 &relation.relation.from_thread_id,
                 &relation.relation.to_thread_id,
-                3,
+                weight,
             );
         }
     }
@@ -477,16 +475,18 @@ mod tests {
             requested_model: "jev".into(),
             actual_model: "jev".into(),
             confidence,
+            execution_stage: ExecutionStage::Unknown,
+            execution_outcome: codexflow_domain::ExecutionOutcome::Unknown,
             probabilities: BTreeMap::new(),
             evidence_confidence: 0.9,
             evidence_probabilities: BTreeMap::new(),
             evidence_options: Vec::new(),
             selected_evidence_option: None,
-            evidence: EvidencePair {
+            evidence: Some(EvidencePair {
                 id: "pair".into(),
                 left: evidence(a),
                 right: evidence(b),
-            },
+            }),
             time_check: CausalTimeCheck::Unverifiable,
             explanation: "来源事实".into(),
             input_version: "v1".into(),

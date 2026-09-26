@@ -55,6 +55,18 @@ impl AppError {
             ErrorCode::TextConnectionFailed | ErrorCode::TextProtocolInvalid => {
                 "检查文本服务地址、协议和网络后重试。"
             }
+            ErrorCode::EmbeddingCredentialFailed => "检查系统凭据库状态并重试。",
+            ErrorCode::EmbeddingNotConfigured => "填写嵌入服务地址、模型和当前地址的 API Key。",
+            ErrorCode::EmbeddingInvalidAddress => "填写有效的 HTTPS 嵌入服务地址并重新保存。",
+            ErrorCode::EmbeddingConnectionFailed | ErrorCode::EmbeddingProtocolInvalid => {
+                "检查嵌入服务地址、协议和网络后重试。"
+            }
+            ErrorCode::EmbeddingAuthenticationFailed => "检查嵌入服务凭据后重试。",
+            ErrorCode::EmbeddingModelUnsupported => "检查嵌入模型 ID 与服务支持情况后重试。",
+            ErrorCode::EmbeddingOverloaded | ErrorCode::EmbeddingQuotaExceeded => {
+                "检查嵌入服务状态或额度后重试。"
+            }
+            ErrorCode::EmbeddingTimeout | ErrorCode::EmbeddingCancelled => "需要时重新启动索引。",
             ErrorCode::JevNotConfigured => "为当前服务地址填写并保存 API Key。",
             ErrorCode::JevInvalidAddress => "填写有效的 HTTPS 服务根地址并重新保存。",
             ErrorCode::JevAuthenticationFailed | ErrorCode::AnalysisAuthenticationFailed => {
@@ -112,6 +124,16 @@ impl AppError {
             retryable,
             cache_preserved: true,
             backend: "text".into(),
+            retry_after_ms: None,
+        }
+    }
+    pub fn embedding(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable,
+            cache_preserved: true,
+            backend: "embedding".into(),
             retry_after_ms: None,
         }
     }
@@ -221,6 +243,17 @@ pub enum ErrorCode {
     TextCredentialFailed,
     TextConnectionFailed,
     TextProtocolInvalid,
+    EmbeddingInvalidAddress,
+    EmbeddingNotConfigured,
+    EmbeddingCredentialFailed,
+    EmbeddingConnectionFailed,
+    EmbeddingAuthenticationFailed,
+    EmbeddingModelUnsupported,
+    EmbeddingProtocolInvalid,
+    EmbeddingOverloaded,
+    EmbeddingQuotaExceeded,
+    EmbeddingTimeout,
+    EmbeddingCancelled,
     MigrationFailed,
     DatabaseTooNew,
     ProjectResolutionFailed,
@@ -663,6 +696,112 @@ pub struct ThreadSummary {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct SemanticVector {
+    pub thread_id: String,
+    pub text_digest: String,
+    pub base_url: String,
+    pub requested_model: String,
+    pub actual_model: String,
+    pub source_updated_at: i64,
+    pub history_generation: i64,
+    pub values: Vec<f32>,
+    pub indexed_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopicLabel {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub created_at_unix_ms: i64,
+    pub updated_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTopicAssignment {
+    pub thread_id: String,
+    pub project_id: String,
+    pub topic_id: Option<String>,
+    pub suggested_topic_id: Option<String>,
+    pub confidence: f64,
+    #[serde(default)]
+    pub threshold: f64,
+    pub manual: bool,
+    pub summary_digest: String,
+    pub model: String,
+    #[serde(default)]
+    pub service_base_url: String,
+    #[serde(default)]
+    pub requested_model: String,
+    pub assigned_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalTopicThread {
+    pub thread: ThreadMetadata,
+    pub project: LocalProject,
+    pub assignment: Option<ThreadTopicAssignment>,
+    pub semantic_neighbors: Vec<SemanticNeighbor>,
+    pub summary_available: bool,
+    pub indexed: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticNeighbor {
+    pub thread_id: String,
+    pub project_id: String,
+    pub score: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GlobalTopicView {
+    pub labels: Vec<TopicLabel>,
+    pub threads: Vec<GlobalTopicThread>,
+    pub indexed_count: u64,
+    pub pending_index_count: u64,
+    #[serde(default)]
+    pub pending_topic_assignments: u64,
+    #[serde(default)]
+    pub topic_assignment_threshold: f64,
+    #[serde(default)]
+    pub manual_topic_sample_count: u64,
+    #[serde(default)]
+    pub manual_topic_agreement: Option<f64>,
+    #[serde(default)]
+    pub cross_project_candidate_count: u64,
+    #[serde(default)]
+    pub pending_cross_project_pairs: u64,
+    #[serde(default)]
+    pub cross_project_relations: Vec<InferredPairOutcome>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticIndexResult {
+    pub indexed: u64,
+    pub reused: u64,
+    pub unavailable_summaries: u64,
+    pub topic_assignments: u64,
+    #[serde(default)]
+    pub pending_topic_assignments: u64,
+    #[serde(default)]
+    pub jev_calls: u64,
+    pub actual_model: Option<String>,
+    #[serde(default)]
+    pub cross_project_candidates: u64,
+    #[serde(default)]
+    pub cross_project_relations: u64,
+    #[serde(default)]
+    pub pending_cross_project_pairs: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ThreadSummaryEvidence {
     pub id: String,
     pub turn_id: String,
@@ -1051,6 +1190,10 @@ pub struct RelationCandidate {
     pub score: i32,
     pub reasons: Vec<CandidateReason>,
     pub evidence: EvidenceSample,
+    #[serde(default)]
+    pub left_summary: Option<String>,
+    #[serde(default)]
+    pub right_summary: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1101,6 +1244,10 @@ pub enum InferredRelationKind {
     Fixes,
     Validates,
     Investigates,
+    DependsOn,
+    Modifies,
+    Reviews,
+    HandoffTo,
     AlternativeTo,
     Supersedes,
     MotivatedBy,
@@ -1118,6 +1265,10 @@ impl InferredRelationKind {
             Self::Fixes => "FIXES",
             Self::Validates => "VALIDATES",
             Self::Investigates => "INVESTIGATES",
+            Self::DependsOn => "DEPENDS_ON",
+            Self::Modifies => "MODIFIES",
+            Self::Reviews => "REVIEWS",
+            Self::HandoffTo => "HANDOFF_TO",
             Self::AlternativeTo => "ALTERNATIVE_TO",
             Self::Supersedes => "SUPERSEDES",
             Self::MotivatedBy => "MOTIVATED_BY",
@@ -1151,6 +1302,59 @@ pub struct JevRelationClassification {
     pub requested_model: String,
     pub actual_model: String,
     pub choices: Vec<RelationChoice>,
+    #[serde(default)]
+    pub execution: Option<ExecutionAssessment>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionStage {
+    Planned,
+    Started,
+    Completed,
+    Unknown,
+}
+
+impl Default for ExecutionStage {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ExecutionOutcome {
+    Successful,
+    Blocked,
+    Failed,
+    Unknown,
+}
+
+impl Default for ExecutionOutcome {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionAssessment {
+    pub stage: ExecutionStage,
+    pub outcome: ExecutionOutcome,
+    pub stage_confidence: f64,
+    pub outcome_confidence: f64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JevTopicClassification {
+    pub requested_model: String,
+    pub actual_model: String,
+    pub selected_topic_id: Option<String>,
+    pub confidence: f64,
+    pub probabilities: std::collections::BTreeMap<String, f64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
@@ -1194,6 +1398,10 @@ pub struct InferredRelation {
     pub requested_model: String,
     pub actual_model: String,
     pub confidence: f64,
+    #[serde(default)]
+    pub execution_stage: ExecutionStage,
+    #[serde(default)]
+    pub execution_outcome: ExecutionOutcome,
     pub probabilities: std::collections::BTreeMap<String, f64>,
     pub evidence_confidence: f64,
     pub evidence_probabilities: std::collections::BTreeMap<String, f64>,
@@ -1201,7 +1409,8 @@ pub struct InferredRelation {
     pub evidence_options: Vec<EvidenceOption>,
     #[serde(default)]
     pub selected_evidence_option: Option<String>,
-    pub evidence: EvidencePair,
+    #[serde(default)]
+    pub evidence: Option<EvidencePair>,
     pub time_check: CausalTimeCheck,
     pub explanation: String,
     pub input_version: String,
@@ -1242,6 +1451,10 @@ pub struct ReviewedInferredRelation {
 pub struct InferredPairOutcome {
     pub candidate_id: String,
     pub project_id: String,
+    #[serde(default)]
+    pub left_thread_id: String,
+    #[serde(default)]
+    pub right_thread_id: String,
     pub input_version: String,
     pub status: String,
     pub unknown_count: u32,
@@ -1377,6 +1590,10 @@ pub struct Preferences {
     pub text: TextConfig,
     #[serde(default)]
     pub text_revision: u64,
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
+    #[serde(default)]
+    pub embedding_revision: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1384,6 +1601,30 @@ pub struct Preferences {
 pub struct TextConfig {
     pub base_url: String,
     pub model: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingConfig {
+    pub base_url: String,
+    pub model: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingStatus {
+    pub config: EmbeddingConfig,
+    pub credential_configured: bool,
+    pub credential_error: Option<AppError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddingValidation {
+    pub requested_model: String,
+    pub actual_model: String,
+    pub vector_dimensions: usize,
+    pub input_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1460,6 +1701,8 @@ impl Default for Preferences {
             jev_revision: 0,
             text: TextConfig::default(),
             text_revision: 0,
+            embedding: EmbeddingConfig::default(),
+            embedding_revision: 0,
         }
     }
 }

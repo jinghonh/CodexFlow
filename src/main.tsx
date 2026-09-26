@@ -7,6 +7,7 @@ import { ProjectGraphView } from "./ProjectGraphView";
 import { ProjectAnalysisView } from "./ProjectAnalysisView";
 import { ProjectTimelineView } from "./ProjectTimelineView";
 import { ProjectWorkstreamsView } from "./ProjectWorkstreamsView";
+import { GlobalTopicsView } from "./GlobalTopicsView";
 import { ThreadHistoryView } from "./ThreadHistoryView";
 import { formatAppError } from "./appError";
 import { ProjectThreadDetailsView } from "./ProjectThreadDetailsView";
@@ -37,6 +38,8 @@ type Settings = { theme: Theme; source: SourceStatus };
 type JevStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean; credentialError: AppError | null };
 type TextStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean; credentialError: AppError | null };
 type TextValidation = { requestedModel: string; actualModel: string; reply: string };
+type EmbeddingStatus = { config: { baseUrl: string; model: string }; credentialConfigured: boolean; credentialError: AppError | null };
+type EmbeddingValidation = { requestedModel: string; actualModel: string; vectorDimensions: number; inputTokens: number };
 type JevConnectionResult = { models: string[]; requestedModel: string };
 type JevInferenceResult = {
   requestedModel: string;
@@ -83,18 +86,20 @@ function shouldAutoRefresh(scopes: Scope[], latestRun: IndexRun | null, now = Da
   return !recentlyFailed;
 }
 
-type WorkspacePanel = "connections" | "projects" | "sessions" | "workstreams" | "relations";
+type WorkspacePanel = "connections" | "projects" | "sessions" | "workstreams" | "relations" | "topics";
 const workspacePanels: { id: WorkspacePanel; title: string; index: string }[] = [
   { id: "connections", title: "来源设置", index: "01" },
   { id: "projects", title: "选择项目", index: "02" },
   { id: "sessions", title: "会话浏览", index: "03" },
   { id: "workstreams", title: "工作流回顾", index: "04" },
   { id: "relations", title: "关系审查", index: "05" },
+  { id: "topics", title: "全局主题", index: "06" },
 ];
 const workspaceGroups: { title: string; panels: WorkspacePanel[] }[] = [
   { title: "准备", panels: ["connections", "projects"] },
   { title: "探索", panels: ["sessions", "workstreams"] },
   { title: "审查", panels: ["relations"] },
+  { title: "组织", panels: ["topics"] },
 ];
 const panelStorageKey = "codexflow.active-panel";
 
@@ -176,6 +181,15 @@ export function App() {
   const [textError, setTextError] = useState("");
   const [textValidation, setTextValidation] = useState<TextValidation | null>(null);
   const textEpoch = useRef(0);
+  const [embeddingStatus, setEmbeddingStatus] = useState<EmbeddingStatus | null>(null);
+  const [embeddingBaseUrl, setEmbeddingBaseUrl] = useState("");
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [embeddingKey, setEmbeddingKey] = useState("");
+  const [embeddingBusy, setEmbeddingBusy] = useState(false);
+  const [embeddingValidating, setEmbeddingValidating] = useState(false);
+  const [embeddingError, setEmbeddingError] = useState("");
+  const [embeddingValidation, setEmbeddingValidation] = useState<EmbeddingValidation | null>(null);
+  const embeddingEpoch = useRef(0);
   const [analysisSettingsRevision, setAnalysisSettingsRevision] = useState(0);
   const jevEpoch = useRef(0);
   const [listError, setListError] = useState("");
@@ -189,7 +203,7 @@ export function App() {
   const [completeFilter, setCompleteFilter] = useState("all");
   const [relationSource, setRelationSource] = useState("all");
   const [relationKind, setRelationKind] = useState("all");
-  const [minimumConfidence, setMinimumConfidence] = useState(0.7);
+  const [minimumConfidence, setMinimumConfidence] = useState(0);
   const [workstreams, setWorkstreams] = useState<WorkstreamView | null>(null);
   const [workstreamError, setWorkstreamError] = useState("");
   const [threadMatches, setThreadMatches] = useState<ThreadMatchesState | null>(null);
@@ -374,6 +388,13 @@ export function App() {
       setTextStatus(status); setTextBaseUrl(status.config.baseUrl); setTextModel(status.config.model);
       setAnalysisSettingsRevision((revision) => revision + 1);
     }).catch((error) => setTextError(errorText(error)));
+  }, []);
+
+  useEffect(() => {
+    invoke<EmbeddingStatus>("get_embedding_status").then((status) => {
+      setEmbeddingStatus(status); setEmbeddingBaseUrl(status.config.baseUrl); setEmbeddingModel(status.config.model);
+      setAnalysisSettingsRevision((revision) => revision + 1);
+    }).catch((error) => setEmbeddingError(errorText(error)));
   }, []);
 
   useEffect(() => {
@@ -585,6 +606,47 @@ export function App() {
     } catch (error) { if (epoch === textEpoch.current) setTextError(errorText(error)); }
   }
 
+  async function saveEmbedding() {
+    embeddingEpoch.current += 1; setEmbeddingBusy(true); setEmbeddingError("");
+    try {
+      const next = await invoke<EmbeddingStatus>("save_embedding_settings", {
+        baseUrl: embeddingBaseUrl, model: embeddingModel, apiKey: embeddingKey || null,
+      });
+      setEmbeddingStatus(next); setEmbeddingBaseUrl(next.config.baseUrl); setEmbeddingModel(next.config.model);
+      setEmbeddingKey(""); setEmbeddingValidation(null);
+      setAnalysisSettingsRevision((revision) => revision + 1);
+    } catch (error) { setEmbeddingError(errorText(error)); }
+    finally { setEmbeddingBusy(false); }
+  }
+
+  async function deleteEmbedding() {
+    if (!window.confirm(`删除${credentialStoreName}中的嵌入服务 API Key？已有本地向量会保留。`)) return;
+    embeddingEpoch.current += 1; setEmbeddingBusy(true); setEmbeddingError("");
+    try {
+      setEmbeddingStatus(await invoke<EmbeddingStatus>("delete_embedding_credential"));
+      setEmbeddingKey(""); setEmbeddingValidation(null);
+      setAnalysisSettingsRevision((revision) => revision + 1);
+    } catch (error) { setEmbeddingError(errorText(error)); }
+    finally { setEmbeddingBusy(false); }
+  }
+
+  async function validateEmbedding() {
+    const epoch = embeddingEpoch.current; setEmbeddingValidating(true); setEmbeddingError(""); setEmbeddingValidation(null);
+    try {
+      const result = await invoke<EmbeddingValidation>("test_embedding_settings");
+      if (epoch === embeddingEpoch.current) setEmbeddingValidation(result);
+    } catch (error) { if (epoch === embeddingEpoch.current) setEmbeddingError(errorText(error)); }
+    finally { setEmbeddingValidating(false); }
+  }
+
+  async function cancelEmbedding() {
+    const epoch = ++embeddingEpoch.current;
+    try {
+      await invoke("cancel_embedding_request");
+      if (epoch === embeddingEpoch.current) setEmbeddingError("本地请求已取消；远端计算或计费可能继续。");
+    } catch (error) { if (epoch === embeddingEpoch.current) setEmbeddingError(errorText(error)); }
+  }
+
   const connected = source?.connection === "connected";
   const failed = source?.connection === "failed";
   const checkedAt = source?.checkedAtUnixMs ? new Date(source.checkedAtUnixMs).toLocaleString("zh-CN") : "尚未检查";
@@ -593,6 +655,8 @@ export function App() {
     jevModel !== jevStatus.config.model || jevKey.length > 0;
   const textUnsaved = !textStatus || textBaseUrl !== textStatus.config.baseUrl ||
     textModel !== textStatus.config.model || textKey.length > 0;
+  const embeddingUnsaved = !embeddingStatus || embeddingBaseUrl !== embeddingStatus.config.baseUrl ||
+    embeddingModel !== embeddingStatus.config.model || embeddingKey.length > 0;
   const scopes = projectSessions?.scopes ?? projectCatalog?.scopes ?? [];
   const attempted = scopes.some((scope) => scope.attemptedAtUnixMs !== null);
   const complete = scopes.length === 2 && scopes.every((scope) => scope.complete);
@@ -639,7 +703,7 @@ export function App() {
   const selectedThread = selectedRecord?.thread;
   const selectedAttribution = selectedRecord?.attribution;
   const selectionHidden = !!selectedThread && (showUnassigned || !!currentThreadMatches) && !visibleThreads.some(({ thread }) => thread.id === selectedThread.id);
-  const clearFilters = () => { setQuery(""); setWorkstreamFilter(""); setWorkspaceFilter(""); setArchiveFilter("all"); setCompleteFilter("all"); setRelationSource("all"); setRelationKind("all"); setMinimumConfidence(0.7); };
+  const clearFilters = () => { setQuery(""); setWorkstreamFilter(""); setWorkspaceFilter(""); setArchiveFilter("all"); setCompleteFilter("all"); setRelationSource("all"); setRelationKind("all"); setMinimumConfidence(0); };
   function resetPanelState(panel: WorkspacePanel) {
     if (panel === "connections") {
       setPath(source?.selectedBinary ?? "");
@@ -649,6 +713,8 @@ export function App() {
       setJevKey(""); setJevError(""); setJevConnection(null); setJevInference(null);
       setTextBaseUrl(textStatus?.config.baseUrl ?? ""); setTextModel(textStatus?.config.model ?? "");
       setTextKey(""); setTextError(""); setTextValidation(null);
+      setEmbeddingBaseUrl(embeddingStatus?.config.baseUrl ?? ""); setEmbeddingModel(embeddingStatus?.config.model ?? "");
+      setEmbeddingKey(""); setEmbeddingError(""); setEmbeddingValidation(null);
     } else if (panel === "projects") {
       setProjectPath(""); setProjectError("");
     } else if (panel === "sessions") {
@@ -657,7 +723,7 @@ export function App() {
     } else if (panel === "workstreams") {
       setWorkstreamFilter("");
     } else if (panel === "relations") {
-      setRelationSource("all"); setRelationKind("all"); setMinimumConfidence(0.7);
+      setRelationSource("all"); setRelationKind("all"); setMinimumConfidence(0);
     }
   }
   function selectPanel(panel: WorkspacePanel) {
@@ -790,8 +856,31 @@ export function App() {
           {!textUnsaved && textValidation && <div className="jev-result" role="status"><strong>合成推理已验证</strong><span>请求模型：{textValidation.requestedModel}；实际模型：{textValidation.actualModel}；回复：{textValidation.reply}</span></div>}
         </section>
 
+        <section className="panel jev-panel" aria-label="语义嵌入服务设置">
+          <div className="panel-kicker">05 / 跨项目语义检索</div>
+          <h2>嵌入模型连接设置</h2>
+          <p className="panel-intro">使用独立的 OpenAI 兼容 <code>/v1/embeddings</code> 服务生成会话语义索引。向量请求只在你手动启动索引或测试时发送。</p>
+          <div className="jev-fields">
+            <label htmlFor="embedding-url">服务根地址<input id="embedding-url" spellCheck={false} value={embeddingBaseUrl} onChange={(event) => setEmbeddingBaseUrl(event.target.value)} placeholder="https://example.com/v1" /></label>
+            <label htmlFor="embedding-model">模型 ID<input id="embedding-model" spellCheck={false} value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="嵌入模型名称" /></label>
+            <label htmlFor="embedding-key">API Key<input id="embedding-key" type="password" autoComplete="off" spellCheck={false} value={embeddingKey} onChange={(event) => setEmbeddingKey(event.target.value)} placeholder={embeddingStatus?.credentialError ? `${credentialStoreName}暂时不可用` : embeddingStatus?.credentialConfigured ? "已保存；留空保留现有密钥" : `填写后存入${credentialStoreName}`} /></label>
+          </div>
+          <p className="jev-key-state">{credentialStoreName}：{embeddingStatus?.credentialError ? "暂时无法读取" : embeddingStatus?.credentialConfigured ? "当前地址已配置密钥" : "当前地址未配置密钥"}。更换地址必须填写新密钥。{embeddingUnsaved ? "请先保存修改。" : ""}</p>
+          {embeddingStatus?.credentialError && <p className="page-error" role="alert">{errorText(embeddingStatus.credentialError)}</p>}
+          {embeddingError && <p className="page-error" role="alert">{embeddingError}</p>}
+          <div className="jev-actions">
+            <button className="primary-button" disabled={embeddingBusy || embeddingValidating} onClick={() => void saveEmbedding()}>保存设置</button>
+            {embeddingStatus?.credentialError && <button className="browse-button" disabled={embeddingBusy || embeddingValidating} onClick={() => void invoke<EmbeddingStatus>("get_embedding_status").then(setEmbeddingStatus).catch((error) => setEmbeddingError(errorText(error)))}>重查系统凭据库</button>}
+            <button className="browse-button" disabled={embeddingBusy || embeddingValidating || embeddingUnsaved || !embeddingStatus?.credentialConfigured} onClick={() => void validateEmbedding()}>验证固定合成向量</button>
+            {embeddingValidating && <button className="plain-button" onClick={() => void cancelEmbedding()}>取消请求</button>}
+            <button className="plain-button" disabled={embeddingBusy || embeddingValidating || !embeddingStatus?.credentialConfigured} onClick={() => void deleteEmbedding()}>删除密钥</button>
+          </div>
+          <p className="jev-cost-note">验证只发送固定合成文本。真实索引使用会话总结和产物摘要；更换服务或模型会触发向量重建。</p>
+          {!embeddingUnsaved && embeddingValidation && <div className="jev-result" role="status"><strong>向量请求已验证</strong><span>请求模型：{embeddingValidation.requestedModel}；实际模型：{embeddingValidation.actualModel}；维度：{embeddingValidation.vectorDimensions}；输入 {embeddingValidation.inputTokens} 个令牌。</span></div>}
+        </section>
+
         <section className="footer-panel"><div><div className="panel-kicker">显示偏好</div><h3>界面外观</h3></div><div className="theme-picker" role="group" aria-label="界面外观">{(["system", "light", "dark"] as const).map((value) => <button key={value} className={theme === value ? "selected" : ""} onClick={() => changeTheme(value)}>{value === "system" ? "跟随系统" : value === "light" ? "浅色" : "深色"}</button>)}</div><small>保存于应用管理的本机用户数据目录</small></section>
-        <p className="disclaimer">来源诊断不会启动模型；文本服务与 Jev 的验证只发送固定合成材料。列表刷新读取会话元数据，查看回合或运行分析时才会读取相应内容。</p>
+        <p className="disclaimer">文本服务与 Jev 的验证只发送固定合成材料。列表刷新读取会话元数据，查看回合或运行分析时才会读取相应内容。</p>
         </>}
         {activePanel === "projects" && <>
         <div className="eyebrow">准备 / 选择项目 <span /></div>
@@ -854,8 +943,9 @@ export function App() {
               : <p className="inspector-empty">此会话不在当前项目的可读列表中。</p>}
             onOpenFullHistory={selectedThread ? () => setReviewHistoryOpen(true) : undefined} />
           <ProjectAnalysisView key={`${projectSessions.project.id}:relations-analysis`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="relations" onRelationResultsChanged={refreshRelationsAndWorkstreams} onSettingsApplied={refreshGraphForSettings} />
-        </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>关系图按项目生成。先选择一个本地项目即可查看关系和来源证据。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
+        </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>关系图按项目生成。先选择一个本地项目即可查看关系和候选会话。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
         </>}
+        {activePanel === "topics" && <GlobalTopicsView />}
       </div>
     </main>
     {reviewHistoryOpen && activePanel === "relations" && selectedThread && <div className="history-overlay" role="dialog" aria-modal="true" aria-label="完整会话历史">

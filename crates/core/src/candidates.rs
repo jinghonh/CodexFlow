@@ -9,8 +9,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 pub(crate) const NEIGHBOR_LIMIT: usize = 10;
-pub(crate) const CANDIDATE_RULE_VERSION: &str = "candidate-signals-v3";
+pub(crate) const CANDIDATE_RULE_VERSION: &str = "candidate-signals-v4-tiers-14d";
 const EVIDENCE_LIMIT: usize = 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CandidateTier {
+    Strong,
+    Medium,
+    Weak,
+}
 
 fn stable_id(prefix: &str, parts: &[&str]) -> String {
     let mut hash = Sha256::new();
@@ -145,6 +152,7 @@ struct ScoredPair {
     score: i32,
     reasons: Vec<CandidateReason>,
     relations: Vec<(DerivedRelationKind, String, Vec<CandidateEvidence>)>,
+    tier: CandidateTier,
 }
 
 fn shared<'a, T>(left: &'a BTreeMap<String, T>, right: &BTreeMap<String, T>) -> Option<&'a str> {
@@ -214,17 +222,16 @@ fn score_pair(
         });
     }
     let gap = left.updated_at.abs_diff(right.updated_at);
-    if gap <= 86_400 {
-        score += 3;
+    if gap <= 14 * 86_400 {
+        let gap_days = gap as f64 / 86_400.0;
+        let decay = 2.0f64.powf(-gap_days / 14.0);
+        score += (4.0 * decay).round().max(1.0) as i32;
         reasons.push(CandidateReason {
             signal: "time".into(),
-            detail: "最近活动相距不超过一天。".into(),
-        });
-    } else if gap <= 7 * 86_400 {
-        score += 1;
-        reasons.push(CandidateReason {
-            signal: "time".into(),
-            detail: "最近活动相距不超过一周。".into(),
+            detail: format!(
+                "最近活动相距 {:.1} 天；时间线索按 14 天半衰期衰减。",
+                gap_days
+            ),
         });
     }
     let overlap = left
@@ -246,6 +253,22 @@ fn score_pair(
         score,
         reasons,
         relations,
+        tier: if !left.references.get(right_id).is_none()
+            || !right.references.get(left_id).is_none()
+            || shared(&left.artifacts, &right.artifacts).is_some()
+        {
+            CandidateTier::Strong
+        } else if shared(&left.files, &right.files).is_some()
+            || left
+                .branch
+                .as_ref()
+                .is_some_and(|branch| right.branch.as_ref() == Some(branch))
+            || gap <= 14 * 86_400
+        {
+            CandidateTier::Medium
+        } else {
+            CandidateTier::Weak
+        },
     })
 }
 
@@ -442,49 +465,87 @@ pub(crate) fn build(
             }
         }
     }
-    let mut selected = BTreeSet::new();
-    for id in &ids {
-        let mut neighbors = scored
-            .iter()
-            .enumerate()
-            .filter(|(_, pair)| &pair.left == id || &pair.right == id)
-            .map(|(index, pair)| (index, pair))
-            .collect::<Vec<_>>();
-        neighbors.sort_by(|(_, a), (_, b)| {
-            b.score.cmp(&a.score).then_with(|| {
-                if &a.left == id { &a.right } else { &a.left }.cmp(if &b.left == id {
-                    &b.right
-                } else {
-                    &b.left
-                })
-            })
-        });
-        selected.extend(
-            neighbors
-                .into_iter()
-                .take(NEIGHBOR_LIMIT)
-                .map(|(index, _)| index),
-        );
+    let mut selected_indices = BTreeSet::new();
+    let mut bounded_degree: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut tier_degree: BTreeMap<(&str, CandidateTier), usize> = BTreeMap::new();
+    for (index, pair) in scored
+        .iter()
+        .enumerate()
+        .filter(|(_, pair)| pair.tier == CandidateTier::Strong)
+    {
+        selected_indices.insert(index);
+        let _ = pair;
     }
-    let mut selected = selected
+    // First reserve one medium and one weak neighbor where each populated tier
+    // has an available counterpart. Strong evidence pairs are never capped.
+    for tier in [CandidateTier::Medium, CandidateTier::Weak] {
+        for id in &ids {
+            if tier_degree.get(&(id.as_str(), tier)).copied().unwrap_or(0) > 0 {
+                continue;
+            }
+            let mut neighbors = scored
+                .iter()
+                .enumerate()
+                .filter(|(_, pair)| pair.tier == tier && (&pair.left == id || &pair.right == id))
+                .collect::<Vec<_>>();
+            neighbors.sort_by(|(_, a), (_, b)| {
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| (&a.left, &a.right).cmp(&(&b.left, &b.right)))
+            });
+            if let Some((index, pair)) = neighbors.into_iter().find(|(_, pair)| {
+                let other = if &pair.left == id {
+                    pair.right.as_str()
+                } else {
+                    pair.left.as_str()
+                };
+                bounded_degree.get(id.as_str()).copied().unwrap_or(0) < NEIGHBOR_LIMIT
+                    && bounded_degree.get(other).copied().unwrap_or(0) < NEIGHBOR_LIMIT
+            }) {
+                selected_indices.insert(index);
+                for endpoint in [pair.left.as_str(), pair.right.as_str()] {
+                    *bounded_degree.entry(endpoint).or_default() += 1;
+                    *tier_degree.entry((endpoint, tier)).or_default() += 1;
+                }
+            }
+        }
+    }
+    let mut remaining = scored
+        .iter()
+        .enumerate()
+        .filter(|(index, pair)| {
+            pair.tier != CandidateTier::Strong && !selected_indices.contains(index)
+        })
+        .collect::<Vec<_>>();
+    remaining.sort_by(|(_, a), (_, b)| {
+        a.tier
+            .cmp(&b.tier)
+            .then_with(|| b.score.cmp(&a.score))
+            .then_with(|| (&a.left, &a.right).cmp(&(&b.left, &b.right)))
+    });
+    for (index, pair) in remaining {
+        if bounded_degree.get(pair.left.as_str()).copied().unwrap_or(0) >= NEIGHBOR_LIMIT
+            || bounded_degree
+                .get(pair.right.as_str())
+                .copied()
+                .unwrap_or(0)
+                >= NEIGHBOR_LIMIT
+        {
+            continue;
+        }
+        selected_indices.insert(index);
+        *bounded_degree.entry(pair.left.as_str()).or_default() += 1;
+        *bounded_degree.entry(pair.right.as_str()).or_default() += 1;
+    }
+    let mut selected = selected_indices
         .into_iter()
         .map(|index| &scored[index])
         .collect::<Vec<_>>();
     selected.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
+        a.tier
+            .cmp(&b.tier)
+            .then_with(|| b.score.cmp(&a.score))
             .then_with(|| (&a.left, &a.right).cmp(&(&b.left, &b.right)))
-    });
-    let mut degree: BTreeMap<&str, usize> = BTreeMap::new();
-    selected.retain(|pair| {
-        if degree.get(pair.left.as_str()).copied().unwrap_or(0) >= NEIGHBOR_LIMIT
-            || degree.get(pair.right.as_str()).copied().unwrap_or(0) >= NEIGHBOR_LIMIT
-        {
-            return false;
-        }
-        *degree.entry(pair.left.as_str()).or_default() += 1;
-        *degree.entry(pair.right.as_str()).or_default() += 1;
-        true
     });
     let mut candidates = Vec::new();
     let mut relations = Vec::new();
@@ -500,6 +561,8 @@ pub(crate) fn build(
             score: pair.score,
             reasons: pair.reasons.clone(),
             evidence: sample(&signals[&pair.left], &signals[&pair.right], &pair.reasons),
+            left_summary: None,
+            right_summary: None,
         });
         for (kind, basis, proofs) in &pair.relations {
             relations.push(DerivedRelation {

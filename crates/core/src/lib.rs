@@ -1,5 +1,6 @@
 mod analysis_batch;
 mod candidates;
+mod embedding_settings;
 mod explorer;
 mod facts;
 mod inferred;
@@ -7,6 +8,7 @@ mod projects;
 mod relations;
 mod summary;
 mod text_settings;
+mod topics;
 mod workstreams;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
@@ -22,8 +24,8 @@ use codexflow_domain::{
     SessionList, SourceEvidence, SourceStatus, ThreadMetadata, UserRelationDecision,
 };
 use codexflow_jev::{
-    normalize_base_url, system_credentials, system_text_credentials, Credential, CredentialStore,
-    JevClient,
+    normalize_base_url, system_credentials, system_embedding_credentials, system_text_credentials,
+    Credential, CredentialStore, JevClient,
 };
 use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore, WorkstreamChange};
 pub use explorer::{ProjectThreadQuery, ProjectThreadQueryResult};
@@ -54,6 +56,7 @@ pub struct SourceService {
     state: Mutex<State>,
     credentials: Arc<dyn CredentialStore>,
     text_credentials: Arc<dyn CredentialStore>,
+    embedding_credentials: Arc<dyn CredentialStore>,
     project_updates: std::sync::Mutex<()>,
     // Invalidates ownership computed from stale source and project snapshots.
     reconciliation_revision: AtomicU64,
@@ -62,6 +65,10 @@ pub struct SourceService {
     text_gate: RwLock<()>,
     text_cancel: Mutex<CancellationToken>,
     text_validation_cancel: Mutex<CancellationToken>,
+    embedding_gate: RwLock<()>,
+    embedding_cancel: Mutex<CancellationToken>,
+    embedding_validation_cancel: Mutex<CancellationToken>,
+    semantic_index_cancel: Mutex<CancellationToken>,
     refresh_active: std::sync::Mutex<Option<(String, CancellationToken)>>,
     summary_active:
         std::sync::Mutex<std::collections::HashMap<String, (String, CancellationToken)>>,
@@ -98,10 +105,11 @@ impl CredentialStore for EmptyCredentials {
 
 impl SourceService {
     pub fn new(app_data_dir: PathBuf) -> Result<Self, AppError> {
-        Self::with_credential_stores(
+        Self::with_all_credential_stores(
             app_data_dir,
             system_credentials(),
             system_text_credentials(),
+            system_embedding_credentials(),
         )
     }
 
@@ -117,6 +125,20 @@ impl SourceService {
         credentials: Arc<dyn CredentialStore>,
         text_credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppError> {
+        Self::with_all_credential_stores(
+            app_data_dir,
+            credentials,
+            text_credentials,
+            Arc::new(EmptyCredentials),
+        )
+    }
+
+    pub fn with_all_credential_stores(
+        app_data_dir: PathBuf,
+        credentials: Arc<dyn CredentialStore>,
+        text_credentials: Arc<dyn CredentialStore>,
+        embedding_credentials: Arc<dyn CredentialStore>,
+    ) -> Result<Self, AppError> {
         let store = PreferenceStore::new(app_data_dir.clone());
         let sessions = SessionStore::new(app_data_dir)?;
         let preferences = store.load()?;
@@ -131,6 +153,7 @@ impl SourceService {
             }),
             credentials,
             text_credentials,
+            embedding_credentials,
             project_updates: std::sync::Mutex::new(()),
             reconciliation_revision: AtomicU64::new(0),
             jev_gate: RwLock::new(()),
@@ -138,6 +161,10 @@ impl SourceService {
             text_gate: RwLock::new(()),
             text_cancel: Mutex::new(CancellationToken::new()),
             text_validation_cancel: Mutex::new(CancellationToken::new()),
+            embedding_gate: RwLock::new(()),
+            embedding_cancel: Mutex::new(CancellationToken::new()),
+            embedding_validation_cancel: Mutex::new(CancellationToken::new()),
+            semantic_index_cancel: Mutex::new(CancellationToken::new()),
             refresh_active: std::sync::Mutex::new(None),
             summary_active: std::sync::Mutex::new(std::collections::HashMap::new()),
             analysis_active: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -344,6 +371,8 @@ impl SourceService {
             jev_revision: preferences.jev_revision,
             text: preferences.text.clone(),
             text_revision: preferences.text_revision,
+            embedding: preferences.embedding.clone(),
+            embedding_revision: preferences.embedding_revision,
         };
         self.store.save(&next)?;
         *preferences = next;
@@ -377,6 +406,8 @@ impl SourceService {
                 jev_revision: preferences.jev_revision,
                 text: preferences.text.clone(),
                 text_revision: preferences.text_revision,
+                embedding: preferences.embedding.clone(),
+                embedding_revision: preferences.embedding_revision,
             };
             self.store.save(&next)?;
             *preferences = next;
@@ -786,7 +817,10 @@ impl SourceService {
                     &relation.to_thread_id,
                     relation.kind,
                 );
-                let evidence_version = inferred::evidence_version(&relation.evidence)?;
+                let evidence_version = inferred::evidence_version(
+                    relation.evidence.as_ref(),
+                    &relation.input_version,
+                )?;
                 let review = reviews
                     .get(&relation.id)
                     .map(|(review, _)| review.clone())
@@ -814,10 +848,7 @@ impl SourceService {
                         .all(|id| {
                             *id == candidate.left_thread_id || *id == candidate.right_thread_id
                         })
-                        && candidate.evidence.pairs.contains(&relation.evidence)
                         && (0.0..=1.0).contains(&relation.confidence)
-                        && inferred::valid_evidence(self, project_id, &relation.evidence.left)?
-                        && inferred::valid_evidence(self, project_id, &relation.evidence.right)?
                 } else {
                     false
                 };
@@ -874,7 +905,8 @@ impl SourceService {
             }
             relation.id = relation_id.clone();
             relation.project_id = project_id.into();
-            let evidence_version = inferred::evidence_version(&relation.evidence)?;
+            let evidence_version =
+                inferred::evidence_version(relation.evidence.as_ref(), &relation.input_version)?;
             reviewed.insert(
                 relation_id,
                 ReviewedInferredRelation {
@@ -1091,7 +1123,7 @@ impl SourceService {
             if !relation.evidence_valid {
                 return Err(AppError {
                     code: ErrorCode::AnalysisInvalidResult,
-                    message: "关系证据已过期，请刷新并重新检查证据。".into(),
+                    message: "关系判断已过期，请刷新并重新检查会话来源。".into(),
                     retryable: true,
                     cache_preserved: true,
                     backend: "core".into(),
@@ -1146,6 +1178,17 @@ impl SourceService {
                 ))
             })
             .collect::<Result<_, AppError>>()?;
+        let candidate_expected: Vec<_> = sessions
+            .threads
+            .iter()
+            .map(|item| {
+                Ok((
+                    item.thread.id.clone(),
+                    item.thread.updated_at,
+                    self.sessions.history_generation(&item.thread.id)?,
+                ))
+            })
+            .collect::<Result<_, AppError>>()?;
         let mut hasher = Sha256::new();
         hasher.update(candidates::CANDIDATE_RULE_VERSION);
         hasher.update(facts::RULE_VERSION);
@@ -1153,7 +1196,52 @@ impl SourceService {
             serde_json::to_vec(sessions).map_err(|_| AppError::store("序列化候选输入失败。"))?,
         );
         hasher.update(
-            serde_json::to_vec(&expected).map_err(|_| AppError::store("序列化候选版本失败。"))?,
+            serde_json::to_vec(&candidate_expected)
+                .map_err(|_| AppError::store("序列化候选版本失败。"))?,
+        );
+        let preferences = self.store.load()?;
+        hasher.update(
+            serde_json::to_vec(&preferences.embedding)
+                .map_err(|_| AppError::store("序列化嵌入设置失败。"))?,
+        );
+        let semantic_vectors = self.sessions.semantic_vectors()?;
+        let vector_versions = semantic_vectors
+            .iter()
+            .map(|vector| {
+                (
+                    vector.thread_id.as_str(),
+                    vector.text_digest.as_str(),
+                    vector.base_url.as_str(),
+                    vector.requested_model.as_str(),
+                    vector.actual_model.as_str(),
+                    vector.indexed_at_unix_ms,
+                )
+            })
+            .collect::<Vec<_>>();
+        hasher.update(
+            serde_json::to_vec(&vector_versions)
+                .map_err(|_| AppError::store("序列化语义索引版本失败。"))?,
+        );
+        let summary_versions = sessions
+            .threads
+            .iter()
+            .map(|item| {
+                Ok((
+                    item.thread.id.clone(),
+                    self.sessions.summary(&item.thread.id)?.map(|summary| {
+                        (
+                            summary.input_digest,
+                            summary.model,
+                            summary.source_updated_at,
+                            summary.history_generation,
+                        )
+                    }),
+                ))
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
+        hasher.update(
+            serde_json::to_vec(&summary_versions)
+                .map_err(|_| AppError::store("序列化会话总结版本失败。"))?,
         );
         let input_version = format!("{:x}", hasher.finalize());
         if let Some(saved) = self.sessions.cached_automatic_candidate_view_if_current(
@@ -1174,13 +1262,187 @@ impl SourceService {
                     true,
                 )
             })?;
-        let mut result = candidates::build(&readable, material);
+        // Incomplete histories still contribute metadata cues; only source facts
+        // and excerpt pointers remain limited to the complete readable snapshot.
+        let mut result = candidates::build(sessions, material);
+        let local_ids: std::collections::HashSet<_> = sessions
+            .threads
+            .iter()
+            .map(|item| item.thread.id.clone())
+            .collect();
+        let global_topics = self.global_topic_view()?;
+        let mut semantic_pairs: std::collections::BTreeMap<(String, String), f64> =
+            std::collections::BTreeMap::new();
+        for item in &global_topics.threads {
+            if !local_ids.contains(&item.thread.id) {
+                continue;
+            }
+            for neighbor in &item.semantic_neighbors {
+                if !local_ids.contains(&neighbor.thread_id) || neighbor.thread_id == item.thread.id
+                {
+                    continue;
+                }
+                let (left, right) = if item.thread.id < neighbor.thread_id {
+                    (item.thread.id.clone(), neighbor.thread_id.clone())
+                } else {
+                    (neighbor.thread_id.clone(), item.thread.id.clone())
+                };
+                semantic_pairs
+                    .entry((left, right))
+                    .and_modify(|score| *score = score.max(neighbor.score))
+                    .or_insert(neighbor.score);
+            }
+        }
+        let mut semantic_pairs = semantic_pairs.into_iter().collect::<Vec<_>>();
+        semantic_pairs.sort_by(
+            |((left_a, right_a), score_a), ((left_b, right_b), score_b)| {
+                score_b
+                    .total_cmp(score_a)
+                    .then_with(|| (left_a, right_a).cmp(&(left_b, right_b)))
+            },
+        );
+        let mut pair_indices: std::collections::BTreeMap<(String, String), usize> = result
+            .0
+            .candidates
+            .iter()
+            .enumerate()
+            .map(|(index, pair)| {
+                (
+                    (pair.left_thread_id.clone(), pair.right_thread_id.clone()),
+                    index,
+                )
+            })
+            .collect();
+        let mut weak_degree: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for pair in &result.0.candidates {
+            let strong = pair
+                .reasons
+                .iter()
+                .any(|reason| reason.signal == "explicitReference" || reason.signal == "artifact");
+            if !strong {
+                *weak_degree.entry(pair.left_thread_id.clone()).or_default() += 1;
+                *weak_degree.entry(pair.right_thread_id.clone()).or_default() += 1;
+            }
+        }
+        for ((left, right), semantic_score) in semantic_pairs {
+            let score = (semantic_score * 100.0).round() as i32;
+            if let Some(index) = pair_indices.get(&(left.clone(), right.clone())).copied() {
+                let candidate = &mut result.0.candidates[index];
+                if !candidate
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.signal == "semantic")
+                {
+                    candidate.reasons.push(codexflow_domain::CandidateReason {
+                        signal: "semantic".into(),
+                        detail: format!(
+                            "全局语义索引近邻；余弦相似度按 14 天半衰期调整后得分 {:.3}。",
+                            semantic_score
+                        ),
+                    });
+                    candidate.score = candidate.score.saturating_add(score);
+                }
+                continue;
+            }
+            if weak_degree.get(&left).copied().unwrap_or(0) >= candidates::NEIGHBOR_LIMIT
+                || weak_degree.get(&right).copied().unwrap_or(0) >= candidates::NEIGHBOR_LIMIT
+            {
+                continue;
+            }
+            let digest = Sha256::digest(
+                format!("candidate\0{}\0{}\0{}", sessions.project.id, left, right).as_bytes(),
+            );
+            let id = format!("candidate:{digest:x}");
+            let index = result.0.candidates.len();
+            result
+                .0
+                .candidates
+                .push(codexflow_domain::RelationCandidate {
+                    id: id.clone(),
+                    left_thread_id: left.clone(),
+                    right_thread_id: right.clone(),
+                    score,
+                    reasons: vec![codexflow_domain::CandidateReason {
+                        signal: "semantic".into(),
+                        detail: format!(
+                            "全局语义索引近邻；余弦相似度按 14 天半衰期调整后得分 {:.3}。",
+                            semantic_score
+                        ),
+                    }],
+                    evidence: codexflow_domain::EvidenceSample {
+                        left_available: 0,
+                        right_available: 0,
+                        combinations_available: 0,
+                        combinations_shown: 0,
+                        left_sampled: 0,
+                        right_sampled: 0,
+                        sampling_rule: "语义候选不要求独立来源摘录；关系由 Jev 判断。".into(),
+                        pairs: Vec::new(),
+                    },
+                    left_summary: None,
+                    right_summary: None,
+                });
+            pair_indices.insert((left.clone(), right.clone()), index);
+            *weak_degree.entry(left).or_default() += 1;
+            *weak_degree.entry(right).or_default() += 1;
+        }
+        let mut summaries = std::collections::HashMap::new();
+        for item in &sessions.threads {
+            let Some(summary) = self.sessions.summary(&item.thread.id)? else {
+                continue;
+            };
+            if summary.source_updated_at != item.thread.updated_at
+                || summary.history_generation
+                    != self.sessions.history_generation(&item.thread.id)?
+            {
+                continue;
+            }
+            let generation = self.sessions.history_generation(&item.thread.id)?;
+            let artifact_summaries = if self.sessions.fact_index(&item.thread.id)?.is_some_and(
+                |(_, rule, indexed_generation)| {
+                    rule == facts::RULE_VERSION && indexed_generation == generation
+                },
+            ) {
+                self.sessions
+                    .facts(&item.thread.id, 0, 100)?
+                    .facts
+                    .into_iter()
+                    .filter(|fact| fact.kind == codexflow_domain::FactKind::Artifact)
+                    .map(|fact| {
+                        format!(
+                            "{}；操作 {}；结果 {:?}",
+                            fact.subject, fact.operation, fact.outcome
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("；")
+            } else {
+                String::new()
+            };
+            let summary_text = format!(
+                "目标：{}\n活动：{}\n结果：{}\n决定：{}\n问题：{}\n产物摘要：{}",
+                summary.content.goal,
+                summary.content.activity,
+                summary.content.outcome,
+                summary.content.decisions,
+                summary.content.issues,
+                artifact_summaries,
+            );
+            summaries.insert(item.thread.id.clone(), summary_text);
+        }
+        for candidate in &mut result.0.candidates {
+            candidate.left_summary = summaries.get(&candidate.left_thread_id).cloned();
+            candidate.right_summary = summaries.get(&candidate.right_thread_id).cloned();
+        }
+        result.0.candidate_count = result.0.candidates.len() as u64;
+        result.0.thread_count = sessions.threads.len() as u64;
         result.0.input_version = input_version;
         result.0.unavailable_threads = (sessions.threads.len() - readable.threads.len()) as u64;
         for candidate in &result.0.candidates {
             result.0.candidate_versions.insert(
                 candidate.id.clone(),
-                inferred::candidate_version_at(candidate, &expected)?,
+                inferred::candidate_version_at(candidate, &candidate_expected)?,
             );
         }
         let analyzed: std::collections::HashSet<_> = self
@@ -3775,16 +4037,18 @@ mod tests {
             requested_model: "jev-1.13.0".into(),
             actual_model: "jev-1.13.0".into(),
             confidence: 0.8,
+            execution_stage: codexflow_domain::ExecutionStage::Unknown,
+            execution_outcome: codexflow_domain::ExecutionOutcome::Unknown,
             probabilities: Default::default(),
             evidence_confidence: 0.8,
             evidence_probabilities: Default::default(),
             evidence_options: Vec::new(),
             selected_evidence_option: None,
-            evidence: EvidencePair {
+            evidence: Some(EvidencePair {
                 id: "pair".into(),
                 left: candidate_evidence("a"),
                 right: candidate_evidence("b"),
-            },
+            }),
             time_check: CausalTimeCheck::Unverifiable,
             explanation: "合成关系".into(),
             input_version: "synthetic-v1".into(),

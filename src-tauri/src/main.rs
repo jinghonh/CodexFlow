@@ -1,11 +1,12 @@
 use codexflow_core::{ProjectThreadQuery, ProjectThreadQueryResult, SourceService};
 use codexflow_domain::{
     AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisStageSelection, AppError,
-    CandidatePreview, DisplayTheme, EvidenceCheck, EvidencePage, FactPage, HistoryCoverage,
-    HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, JevConnectionResult,
-    JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph, ProjectSessions, ProjectTimeline,
-    ProjectWorkstreams, RelationReview, SessionList, SourceStatus, SummaryEvidenceCheck,
-    SummaryPreview, SummaryRun, TextStatus, TextValidation, UserRelationDecision,
+    CandidatePreview, DisplayTheme, EmbeddingStatus, EmbeddingValidation, EvidenceCheck,
+    EvidencePage, FactPage, GlobalTopicView, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
+    HistoryTurnPage, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
+    ProjectGraph, ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview,
+    SemanticIndexResult, SessionList, SourceStatus, SummaryEvidenceCheck, SummaryPreview,
+    SummaryRun, TextStatus, TextValidation, UserRelationDecision,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -181,6 +182,103 @@ async fn validate_text_settings(
 #[tauri::command]
 async fn cancel_text_request(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
     service(&state)?.cancel_text_request().await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn get_embedding_status(
+    state: tauri::State<'_, AppState>,
+) -> Result<EmbeddingStatus, AppError> {
+    Ok(service(&state)?.embedding_status().await)
+}
+
+#[tauri::command]
+async fn save_embedding_settings(
+    state: tauri::State<'_, AppState>,
+    base_url: String,
+    model: String,
+    api_key: Option<String>,
+) -> Result<EmbeddingStatus, AppError> {
+    service(&state)?
+        .save_embedding(base_url, model, api_key)
+        .await
+}
+
+#[tauri::command]
+async fn delete_embedding_credential(
+    state: tauri::State<'_, AppState>,
+) -> Result<EmbeddingStatus, AppError> {
+    service(&state)?.delete_embedding_credential().await
+}
+
+#[tauri::command]
+async fn test_embedding_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<EmbeddingValidation, AppError> {
+    service(&state)?.test_embedding().await
+}
+
+#[tauri::command]
+async fn cancel_embedding_request(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    service(&state)?.cancel_embedding_request().await;
+    Ok(())
+}
+
+#[tauri::command]
+fn get_global_topic_view(state: tauri::State<'_, AppState>) -> Result<GlobalTopicView, AppError> {
+    service(&state)?.global_topic_view()
+}
+
+#[tauri::command]
+async fn create_topic_label(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    description: String,
+) -> Result<GlobalTopicView, AppError> {
+    service(&state)?.create_topic_label(name, description).await
+}
+
+#[tauri::command]
+async fn update_topic_label(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    name: String,
+    description: String,
+) -> Result<GlobalTopicView, AppError> {
+    service(&state)?
+        .update_topic_label(id, name, description)
+        .await
+}
+
+#[tauri::command]
+async fn delete_topic_label(
+    state: tauri::State<'_, AppState>,
+    id: String,
+) -> Result<GlobalTopicView, AppError> {
+    service(&state)?.delete_topic_label(&id).await
+}
+
+#[tauri::command]
+async fn set_thread_topic(
+    state: tauri::State<'_, AppState>,
+    thread_id: String,
+    topic_id: Option<String>,
+) -> Result<GlobalTopicView, AppError> {
+    service(&state)?
+        .set_thread_topic(&thread_id, topic_id)
+        .await
+}
+
+#[tauri::command]
+async fn rebuild_global_semantic_index(
+    state: tauri::State<'_, AppState>,
+) -> Result<SemanticIndexResult, AppError> {
+    service(&state)?.rebuild_global_semantic_index().await
+}
+
+#[tauri::command]
+async fn cancel_semantic_index(state: tauri::State<'_, AppState>) -> Result<(), AppError> {
+    service(&state)?.cancel_semantic_index().await;
     Ok(())
 }
 
@@ -597,6 +695,18 @@ fn main() {
             delete_text_credential,
             validate_text_settings,
             cancel_text_request,
+            get_embedding_status,
+            save_embedding_settings,
+            delete_embedding_credential,
+            test_embedding_settings,
+            cancel_embedding_request,
+            get_global_topic_view,
+            create_topic_label,
+            update_topic_label,
+            delete_topic_label,
+            set_thread_topic,
+            rebuild_global_semantic_index,
+            cancel_semantic_index,
             get_session_list,
             load_thread_history,
             get_summary_preview,

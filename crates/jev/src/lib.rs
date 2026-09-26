@@ -90,6 +90,12 @@ pub fn system_text_credentials() -> Arc<dyn CredentialStore> {
     })
 }
 
+pub fn system_embedding_credentials() -> Arc<dyn CredentialStore> {
+    Arc::new(SystemCredentialStore {
+        service: credential_service(b"dev.codexflow.desktop.embedding"),
+    })
+}
+
 pub struct SystemCredentialStore {
     service: Vec<u8>,
 }

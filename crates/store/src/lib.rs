@@ -3,9 +3,9 @@ use codexflow_domain::{
     DerivedRelation, EvidencePage, FactPage, HistoryCoverage, HistoryItem, HistoryItemLocation,
     HistoryItemPage, HistorySnapshot, HistoryTurn, HistoryTurnPage, IndexRun, IndexRunState,
     InferredPairOutcome, InferredRelation, ListScopeStatus, LocalProject, ObservedRelation,
-    Preferences, ProjectCatalog, ProjectSessions, RelationReview, SessionList, SourceEvidence,
-    SourceFact, SummaryRun, SummaryRunState, ThreadAttribution, ThreadMetadata, ThreadSummary,
-    UserRelationDecision, Workstream,
+    Preferences, ProjectCatalog, ProjectSessions, RelationReview, SemanticVector, SessionList,
+    SourceEvidence, SourceFact, SummaryRun, SummaryRunState, ThreadAttribution, ThreadMetadata,
+    ThreadSummary, ThreadTopicAssignment, TopicLabel, UserRelationDecision, Workstream,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::{
@@ -20,7 +20,7 @@ pub struct PreferenceStore {
     legacy_path: PathBuf,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 15;
+const SESSION_SCHEMA_VERSION: i64 = 16;
 
 pub struct SessionStore {
     path: PathBuf,
@@ -581,6 +581,29 @@ impl SessionStore {
                 PRAGMA user_version = 15;",
                 )
                 .map_err(|_| AppError::migration("迁移应用设置数据库失败，原数据已保留。"))?;
+        }
+        if version < 16 {
+            migration
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS semantic_vectors (
+                        thread_id TEXT PRIMARY KEY NOT NULL,
+                        vector_json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS topic_labels (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                        label_json TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS thread_topics (
+                        thread_id TEXT PRIMARY KEY NOT NULL,
+                        project_id TEXT NOT NULL,
+                        topic_id TEXT,
+                        assignment_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS thread_topics_topic ON thread_topics(topic_id);
+                    PRAGMA user_version = 16;",
+                )
+                .map_err(|_| AppError::migration("迁移语义索引与主题数据库失败，原数据已保留。"))?;
         }
         migration
             .commit()
@@ -1262,6 +1285,233 @@ impl SessionStore {
         .map_err(|_| AppError::store("保存会话总结失败，旧总结已保留。"))?;
         tx.commit()
             .map_err(|_| AppError::store("提交会话总结失败，旧总结已保留。"))?;
+        Ok(true)
+    }
+
+    pub fn semantic_vectors(&self) -> Result<Vec<SemanticVector>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT vector_json FROM semantic_vectors ORDER BY thread_id")
+            .map_err(|_| AppError::store("读取语义索引失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询语义索引失败。"))?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| AppError::store("读取语义索引失败。"))?)
+                .map_err(|_| AppError::store("语义索引内容损坏。"))
+        })
+        .collect()
+    }
+
+    pub fn save_semantic_vector_if_current(
+        &self,
+        vector: &SemanticVector,
+    ) -> Result<bool, AppError> {
+        if vector.thread_id.trim().is_empty()
+            || vector.text_digest.trim().is_empty()
+            || vector.actual_model.trim().is_empty()
+            || vector.values.is_empty()
+            || vector.values.len() > 16_384
+            || vector.values.iter().any(|value| !value.is_finite())
+        {
+            return Err(AppError::store("语义向量未通过本地校验。"));
+        }
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始保存语义索引失败。"))?;
+        let metadata: Option<String> = tx
+            .query_row(
+                "SELECT metadata_json FROM threads WHERE id=?1",
+                [&vector.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查语义索引来源失败。"))?;
+        let generation: Option<i64> = tx
+            .query_row(
+                "SELECT generation FROM history_revisions WHERE thread_id=?1",
+                [&vector.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查语义索引来源版本失败。"))?;
+        let current = metadata
+            .and_then(|json| serde_json::from_str::<ThreadMetadata>(&json).ok())
+            .is_some_and(|thread| thread.updated_at == vector.source_updated_at)
+            && generation.unwrap_or(0) == vector.history_generation;
+        if !current {
+            return Ok(false);
+        }
+        let json =
+            serde_json::to_string(vector).map_err(|_| AppError::store("序列化语义向量失败。"))?;
+        tx.execute(
+            "INSERT INTO semantic_vectors(thread_id,vector_json) VALUES (?1,?2)
+             ON CONFLICT(thread_id) DO UPDATE SET vector_json=excluded.vector_json",
+            params![vector.thread_id, json],
+        )
+        .map_err(|_| AppError::store("保存语义向量失败，旧向量已保留。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交语义向量失败，旧向量已保留。"))?;
+        Ok(true)
+    }
+
+    pub fn topic_labels(&self) -> Result<Vec<TopicLabel>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT label_json FROM topic_labels ORDER BY name COLLATE NOCASE, id")
+            .map_err(|_| AppError::store("读取主题词表失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询主题词表失败。"))?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| AppError::store("读取主题词表失败。"))?)
+                .map_err(|_| AppError::store("主题词表内容损坏。"))
+        })
+        .collect()
+    }
+
+    pub fn save_topic_label(&self, label: &TopicLabel) -> Result<(), AppError> {
+        let json =
+            serde_json::to_string(label).map_err(|_| AppError::store("序列化主题标签失败。"))?;
+        self.connection()?
+            .execute(
+                "INSERT INTO topic_labels(id,name,label_json) VALUES (?1,?2,?3)
+                 ON CONFLICT(id) DO UPDATE SET name=excluded.name,label_json=excluded.label_json",
+                params![label.id, label.name, json],
+            )
+            .map_err(|_| AppError::store("保存主题标签失败；名称可能已存在。"))?;
+        Ok(())
+    }
+
+    pub fn delete_topic_label(&self, topic_id: &str) -> Result<(), AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始删除主题失败。"))?;
+        let mut query = tx
+            .prepare("SELECT thread_id,assignment_json FROM thread_topics")
+            .map_err(|_| AppError::store("查询主题成员失败。"))?;
+        let entries = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| AppError::store("查询主题成员失败。"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AppError::store("读取主题成员失败。"))?;
+        drop(query);
+        for (thread_id, json) in entries {
+            let mut assignment: ThreadTopicAssignment =
+                serde_json::from_str(&json).map_err(|_| AppError::store("主题归属内容损坏。"))?;
+            if assignment.topic_id.as_deref() != Some(topic_id)
+                && assignment.suggested_topic_id.as_deref() != Some(topic_id)
+            {
+                continue;
+            }
+            if !assignment.manual {
+                tx.execute("DELETE FROM thread_topics WHERE thread_id=?1", [&thread_id])
+                    .map_err(|_| AppError::store("清除已删除主题的自动归属失败。"))?;
+                continue;
+            }
+            if assignment.topic_id.as_deref() == Some(topic_id) {
+                assignment.topic_id = None;
+            }
+            if assignment.suggested_topic_id.as_deref() == Some(topic_id) {
+                assignment.suggested_topic_id = None;
+            }
+            let json = serde_json::to_string(&assignment)
+                .map_err(|_| AppError::store("序列化主题归属失败。"))?;
+            tx.execute(
+                "UPDATE thread_topics SET topic_id=?2,assignment_json=?3 WHERE thread_id=?1",
+                params![thread_id, assignment.topic_id, json],
+            )
+            .map_err(|_| AppError::store("更新主题成员失败。"))?;
+        }
+        tx.execute("DELETE FROM topic_labels WHERE id=?1", [topic_id])
+            .map_err(|_| AppError::store("删除主题失败。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交主题删除失败。"))
+    }
+
+    pub fn topic_assignments(&self) -> Result<Vec<ThreadTopicAssignment>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT assignment_json FROM thread_topics ORDER BY project_id,thread_id")
+            .map_err(|_| AppError::store("读取主题归属失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询主题归属失败。"))?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| AppError::store("读取主题归属失败。"))?)
+                .map_err(|_| AppError::store("主题归属内容损坏。"))
+        })
+        .collect()
+    }
+
+    pub fn save_topic_assignment(
+        &self,
+        assignment: &ThreadTopicAssignment,
+        preserve_manual: bool,
+    ) -> Result<bool, AppError> {
+        let mut connection = self.connection()?;
+        let tx = connection
+            .transaction()
+            .map_err(|_| AppError::store("开始保存主题归属失败。"))?;
+        let owner: Option<Option<String>> = tx
+            .query_row(
+                "SELECT project_id FROM thread_attributions WHERE thread_id=?1",
+                [&assignment.thread_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("检查主题会话项目归属失败。"))?;
+        if owner.flatten().as_deref() != Some(assignment.project_id.as_str()) {
+            return Ok(false);
+        }
+        for topic_id in [
+            assignment.topic_id.as_deref(),
+            assignment.suggested_topic_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let exists: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM topic_labels WHERE id=?1)",
+                    [topic_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| AppError::store("验证主题标签失败。"))?;
+            if !exists {
+                return Err(AppError::store("主题标签不存在。"));
+            }
+        }
+        if preserve_manual {
+            let old: Option<String> = tx
+                .query_row(
+                    "SELECT assignment_json FROM thread_topics WHERE thread_id=?1",
+                    [&assignment.thread_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|_| AppError::store("读取原主题归属失败。"))?;
+            if old
+                .and_then(|json| serde_json::from_str::<ThreadTopicAssignment>(&json).ok())
+                .is_some_and(|value| value.manual)
+            {
+                return Ok(false);
+            }
+        }
+        let json = serde_json::to_string(assignment)
+            .map_err(|_| AppError::store("序列化主题归属失败。"))?;
+        tx.execute(
+            "INSERT INTO thread_topics(thread_id,project_id,topic_id,assignment_json) VALUES (?1,?2,?3,?4)
+             ON CONFLICT(thread_id) DO UPDATE SET project_id=excluded.project_id,topic_id=excluded.topic_id,assignment_json=excluded.assignment_json",
+            params![assignment.thread_id, assignment.project_id, assignment.topic_id, json],
+        )
+        .map_err(|_| AppError::store("保存主题归属失败。"))?;
+        tx.commit()
+            .map_err(|_| AppError::store("提交主题归属失败。"))?;
         Ok(true)
     }
 
@@ -3267,6 +3517,8 @@ mod tests {
                 jev_revision: 0,
                 text: Default::default(),
                 text_revision: 0,
+                embedding: Default::default(),
+                embedding_revision: 0,
             })
             .unwrap();
         let loaded = PreferenceStore::new(dir.clone()).load().unwrap();
@@ -3293,6 +3545,8 @@ mod tests {
             jev_revision: 3,
             text: Default::default(),
             text_revision: 0,
+            embedding: Default::default(),
+            embedding_revision: 0,
         };
         fs::write(
             dir.join("preferences.json"),

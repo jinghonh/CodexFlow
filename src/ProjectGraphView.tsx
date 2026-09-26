@@ -21,10 +21,12 @@ type EvidenceOption = { key: string; pair: { id: string; left: Evidence; right: 
 type DerivedRelation = { id: string; projectId: string; fromThreadId: string; toThreadId: string;
   kind: "SHARED_FILE" | "SHARED_ARTIFACT" | "EXPLICIT_REFERENCE"; source: "derived"; basis: string; evidence: Evidence[] };
 type InferredRelation = { id: string; projectId: string; candidateId: string; fromThreadId: string; toThreadId: string;
-  kind: "CONTINUES" | "IMPLEMENTS" | "FIXES" | "VALIDATES" | "INVESTIGATES" | "ALTERNATIVE_TO" | "SUPERSEDES" | "MOTIVATED_BY" | "RELATED";
+  kind: "CONTINUES" | "IMPLEMENTS" | "FIXES" | "VALIDATES" | "INVESTIGATES" | "DEPENDS_ON" | "MODIFIES" | "REVIEWS" | "HANDOFF_TO" | "ALTERNATIVE_TO" | "SUPERSEDES" | "MOTIVATED_BY" | "RELATED";
   source: "jev"; requestedModel: string; actualModel: string; confidence: number; probabilities: Record<string, number>;
+  executionStage?: "planned" | "started" | "completed" | "unknown";
+  executionOutcome?: "successful" | "blocked" | "failed" | "unknown";
   evidenceConfidence: number; evidenceProbabilities: Record<string, number>; evidenceOptions?: EvidenceOption[];
-  selectedEvidenceOption?: string | null; evidence: { id: string; left: Evidence; right: Evidence };
+  selectedEvidenceOption?: string | null; evidence?: { id: string; left: Evidence; right: Evidence } | null;
   timeCheck: "verified" | "unverifiable"; explanation: string; inputVersion: string };
 type RelationReview = { relationId: string; projectId: string; decision: "pending" | "confirmed" | "rejected";
   revision: number; confirmedEvidenceVersion: string | null };
@@ -53,7 +55,14 @@ const sourceText: Record<Relation["source"], string> = { observed: "观察" };
 const derivedText: Record<DerivedRelation["kind"], string> = { SHARED_FILE: "共同文件", SHARED_ARTIFACT: "共同产物", EXPLICIT_REFERENCE: "明确引用" };
 const inferredText: Record<InferredRelation["kind"], string> = {
   CONTINUES: "延续", IMPLEMENTS: "落实", FIXES: "修复", VALIDATES: "验证", INVESTIGATES: "调查",
+  DEPENDS_ON: "依赖", MODIFIES: "修改", REVIEWS: "评审", HANDOFF_TO: "交接",
   ALTERNATIVE_TO: "替代方案", SUPERSEDES: "取代", MOTIVATED_BY: "促成", RELATED: "相关",
+};
+const executionStageText: Record<NonNullable<InferredRelation["executionStage"]>, string> = {
+  planned: "计划中", started: "已开始", completed: "已完成", unknown: "未知",
+};
+const executionOutcomeText: Record<NonNullable<InferredRelation["executionOutcome"]>, string> = {
+  successful: "成功", blocked: "受阻", failed: "失败", unknown: "未知",
 };
 
 function reviewedRelations(graph: ProjectGraph): ReviewedRelation[] {
@@ -73,17 +82,17 @@ function visibleInferred(graph: ProjectGraph, minimumConfidence: number): Inferr
   return (graph.inferredRelations ?? []).filter((relation) => {
     const reviewed = byId.get(relation.id);
     return reviewed?.review.decision !== "rejected" && (!reviewed || reviewed.evidenceValid)
-      && (relation.confidence >= minimumConfidence || (minimumConfidence === 0.7 && reviewed && confirmedWithCurrentEvidence(reviewed)));
+      && relation.confidence >= minimumConfidence;
   });
 }
 
 function reviewStatus(relation: ReviewedRelation): string {
   if (relation.review.decision === "rejected") return "已拒绝";
   if (relation.review.decision === "confirmed") {
-    if (!relation.evidenceValid) return "已确认；当前关系未验证或证据已过期";
-    return confirmedWithCurrentEvidence(relation) ? "已确认" : "已确认；当前证据尚未确认";
+    if (!relation.evidenceValid) return "已确认；当前判断版本未验证";
+    return confirmedWithCurrentEvidence(relation) ? "已确认" : "已确认；当前判断版本尚未确认";
   }
-  return relation.evidenceValid ? "待裁决" : "当前关系未验证或证据已过期";
+  return relation.evidenceValid ? "待裁决" : "当前判断版本未验证";
 }
 
 function probabilityLabel(key: string, evidence = false): string {
@@ -293,7 +302,7 @@ async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{
   return { nodes, edges: graphEdges(graph), warning };
 }
 
-export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, selectedThreadId = null, onSelectThread, visibleThreadIds, relationSource = "all", onRelationSourceChange, relationKind = "all", onRelationKindChange, minimumConfidence = 0.7, onMinimumConfidenceChange, renderSessionInspector, onOpenFullHistory, onGraphChanged }: { projectId: string; refreshVersion: number;
+export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, selectedThreadId = null, onSelectThread, visibleThreadIds, relationSource = "all", onRelationSourceChange, relationKind = "all", onRelationKindChange, minimumConfidence = 0, onMinimumConfidenceChange, renderSessionInspector, onOpenFullHistory, onGraphChanged }: { projectId: string; refreshVersion: number;
   onSelectEvidence?: (evidence: EvidenceReference) => void; selectedThreadId?: string | null; onSelectThread?: (id: string) => void;
   visibleThreadIds?: Set<string>; relationSource?: string; onRelationSourceChange?: (value: string) => void;
   relationKind?: string; onRelationKindChange?: (value: string) => void; minimumConfidence?: number; onMinimumConfidenceChange?: (value: number) => void;
@@ -401,8 +410,8 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
     const node = graph.nodes.find((item) => item.id === current.id);
     return node ? { type: "node" as const, node } : null;
   }, [graph, selection, selectedThreadId]);
-  const selectedEvidenceIsMapped = detail?.type === "inferred"
-    && (detail.relation.evidenceOptions ?? []).some((option) => option.pair.id === detail.relation.evidence.id);
+  const selectedEvidenceIsMapped = detail?.type === "inferred" && !!detail.relation.evidence
+    && (detail.relation.evidenceOptions ?? []).some((option) => option.pair.id === detail.relation.evidence?.id);
 
   function selectSource(evidence: EvidenceReference) {
     selectSession(evidence.threadId);
@@ -457,13 +466,12 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   return <section id="relations" className="panel graph-panel">
     <div className="panel-kicker">审查 / 项目关系</div>
     <h2>{graph?.project.name ?? "项目关系"}</h2>
-    <p className="panel-intro">沿关系查看项目中的会话脉络。选择一条关系，可依次核对模型判断、双方证据和会话来源。</p>
+    <p className="panel-intro">沿关系查看项目中的会话脉络。规则信号只用于召回候选；工作流依据 Jev 已判断的具体关系和执行阶段形成。</p>
     {error && <div className="page-error" role="alert">{error}</div>}
     {!graph && !error && <p className="empty-list">正在读取项目关系图…</p>}
     {graph && <>
-      <div className="graph-summary"><strong>{visibleNodes.filter((node) => !node.data.referenceOnly).length} 条可见会话</strong><span>{visibleEdges.length} 条可见关系</span><span>{graph.relations.length} 条观察关系</span><span>{graph.derivedRelations?.length ?? 0} 条规则关系</span><span>{visibleInferred(graph, 0.7).length} 条默认显示的推断关系</span></div>
-      <div className="explorer-filters" aria-label="关系过滤"><label>来源类别<select aria-label="按来源类别过滤关系" value={relationSource} onChange={(event) => onRelationSourceChange?.(event.target.value)}><option value="all">全部</option><option value="observed">观察</option><option value="derived">规则</option><option value="inferred">推断</option></select></label><label>关系类型<select aria-label="按关系类型过滤" value={relationKind} onChange={(event) => onRelationKindChange?.(event.target.value)}><option value="all">全部类型</option>{[...new Set([...graph.relations, ...(graph.derivedRelations ?? []), ...(graph.inferredRelations ?? [])].map((item) => item.kind))].sort().map((kind) => <option value={kind} key={kind}>{kind}</option>)}</select></label><label>最低置信度<select aria-label="最低关系置信度" value={threshold} onChange={(event) => changeThreshold(Number(event.target.value))}><option value={0}>全部</option><option value={0.5}>0.50</option><option value={0.7}>0.70（默认）</option><option value={0.9}>0.90</option></select></label></div>
-      <label className="graph-confidence-toggle"><input type="checkbox" checked={threshold < 0.7} onChange={(event) => changeThreshold(event.target.checked ? 0 : 0.7)} />查看低于 0.70 的推断关系（{(graph.inferredRelations ?? []).filter((item) => item.confidence < 0.70).length}）</label>
+      <div className="graph-summary"><strong>{visibleNodes.filter((node) => !node.data.referenceOnly).length} 条可见会话</strong><span>{visibleEdges.length} 条可见关系</span><span>{graph.relations.length} 条观察关系</span><span>{graph.derivedRelations?.length ?? 0} 条候选信号</span><span>{visibleInferred(graph, threshold).length} 条符合当前置信度条件的推断关系</span></div>
+      <div className="explorer-filters" aria-label="关系过滤"><label>来源类别<select aria-label="按来源类别过滤关系" value={relationSource} onChange={(event) => onRelationSourceChange?.(event.target.value)}><option value="all">全部</option><option value="observed">观察</option><option value="derived">候选信号</option><option value="inferred">推断</option></select></label><label>关系类型<select aria-label="按关系类型过滤" value={relationKind} onChange={(event) => onRelationKindChange?.(event.target.value)}><option value="all">全部类型</option>{[...new Set([...graph.relations, ...(graph.derivedRelations ?? []), ...(graph.inferredRelations ?? [])].map((item) => item.kind))].sort().map((kind) => <option value={kind} key={kind}>{kind}</option>)}</select></label><label>最低关系置信度<select aria-label="最低关系置信度" value={threshold} onChange={(event) => changeThreshold(Number(event.target.value))}><option value={0}>全部</option><option value={0.5}>0.50</option><option value={0.7}>0.70</option><option value={0.9}>0.90</option></select></label></div>
       {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid).length > 0 &&
         <div className="graph-review-list"><strong>已拒绝或过期的推断关系</strong>
           {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid)
@@ -471,7 +479,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
               {inferredText[relation.kind]} · {reviewStatus(relation)} · {relation.staleReason ?? "可查看旧证据"} · {relation.fromThreadId} ↔ {relation.toThreadId}
             </button>)}
         </div>}
-      {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}，证据不足 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "insufficientEvidence").length}；这些结果不生成图边。</p>}
+      {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}；只有 Jev 支持的具体关系才形成图边。</p>}
       <button className="browse-button" onClick={() => void refreshGraph()}>自动布局</button>
       <p className="graph-layout-status" role="status">{layoutPending ? "正在布局关系图…" : "关系图布局完成"}</p>
       {layout.warning && <div className="graph-layout-warning" role="status">{layout.warning}</div>}
@@ -498,24 +506,24 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
         </> : <>
         {!detail && <div className="inspector-empty"><span>选择一个节点或关系</span><p>关系判断、证据和会话详情会在这里连续展开。</p></div>}
         {detail?.type === "node" && <><h3>{detail.node.referenceOnly ? "仅有引用的端点" : "会话"}</h3><strong>{detail.node.referenceOnly ? detail.node.title ?? detail.node.id : threadDisplayTitle({ title: detail.node.title, sourceKind: detail.node.sourceKind ?? "" })}</strong><code>{detail.node.id}</code>{detail.node.referenceOnly && <p>来源记录了此会话 ID，当前项目图没有可展示的会话内容。</p>}</>}
-        {detail?.type === "derived" && <><h3>规则关系 · {derivedText[detail.relation.kind]}</h3>
+        {detail?.type === "derived" && <><h3>候选信号 · {derivedText[detail.relation.kind]}</h3>
           <p><code>{detail.relation.fromThreadId}</code> ↔ <code>{detail.relation.toThreadId}</code></p>
-          <p>{detail.relation.basis}</p><p>这是来源事实计算结果，不是模型判断或概率。</p>
+          <p>{detail.relation.basis}</p><p>这是关系召回线索，仅表示值得检查，不直接决定工作流归属。</p>
           {detail.relation.evidence.map((evidence) => <div key={evidence.id} className="graph-proof">
             <blockquote>{evidence.excerpt}</blockquote><small>会话 {evidence.threadId} · 回合 {evidence.turnId} · 条目 {evidence.itemId} · 内容版本 {evidence.contentVersion.slice(0, 12)}</small>
             <button className="browse-button" onClick={() => selectSource(evidence)}>在会话中查看</button>
           </div>)}
         </>}
         {detail?.type === "inferred" && <><div className="inspector-kicker">模型推断 · {detail.relation.actualModel}</div><h3>{inferredText[detail.relation.kind]}</h3>
-          <div className="inspector-status-row"><span className={detail.relation.evidenceValid ? "state-pill valid" : "state-pill stale"}>{detail.relation.evidenceValid ? "当前分析有效" : "历史结果 · 证据已变化"}</span><span className="state-pill neutral">{reviewStatus(detail.relation)}</span></div>
-          {!detail.relation.evidenceValid && <><p>{detail.relation.staleReason ?? "来源证据已变化；下方保留当时的分析与证据快照。"}</p><button className="browse-button" onClick={() => document.getElementById("project-analysis")?.scrollIntoView({ behavior: "smooth" })}>前往重新分析</button></>}
+          <div className="inspector-status-row"><span className={detail.relation.evidenceValid ? "state-pill valid" : "state-pill stale"}>{detail.relation.evidenceValid ? "当前判断有效" : "历史结果 · 候选或配置已变化"}</span><span className="state-pill neutral">{reviewStatus(detail.relation)}</span></div>
+          {!detail.relation.evidenceValid && <><p>{detail.relation.staleReason ?? "候选输入或模型设置已变化；下方保留当时的结构化判断。"}</p><button className="browse-button" onClick={() => document.getElementById("project-analysis")?.scrollIntoView({ behavior: "smooth" })}>前往重新分析</button></>}
           <p className="inspector-endpoints"><code>{detail.relation.fromThreadId}</code><span>{["RELATED", "ALTERNATIVE_TO"].includes(detail.relation.kind) ? "↔" : "→"}</span><code>{detail.relation.toThreadId}</code></p>
           <p className="inspector-explanation">{detail.relation.explanation}</p>
-          <div className="judgment-metrics"><div><span>关系置信度</span><strong>{(detail.relation.confidence * 100).toFixed(1)}%</strong></div><div><span>证据选择置信度</span><strong>{(detail.relation.evidenceConfidence * 100).toFixed(1)}%</strong></div></div>
+          <div className="judgment-metrics"><div><span>关系判断置信度</span><strong>{(detail.relation.confidence * 100).toFixed(1)}%</strong></div><div><span>执行阶段</span><strong>{executionStageText[detail.relation.executionStage ?? "unknown"]}</strong></div><div><span>执行结果</span><strong>{executionOutcomeText[detail.relation.executionOutcome ?? "unknown"]}</strong></div></div>
           <ProbabilityTable title="关系选项概率" probabilities={detail.relation.probabilities} onSelectEvidence={selectSource} />
-          <ProbabilityTable title="证据选项概率" evidence probabilities={detail.relation.evidenceProbabilities}
-            options={detail.relation.evidenceOptions} selectedOption={detail.relation.selectedEvidenceOption} onSelectEvidence={selectSource} />
-          {!selectedEvidenceIsMapped && <div className="selected-evidence-snapshot">
+          {detail.relation.evidence && <ProbabilityTable title="历史证据选项概率" evidence probabilities={detail.relation.evidenceProbabilities}
+            options={detail.relation.evidenceOptions} selectedOption={detail.relation.selectedEvidenceOption} onSelectEvidence={selectSource} />}
+          {detail.relation.evidence && !selectedEvidenceIsMapped && <div className="selected-evidence-snapshot">
             <div><strong>已选证据快照</strong><span>{detail.relation.selectedEvidenceOption ? `选项 ${detail.relation.selectedEvidenceOption}` : "历史选项映射缺失"}</span></div>
             {[detail.relation.evidence.left, detail.relation.evidence.right].map((item, index) => <article key={item.id}>
               <strong>{index === 0 ? "左侧证据" : "右侧证据"}</strong><blockquote>{item.excerpt}</blockquote>
@@ -523,7 +531,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
               <button className="plain-button" onClick={() => selectSource(item)}>在会话中查看</button>
             </article>)}
           </div>}
-          <div className="inspector-facts"><span>时间核对</span><strong>{["RELATED", "ALTERNATIVE_TO"].includes(detail.relation.kind) ? "无向关系不检查顺序" : detail.relation.timeCheck === "verified" ? "前后顺序已由证据回合验证" : "来源时间不足，无法验证顺序"}</strong><span>修订号</span><strong>{detail.relation.review.revision}</strong></div>
+          <div className="inspector-facts"><span>判断输入</span><strong>双方当前可用的会话总结和候选线索；来源摘录不单独验真</strong><span>修订号</span><strong>{detail.relation.review.revision}</strong></div>
           {decisionError && <div className="page-error" role="alert">{decisionError}<button className="browse-button" onClick={refreshGraph}>刷新关系图</button></div>}
           <div className="graph-review-actions">
             <button className="primary-button" disabled={savingDecision || !detail.relation.evidenceValid || confirmedWithCurrentEvidence(detail.relation)} onClick={() => decide(detail.relation, "confirmed")}>确认关系</button>
@@ -539,10 +547,6 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
         </>}
       </aside>
       </div>
-      {(graph.diagnostics.length > 0 || graph.relations.some((item) => item.parentEndpoint !== "inProject")) && <div className="graph-diagnostics"><strong>来源诊断</strong>
-        {graph.relations.filter((item) => item.parentEndpoint !== "inProject").map((item) => <p key={item.id}><code>{item.toThreadId}</code> 的 <code>{item.sourceField}</code> 指向 <code>{item.fromThreadId}</code>：{endpointText[item.parentEndpoint]}</p>)}
-        {graph.diagnostics.map((item) => <p key={`${item.threadId}:${item.sourceField}`}><code>{item.threadId}</code> 的 <code>{item.sourceField}</code>：{item.message}</p>)}
-      </div>}
     </>}
   </section>;
 }

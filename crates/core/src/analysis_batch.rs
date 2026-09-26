@@ -45,7 +45,7 @@ enum JevUnitResult {
     Evidence(codexflow_domain::JevEvidenceSelection),
 }
 
-fn pinned_jev_model(model: &str) -> bool {
+pub(super) fn pinned_jev_model(model: &str) -> bool {
     model.strip_prefix("jev-").is_some_and(|version| {
         let (base, suffix) = version
             .split_once('-')
@@ -290,13 +290,26 @@ impl SourceService {
             .iter()
             .filter(|item| stream.relation_ids.contains(&item.relation.id))
         {
+            let source_note = relation
+                .relation
+                .evidence
+                .as_ref()
+                .map(|evidence| {
+                    format!(
+                        "来源摘录：{} / {}",
+                        evidence.left.excerpt, evidence.right.excerpt
+                    )
+                })
+                .unwrap_or_else(|| "未请求独立来源证据选择".into());
             let line = format!(
-                "推断关系 {} {} {}；证据：{} / {}\n",
+                "推断关系 {} {} {}；执行阶段 {:?}；执行结果 {:?}；{}；判断说明：{}\n",
                 relation.relation.from_thread_id,
                 relation.relation.kind.as_str(),
                 relation.relation.to_thread_id,
-                relation.relation.evidence.left.excerpt,
-                relation.relation.evidence.right.excerpt
+                relation.relation.execution_stage,
+                relation.relation.execution_outcome,
+                source_note,
+                relation.relation.explanation
             );
             fingerprint.update(line.as_bytes());
             if prompt.chars().count() + line.chars().count() < limit {
@@ -357,18 +370,9 @@ impl SourceService {
             && !text.config.base_url.is_empty()
             && !text.config.model.is_empty();
         let jev_configured = jev.credential_configured && jev.credential_error.is_none();
-        let candidate_upper_bound = candidate.as_ref().map_or(0, |candidate| {
-            let max_pairs = candidate
-                .thread_count
-                .saturating_mul(candidate.thread_count.saturating_sub(1))
-                / 2;
-            max_pairs.min(
-                candidate
-                    .thread_count
-                    .saturating_mul(u64::from(candidate.neighbor_limit))
-                    / 2,
-            )
-        });
+        let candidate_upper_bound = candidate
+            .as_ref()
+            .map_or(0, |candidate| candidate.candidate_count);
         let existing = self.sessions.inferred_pair_outcomes(project_id)?;
         let mut pending_candidates = 0;
         if let Some(candidate) = &candidate {
@@ -485,29 +489,6 @@ impl SourceService {
                 .into(),
             },
             AnalysisStagePlan {
-                stage: AnalysisStage::EvidenceSelection,
-                service: "Jev".into(),
-                model: jev.config.model.clone(),
-                send_scope: "最多 20 组候选两侧证据发送到配置的 Jev 服务。".into(),
-                pending_items: if stage_selection.relations {
-                    pending_candidates
-                } else {
-                    0
-                },
-                maximum_calls: if stage_selection.relations {
-                    candidate_upper_bound.saturating_mul(attempts)
-                } else {
-                    0
-                },
-                available: jev_configured,
-                note: if stage_selection.relations {
-                    "随候选分类自动执行；每对仅对支持关系选择证据，两阶段合计最多两次推理请求。"
-                } else {
-                    "未选择候选分类，本批不执行证据选择。"
-                }
-                .into(),
-            },
-            AnalysisStagePlan {
                 stage: AnalysisStage::Naming,
                 service: text_service,
                 model,
@@ -543,7 +524,7 @@ impl SourceService {
             cached_summaries: cached,
             unavailable_summaries: unavailable,
             maximum_candidates: candidate_upper_bound,
-            evidence_selection_call_limit: candidate_upper_bound,
+            evidence_selection_call_limit: 0,
             pending_groups: if stage_selection.naming
                 && stage_selection.relations
                 && jev_configured
@@ -2133,7 +2114,7 @@ impl SourceService {
             })
             .unwrap_or_default();
         let questions = if phase == AnalysisStage::Relation {
-            16
+            26
         } else {
             supported.len() as u32
         };
@@ -2303,28 +2284,17 @@ impl SourceService {
                 );
                 current.units[index].actual_model = Some(classification.actual_model.clone());
                 current.units[index].error = None;
-                if classification
-                    .choices
-                    .iter()
-                    .any(|choice| choice.judgment == RelationJudgment::Supported)
-                {
-                    current.units[index].relation_classification = Some(classification);
-                    current.units[index].stage = AnalysisStage::EvidenceSelection;
-                    current.units[index].state = AnalysisUnitState::Pending;
-                    current.units[index].attempts = 0;
-                } else {
-                    let mut result = inferred::outcome(
-                        self,
-                        &current.project_id,
-                        candidate,
-                        &current.units[index].input_version,
-                        &classification,
-                        None,
-                    )?;
-                    stamp_jev_outcome(&mut result, &current, &classification.actual_model);
-                    outcome = Some(result);
-                    current.units[index].state = AnalysisUnitState::Succeeded;
-                }
+                let mut result = inferred::outcome(
+                    self,
+                    &current.project_id,
+                    candidate,
+                    &current.units[index].input_version,
+                    &classification,
+                    None,
+                )?;
+                stamp_jev_outcome(&mut result, &current, &classification.actual_model);
+                outcome = Some(result);
+                current.units[index].state = AnalysisUnitState::Succeeded;
             }
             Ok(JevUnitResult::Evidence(selection)) => {
                 current.units[index].relation_evidence_selection = Some(selection.clone());
@@ -3805,8 +3775,9 @@ mod tests {
         assert_eq!(relation.kind.as_str(), "FIXES");
         assert_eq!(relation.actual_model, "jev-1.13.0");
         assert_eq!(relation.confidence, 0.76);
-        assert_eq!(relation.evidence.left.thread_id, "thread-0");
-        assert_eq!(relation.evidence.right.thread_id, "thread-1");
+        let evidence = relation.evidence.as_ref().unwrap();
+        assert_eq!(evidence.left.thread_id, "thread-0");
+        assert_eq!(evidence.right.thread_id, "thread-1");
         assert_eq!(graph.inference_outcomes[0].status, "valid");
         let old = service
             .sessions
@@ -3902,6 +3873,7 @@ mod tests {
                 judgment: RelationJudgment::Rejected,
                 answer: answer("REJECTS", 0.8),
             }],
+            execution: None,
             input_tokens: 10,
             output_tokens: 2,
         };
@@ -4556,6 +4528,8 @@ mod tests {
         let mut saved = InferredPairOutcome {
             candidate_id: candidate.id.clone(),
             project_id: "project-test".into(),
+            left_thread_id: candidate.left_thread_id.clone(),
+            right_thread_id: candidate.right_thread_id.clone(),
             input_version: input_version.clone(),
             status: "none".into(),
             unknown_count: 0,

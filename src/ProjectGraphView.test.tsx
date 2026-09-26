@@ -132,7 +132,7 @@ test("密集关系使用结构骨架定位且保留全部可见关系", async ()
   expect(layoutControl.edgeCount).toBe(2);
 });
 
-test("固定项目图展示来源方向、双关系、缺失端点诊断和选择详情", async () => {
+test("固定项目图展示来源方向、双关系和选择详情", async () => {
   vi.mocked(invoke).mockResolvedValue({
     project: { id: "project", name: "示例项目" },
     nodes: [
@@ -155,8 +155,8 @@ test("固定项目图展示来源方向、双关系、缺失端点诊断和选�
   expect(fork.dataset.target).toBe("child");
   expect(fork.dataset.dashed).toBe("false");
   expect(screen.getByRole("button", { name: "观察 · 子代理 · 1.0" }).dataset.source).toBe("root");
-  expect(screen.getByText(/父会话尚未出现在本机缓存/)).toBeTruthy();
-  expect(screen.getByText(/已忽略自环/)).toBeTruthy();
+  expect(screen.queryByText(/父会话尚未出现在本机缓存/)).toBeNull();
+  expect(screen.queryByText(/已忽略自环/)).toBeNull();
 
   fireEvent.click(fork);
   expect(screen.getByRole("heading", { name: "观察关系 · 派生" })).toBeTruthy();

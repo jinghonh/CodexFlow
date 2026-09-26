@@ -347,6 +347,7 @@ version = "0.1.0"
 dependencies = [
  "codexflow-codex",
  "codexflow-domain",
+ "codexflow-embedding",
  "codexflow-jev",
  "codexflow-store",
  "codexflow-text",
@@ -375,6 +376,19 @@ name = "codexflow-domain"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "codexflow-embedding"
+version = "0.1.0"
+dependencies = [
+ "codexflow-domain",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "url",
 ]
 
 [[package]]
