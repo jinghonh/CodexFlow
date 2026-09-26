@@ -10,7 +10,7 @@ use codexflow_domain::{
     ThreadMetadata,
 };
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::sync::{Mutex as StdMutex, OnceLock};
@@ -29,6 +29,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const PROBE_THREAD_ID: &str = "00000000-0000-4000-8000-000000000000";
+const THREAD_READ_CONCURRENCY: usize = 8;
 const SOURCES: [&str; 10] = [
     "cli",
     "vscode",
@@ -81,9 +82,21 @@ impl Session {
         &mut self,
         observed_at_unix_ms: i64,
         cancel: &CancellationToken,
+        on_update: impl FnMut(CollectionUpdate<'_>) -> Result<(), AppError>,
+    ) -> Result<Collection, AppError> {
+        self.collect_threads_with_read_policy(observed_at_unix_ms, cancel, |_| true, on_update)
+            .await
+    }
+
+    pub async fn collect_threads_with_read_policy(
+        &mut self,
+        observed_at_unix_ms: i64,
+        cancel: &CancellationToken,
+        should_read: impl Fn(&ThreadMetadata) -> bool,
         mut on_update: impl FnMut(CollectionUpdate<'_>) -> Result<(), AppError>,
     ) -> Result<Collection, AppError> {
         let mut threads = BTreeMap::<String, ThreadMetadata>::new();
+        let mut read_results = HashMap::<(String, i64), Option<String>>::new();
         let mut scopes = Vec::with_capacity(2);
         let mut cancelled = false;
         for archived in [false, true] {
@@ -136,27 +149,75 @@ impl Session {
                     {
                         continue;
                     }
-                    let Some(mut thread) = parse_thread(value, archived, observed_at_unix_ms)
-                    else {
+                    let Some(thread) = parse_thread(value, archived, observed_at_unix_ms) else {
                         errors.push("某条会话的元数据无效，已跳过。".to_owned());
                         continue;
                     };
-                    match tokio::select! {
+                    page_threads.push(thread);
+                }
+                if cancelled {
+                    errors.push("用户已取消列表刷新。".to_owned());
+                    break;
+                }
+
+                let mut read_keys = Vec::new();
+                let mut scheduled = HashSet::new();
+                for thread in &page_threads {
+                    let key = (thread.id.clone(), thread.updated_at);
+                    if !read_results.contains_key(&key)
+                        && should_read(thread)
+                        && scheduled.insert(key.clone())
+                    {
+                        read_keys.push(key);
+                    }
+                }
+                for keys in read_keys.chunks(THREAD_READ_CONCURRENCY) {
+                    if cancel.is_cancelled() {
+                        cancelled = true;
+                        break;
+                    }
+                    let requests: Vec<_> = keys
+                        .iter()
+                        .map(|(thread_id, _)| {
+                            (
+                                "thread/read".to_owned(),
+                                json!({"threadId": thread_id, "includeTurns": false}),
+                            )
+                        })
+                        .collect();
+                    let results = tokio::select! {
                         biased;
                         _ = cancel.cancelled() => { cancelled = true; None },
-                        result = self
-                        .request(
-                            "thread/read",
-                            json!({"threadId": thread.id, "includeTurns": false}),
-                        )
-                        => Some(result),
-                    } {
-                        None => break,
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => {
-                            thread.read_error =
-                                Some(format!("会话读取失败：{}", error.description()))
+                        result = self.request_many(&requests) => Some(result),
+                    };
+                    let Some(results) = results else {
+                        break;
+                    };
+                    match results {
+                        Ok(results) => {
+                            for (key, result) in keys.iter().cloned().zip(results) {
+                                let error = result
+                                    .err()
+                                    .map(|error| format!("会话读取失败：{}", error.description()));
+                                read_results.insert(key, error);
+                            }
                         }
+                        Err(error) => {
+                            let message = format!("会话读取失败：{}", error.description());
+                            for key in keys {
+                                read_results.insert(key.clone(), Some(message.clone()));
+                            }
+                        }
+                    }
+                }
+                if cancelled {
+                    errors.push("用户已取消列表刷新。".to_owned());
+                    break;
+                }
+                for thread in &mut page_threads {
+                    let key = (thread.id.clone(), thread.updated_at);
+                    if let Some(error) = read_results.get(&key) {
+                        thread.read_error = error.clone();
                     }
                     let replace = threads.get(&thread.id).is_none_or(|old| {
                         thread.updated_at > old.updated_at
@@ -165,11 +226,6 @@ impl Session {
                     if replace {
                         threads.insert(thread.id.clone(), thread.clone());
                     }
-                    page_threads.push(thread);
-                }
-                if cancelled {
-                    errors.push("用户已取消列表刷新。".to_owned());
-                    break;
                 }
                 on_update(CollectionUpdate::Page(&page_threads))?;
                 let next = match page.get("nextCursor") {
@@ -193,7 +249,12 @@ impl Session {
                 archived,
                 complete: errors.is_empty(),
                 attempted_at_unix_ms: Some(observed_at_unix_ms),
-                completed_at_unix_ms: errors.is_empty().then_some(observed_at_unix_ms),
+                completed_at_unix_ms: errors.is_empty().then(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64
+                }),
                 error: (!errors.is_empty()).then(|| errors.join(" ")),
             };
             on_update(CollectionUpdate::Scope(&scope))?;
@@ -1444,6 +1505,116 @@ impl Session {
                 .cloned()
                 .ok_or(ProbeError::InvalidResponse);
         }
+    }
+
+    async fn request_many(
+        &mut self,
+        requests: &[(String, Value)],
+    ) -> Result<Vec<Result<Value, ProbeError>>, ProbeError> {
+        let mut pending = HashMap::with_capacity(requests.len());
+        let mut results: Vec<Option<Result<Value, ProbeError>>> = std::iter::repeat_with(|| None)
+            .take(requests.len())
+            .collect();
+        for (index, (method, params)) in requests.iter().enumerate() {
+            let id = self.next_id;
+            self.next_id += 1;
+            self.write(&json!({"id":id,"method":method,"params":params}))
+                .await?;
+            pending.insert(id, index);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                for index in pending.values() {
+                    results[*index] = Some(Err(ProbeError::Timeout));
+                }
+                break;
+            }
+            let count = match timeout(
+                remaining,
+                self.stdout.read_until(b'\n', &mut self.pending_line),
+            )
+            .await
+            {
+                Ok(Ok(count)) => count,
+                Ok(Err(_)) => {
+                    for index in pending.values() {
+                        results[*index] = Some(Err(ProbeError::Exited));
+                    }
+                    break;
+                }
+                Err(_) => {
+                    for index in pending.values() {
+                        results[*index] = Some(Err(ProbeError::Timeout));
+                    }
+                    break;
+                }
+            };
+            if count == 0 {
+                for index in pending.values() {
+                    results[*index] = Some(Err(ProbeError::Exited));
+                }
+                break;
+            }
+            let line = std::mem::take(&mut self.pending_line);
+            let line = match std::str::from_utf8(&line) {
+                Ok(line) => line,
+                Err(_) => {
+                    for index in pending.values() {
+                        results[*index] = Some(Err(ProbeError::InvalidResponse));
+                    }
+                    break;
+                }
+            };
+            let response: Value = match serde_json::from_str(line) {
+                Ok(response) => response,
+                Err(_) => {
+                    for index in pending.values() {
+                        results[*index] = Some(Err(ProbeError::InvalidResponse));
+                    }
+                    break;
+                }
+            };
+            let Some(response_id) = response.get("id").and_then(Value::as_u64) else {
+                if response.get("method").is_some() {
+                    if self.pending_events.len() >= 512 {
+                        self.pending_events.pop_front();
+                    }
+                    self.pending_events.push_back(response);
+                }
+                continue;
+            };
+            let Some(index) = pending.remove(&response_id) else {
+                if response.get("method").is_some() {
+                    self.write(&json!({"id":response["id"],"error":{"code":-32000,"message":"CodexFlow does not approve server requests"}})).await?;
+                    for index in pending.values() {
+                        results[*index] = Some(Err(ProbeError::InvalidResponse));
+                    }
+                    break;
+                }
+                continue;
+            };
+            results[index] = Some(if let Some(error) = response.get("error") {
+                let code = error.get("code").and_then(Value::as_i64).unwrap_or(-32000);
+                let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+                let unsupported = code == -32601
+                    || message.contains("unknown variant")
+                    || message.contains("not supported yet");
+                Err(ProbeError::Rpc(code, unsupported))
+            } else {
+                response
+                    .get("result")
+                    .cloned()
+                    .ok_or(ProbeError::InvalidResponse)
+            });
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|result| result.unwrap_or(Err(ProbeError::Timeout)))
+            .collect())
     }
 
     pub fn exited(&mut self) -> Result<bool, AppError> {

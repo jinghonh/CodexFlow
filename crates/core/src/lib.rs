@@ -16,7 +16,7 @@ use codexflow_domain::{
     HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun, IndexRunState, JevConfig,
     JevConnectionResult, JevInferenceResult, JevStatus, Preferences, ProjectCatalog, ProjectGraph,
     ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview, ReviewedInferredRelation,
-    SessionList, SourceEvidence, SourceStatus, UserRelationDecision,
+    SessionList, SourceEvidence, SourceStatus, ThreadMetadata, UserRelationDecision,
 };
 use codexflow_jev::{
     normalize_base_url, system_credentials, system_text_credentials, Credential, CredentialStore,
@@ -26,6 +26,7 @@ use codexflow_store::{EvidenceSourceSnapshot, PreferenceStore, SessionStore, Wor
 pub use explorer::{ProjectThreadQuery, ProjectThreadQueryResult};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -1409,6 +1410,13 @@ impl SourceService {
         attempted_at: i64,
     ) -> Result<(SessionList, bool, bool, bool), AppError> {
         self.sessions.begin_refresh(attempted_at)?;
+        let cached_read_state: HashMap<_, _> = self
+            .sessions
+            .list()?
+            .threads
+            .into_iter()
+            .map(|thread| (thread.id, (thread.updated_at, thread.read_error.is_some())))
+            .collect();
         let mut state = self.state.lock().await;
         check_process(&mut state);
         let session = state.session.as_mut().ok_or_else(|| {
@@ -1418,30 +1426,49 @@ impl SourceService {
                 true,
             )
         })?;
-        let collection = session
-            .collect_threads_with(attempted_at, token, |update| {
-                match update {
-                    CollectionUpdate::Page(threads) => {
-                        {
-                            let _updates = self.lock_project_updates();
-                            self.sessions.save_collection(threads, &[])?;
-                            self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
+        let collection_result = session
+            .collect_threads_with_read_policy(
+                attempted_at,
+                token,
+                |thread: &ThreadMetadata| {
+                    cached_read_state
+                        .get(&thread.id)
+                        .is_none_or(|(updated_at, read_error)| {
+                            *updated_at != thread.updated_at || *read_error
+                        })
+                },
+                |update| {
+                    match update {
+                        CollectionUpdate::Page(threads) => {
+                            {
+                                let _updates = self.lock_project_updates();
+                                self.sessions.save_collection(threads, &[])?;
+                                self.reconciliation_revision.fetch_add(1, Ordering::Relaxed);
+                            }
+                            run.pages_saved += 1;
+                            run.threads_seen += threads.len() as u64;
                         }
-                        run.pages_saved += 1;
-                        run.threads_seen += threads.len() as u64;
-                        self.reconcile_projects()?;
+                        CollectionUpdate::Scope(scope) => {
+                            self.sessions
+                                .save_collection(&[], std::slice::from_ref(scope))?;
+                        }
                     }
-                    CollectionUpdate::Scope(scope) => {
-                        self.sessions
-                            .save_collection(&[], std::slice::from_ref(scope))?;
-                    }
-                }
-                self.sessions.save_index_run(run)?;
-                notify(run.clone());
-                Ok(())
-            })
-            .await?;
+                    self.sessions.save_index_run(run)?;
+                    notify(run.clone());
+                    Ok(())
+                },
+            )
+            .await;
         check_process(&mut state);
+        drop(state);
+        let reconciliation = self.reconcile_projects();
+        let collection = match collection_result {
+            Ok(collection) => {
+                reconciliation?;
+                collection
+            }
+            Err(error) => return Err(error),
+        };
         let complete =
             collection.scopes.len() == 2 && collection.scopes.iter().all(|scope| scope.complete);
         let any_success =

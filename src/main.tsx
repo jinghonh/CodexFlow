@@ -66,6 +66,21 @@ type ThreadMatches = { matches: { threadId: string; summary: string | null }[]; 
 type ThreadMatchesState = { queryKey: string; value: ThreadMatches };
 type IndexRun = { id: string; projectId: string | null; state: "queued" | "running" | "complete" | "partial" | "failed" | "cancelled"; startedAtUnixMs: number; finishedAtUnixMs: number | null; pagesSaved: number; threadsSeen: number; error: AppError | null; interrupted: boolean };
 const runLabels: Record<IndexRun["state"], string> = { queued: "待执行", running: "执行中", complete: "完成", partial: "部分完成", failed: "失败", cancelled: "已取消" };
+const AUTO_REFRESH_MAX_AGE_MS = 6 * 60 * 60 * 1_000;
+const AUTO_REFRESH_FAILURE_COOLDOWN_MS = 60 * 60 * 1_000;
+
+function shouldAutoRefresh(scopes: Scope[], latestRun: IndexRun | null, now = Date.now()) {
+  const cacheFresh = scopes.length === 2 && scopes.every((scope) =>
+    scope.complete && scope.completedAtUnixMs !== null &&
+    now >= scope.completedAtUnixMs && now - scope.completedAtUnixMs < AUTO_REFRESH_MAX_AGE_MS
+  );
+  if (cacheFresh) return false;
+
+  const recentlyFailed = (latestRun?.state === "failed" || latestRun?.state === "partial") &&
+    latestRun.finishedAtUnixMs !== null &&
+    now - latestRun.finishedAtUnixMs < AUTO_REFRESH_FAILURE_COOLDOWN_MS;
+  return !recentlyFailed;
+}
 
 type WorkspacePanel = "connections" | "projects" | "sessions" | "workstreams" | "relations";
 const workspacePanels: { id: WorkspacePanel; title: string; index: string }[] = [
@@ -239,30 +254,37 @@ export function App() {
     listen<IndexRun>("index-run", (event) => {
       if (!active) return;
       recordRun(event.payload);
-      void loadProjects().catch((error) => setListError(errorText(error)));
+      if (event.payload.state !== "queued" && event.payload.state !== "running") {
+        void loadProjects().catch((error) => setListError(errorText(error)));
+      }
     }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});
     invoke<Settings>("get_settings")
       .then(async (settings) => {
         if (!active) return;
         let selectedProjectId: string | null = null;
+        let cachedScopes: Scope[] = [];
         try {
           const catalog = await invoke<ProjectCatalog>("get_project_catalog");
           if (active) {
             setProjectCatalog(catalog);
             selectedProjectId = catalog.selectedProjectId;
+            cachedScopes = catalog.scopes;
             if (catalog.selectedProjectId) setProjectSessions(await invoke<ProjectSessions>("get_project_sessions", { projectId: catalog.selectedProjectId }));
             setGraphVersion((version) => version + 1);
           }
         } catch (error) { if (active) setListError(errorText(error)); }
         if (!active) return;
-        recordRun(await invoke<IndexRun | null>("get_latest_index_run"));
+        const latestRun = await invoke<IndexRun | null>("get_latest_index_run");
+        recordRun(latestRun);
         setTheme(settings.theme);
         setPath(settings.source.selectedBinary ?? "");
         setSource(settings.source);
         setBusy(false);
         const next = await invoke<SourceStatus>("connect_source", { selectedBinary: settings.source.selectedBinary });
         if (active) setSource(next);
-        if (active && next.connection === "connected" && selectedProjectId) await startRefresh(selectedProjectId);
+        if (active && next.connection === "connected" && selectedProjectId && shouldAutoRefresh(cachedScopes, latestRun)) {
+          await startRefresh(selectedProjectId);
+        }
       })
       .catch((error) => { if (active) setPageError(errorText(error)); })
       .finally(() => { if (active) setBusy(false); });

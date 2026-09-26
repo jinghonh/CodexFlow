@@ -201,9 +201,6 @@ fn merge_thread_metadata(previous: ThreadMetadata, incoming: ThreadMetadata) -> 
     merged.turns_complete = previous.turns_complete;
     merged.items_complete = previous.items_complete;
     merged.content_complete = previous.content_complete;
-    if merged.read_error.is_none() {
-        merged.read_error = previous.read_error.clone();
-    }
     merged.observed_at_unix_ms = previous.observed_at_unix_ms.max(merged.observed_at_unix_ms);
     merged.missing_from_source = false;
     if same_refresh {
