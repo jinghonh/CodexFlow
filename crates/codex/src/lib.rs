@@ -338,8 +338,10 @@ pub fn resolve_binary(choice: Option<&str>) -> Result<PathBuf, AppError> {
         }
         path
     } else {
-        env::split_paths(&env::var_os("PATH").unwrap_or_default())
-            .flat_map(|dir| path_candidates(&dir, input))
+        let directories = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+            .collect::<Vec<_>>();
+        path_candidates_in_search_path(&directories, input)
+            .into_iter()
             .find(|path| is_executable(path))
             .ok_or_else(|| {
                 AppError::codex(
@@ -388,6 +390,28 @@ fn path_candidates(directory: &Path, input: &str) -> Vec<PathBuf> {
     {
         vec![directory.join(command)]
     }
+}
+
+fn path_candidates_in_search_path(directories: &[PathBuf], input: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    if Path::new(input).extension().is_none() {
+        return ["exe", "cmd", ""]
+            .into_iter()
+            .flat_map(|extension| {
+                directories.iter().map(move |directory| {
+                    if extension.is_empty() {
+                        directory.join(input)
+                    } else {
+                        directory.join(input).with_extension(extension)
+                    }
+                })
+            })
+            .collect();
+    }
+    directories
+        .iter()
+        .flat_map(|directory| path_candidates(directory, input))
+        .collect()
 }
 
 fn is_executable(path: &Path) -> bool {
