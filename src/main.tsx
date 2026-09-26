@@ -588,16 +588,18 @@ export function App() {
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">C<span>F</span></span><div><strong>CodexFlow</strong><small>本地工作过程</small></div></div>
-      <nav className="side-group" aria-label="工作任务">
-        {workspaceGroups.map((group) => <div className="side-section" key={group.title}>
-          <span className="side-caption">{group.title}</span>
-          {group.panels.map((id) => {
-            const panel = workspacePanels.find((item) => item.id === id)!;
-            return <button key={panel.id} className={`side-link ${activePanel === panel.id ? "active" : ""}`} aria-current={activePanel === panel.id ? "page" : undefined} onClick={() => selectPanel(panel.id)}><span className="side-dot" />{panel.title}<span className="side-index">{panel.index}</span></button>;
-          })}
-        </div>)}
-      </nav>
-      <div className="side-note"><span className="side-note-line" />同一仓库的主工作区与 worktree 合并展示。会话的实际工作区和归属依据仍可逐条查看。</div>
+      <div className="sidebar-middle">
+        <nav className="side-group" aria-label="工作任务">
+          {workspaceGroups.map((group) => <div className="side-section" key={group.title}>
+            <span className="side-caption">{group.title}</span>
+            {group.panels.map((id) => {
+              const panel = workspacePanels.find((item) => item.id === id)!;
+              return <button key={panel.id} className={`side-link ${activePanel === panel.id ? "active" : ""}`} aria-current={activePanel === panel.id ? "page" : undefined} onClick={() => selectPanel(panel.id)}><span className="side-dot" />{panel.title}<span className="side-index">{panel.index}</span></button>;
+            })}
+          </div>)}
+        </nav>
+        <div className="side-note"><span className="side-note-line" />同一仓库的主工作区与 worktree 合并展示。会话的实际工作区和归属依据仍可逐条查看。</div>
+      </div>
       <div className="sidebar-bottom"><span className="sidebar-bottom-symbol">↗</span><div>本机运行<br /><strong>数据留在你的设备</strong></div></div>
     </aside>
 
@@ -708,7 +710,7 @@ export function App() {
         <div className="page-heading"><div><h1>会话浏览<span className="accent">.</span></h1><p>{projectSessions?.project.name ?? "浏览所选本地项目的会话、摘要和来源事实。"}</p></div><div className="heading-badge">按需读取<br /><strong>列表仅含元数据</strong></div></div>
         <section id="sessions" className="panel session-panel">
           <div className="session-heading"><div><div className="panel-kicker">探索 / 会话清单</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
-          {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}</div>}
+          {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}{refreshing && <div className="index-progress" role="progressbar" aria-label="会话列表加载进度" aria-valuetext={`已保存 ${indexRun.pagesSaved} 页，读取 ${indexRun.threadsSeen} 条`}><span /></div>}</div>}
           {!showUnassigned && projectSessions && <div className="workspace-list"><strong>实际工作区</strong>{projectSessions.workspaces.length ? projectSessions.workspaces.map((workspace) => <code key={workspace}>{workspace}</code>) : <span>当前没有可验证的工作区</span>}</div>}
           <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{refreshing ? "刷新中；缓存可浏览" : !attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>选择会话后按需读取回合与条目</span></div>
           {!showUnassigned && <p className="project-state" role="status">{projectState}</p>}
