@@ -63,8 +63,8 @@ type ProjectCatalog = { projects: Project[]; selectedProjectId: string | null; r
 type ProjectSessions = { project: Project; workspaces: string[]; threads: AttributedThread[]; scopes: Scope[] };
 type Workstream = { id: string; name: string; members: string[] };
 type WorkstreamView = { workstreams: Workstream[]; ungroupedThreadIds: string[]; revision: number };
-type ThreadMatches = { matches: { threadId: string; summary: string | null }[]; total: number };
-type ThreadMatchesState = { queryKey: string; value: ThreadMatches };
+type ThreadMatches = { matches: AttributedThread[]; selected: AttributedThread | null; total: number };
+type ThreadMatchesState = { queryKey: string; projectId: string; selectedThreadId: string | null; value: ThreadMatches };
 type IndexRun = { id: string; projectId: string | null; state: "queued" | "running" | "complete" | "partial" | "failed" | "cancelled"; startedAtUnixMs: number; finishedAtUnixMs: number | null; pagesSaved: number; threadsSeen: number; error: AppError | null; interrupted: boolean };
 const runLabels: Record<IndexRun["state"], string> = { queued: "待执行", running: "执行中", complete: "完成", partial: "部分完成", failed: "失败", cancelled: "已取消" };
 const AUTO_REFRESH_MAX_AGE_MS = 6 * 60 * 60 * 1_000;
@@ -246,11 +246,12 @@ export function App() {
         text: query, workstreamId: workstreamFilter || null, workspaceRoot: workspaceFilter || null,
         archived: archiveFilter === "all" ? null : archiveFilter === "archived",
         complete: completeFilter === "all" ? null : completeFilter === "complete",
-      } }).then((value) => { if (active) { setThreadMatches({ queryKey, value }); setQueryError(null); } })
+        selectedThreadId,
+      } }).then((value) => { if (active) { setThreadMatches({ queryKey, projectId, selectedThreadId, value }); setQueryError(null); } })
         .catch((error) => { if (active) setQueryError({ queryKey, message: errorText(error) }); });
     }, textChanged ? 180 : 0);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [activePanel, projectSessions?.project.id, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, projectDataVersion, workstreamVersion, workstreams?.revision]);
+  }, [activePanel, projectSessions?.project.id, showUnassigned, query, selectedThreadId, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, projectDataVersion, workstreamVersion, workstreams?.revision]);
 
   function selectEvidence(evidence: { threadId: string; turnId: string; itemId: string }) {
     setSelectedThreadId(evidence.threadId);
@@ -604,22 +605,36 @@ export function App() {
     : !connected ? `来源当前不可用；显示缓存（${lastCompleteIndexLabel}）`
     : complete ? `全局列表完整；${lastCompleteIndexLabel}`
     : `最近全局扫描未完成；继续显示缓存（${lastCompleteIndexLabel}）`;
-  const threadQueryKey = JSON.stringify([projectSessions?.project.id ?? null, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, workstreams?.revision ?? null]);
+  const threadQueryKey = JSON.stringify([projectSessions?.project.id ?? null, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, workstreams?.revision ?? null, projectDataVersion]);
   useEffect(() => { setThreadLimit(40); }, [threadQueryKey]);
   const currentThreadMatches = threadMatches?.queryKey === threadQueryKey ? threadMatches.value : null;
   useEffect(() => { if (projectSessions && !showUnassigned) recordStartupReady(); }, [projectSessions, showUnassigned]);
   useEffect(() => { if (currentThreadMatches) finishResponse(); }, [currentThreadMatches]);
   const currentQueryError = queryError?.queryKey === threadQueryKey ? queryError.message : "";
-  const visibleIds = React.useMemo(() => new Set(currentThreadMatches?.matches.map((item) => item.threadId) ?? []), [currentThreadMatches]);
   const projectThreadIds = React.useMemo(() => new Set(projectSessions?.threads.map(({ thread }) => thread.id) ?? []), [projectSessions]);
-  const visibleThreads = (showUnassigned ? projectCatalog?.unassigned ?? [] : projectSessions?.threads ?? []).filter(({ thread }) =>
-    showUnassigned ? [thread.title, thread.preview, thread.id].some((value) => value?.toLowerCase().includes(query.toLowerCase())) : visibleIds.has(thread.id)
-  );
+  const visibleThreads = showUnassigned
+    ? (projectCatalog?.unassigned ?? []).filter(({ thread }) =>
+        [thread.title, thread.preview, thread.id].some((value) => value?.toLowerCase().includes(query.toLowerCase())))
+    : currentThreadMatches?.matches ?? [];
   const shownThreads = visibleThreads.slice(0, threadLimit);
-  const selectedThread = (showUnassigned ? projectCatalog?.unassigned ?? [] : projectSessions?.threads ?? [])
-    .find(({ thread }) => thread.id === selectedThreadId)?.thread;
-  const selectedAttribution = (showUnassigned ? projectCatalog?.unassigned ?? [] : projectSessions?.threads ?? [])
-    .find(({ thread }) => thread.id === selectedThreadId)?.attribution;
+  const sessionTotal = showUnassigned
+    ? projectCatalog?.unassigned.length ?? 0
+    : threadMatches && threadMatches.projectId === projectSessions?.project.id
+      ? threadMatches.value.total : projectSessions?.threads.length ?? 0;
+  const querySelection = threadMatches
+    && threadMatches.projectId === projectSessions?.project.id
+    && threadMatches.selectedThreadId === selectedThreadId
+    ? threadMatches.value.selected
+      ?? threadMatches.value.matches.find(({ thread }) => thread.id === selectedThreadId)
+      ?? null
+    : null;
+  const selectedRecord = showUnassigned
+    ? (projectCatalog?.unassigned ?? []).find(({ thread }) => thread.id === selectedThreadId)
+    : activePanel === "sessions"
+      ? querySelection ?? undefined
+      : projectSessions?.threads.find(({ thread }) => thread.id === selectedThreadId);
+  const selectedThread = selectedRecord?.thread;
+  const selectedAttribution = selectedRecord?.attribution;
   const selectionHidden = !!selectedThread && (showUnassigned || !!currentThreadMatches) && !visibleThreads.some(({ thread }) => thread.id === selectedThread.id);
   const clearFilters = () => { setQuery(""); setWorkstreamFilter(""); setWorkspaceFilter(""); setArchiveFilter("all"); setCompleteFilter("all"); setRelationSource("all"); setRelationKind("all"); setMinimumConfidence(0.7); };
   function resetPanelState(panel: WorkspacePanel) {
@@ -792,7 +807,7 @@ export function App() {
           <div className="session-heading"><div><div className="panel-kicker">探索 / 会话清单</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} title="扫描本机 Codex 来源的全部未归档和已归档会话，更新所有项目的会话目录。" onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "全局索引中…" : "刷新全局索引"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
           {indexRun && <div className="index-run" role="status"><strong>本机 Codex 全局索引 · {runLabels[indexRun.state]}</strong><span>范围：全部未归档与已归档会话</span><span>已处理 {indexRun.pagesSaved} 页；识别 {indexRun.threadsSeen} 条有效元数据</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}{refreshing && <div className="index-progress" role="progressbar" aria-label="本机 Codex 全局索引进度" aria-valuetext={`全局已处理 ${indexRun.pagesSaved} 页，识别 ${indexRun.threadsSeen} 条有效元数据`}><span /></div>}</div>}
           {!showUnassigned && projectSessions && <div className="workspace-list"><strong>实际工作区</strong>{projectSessions.workspaces.length ? projectSessions.workspaces.map((workspace) => <code key={workspace}>{workspace}</code>) : <span>当前没有可验证的工作区</span>}</div>}
-          <div className="list-summary"><strong>{showUnassigned ? `未归属会话：${projectCatalog?.unassigned.length ?? 0} 条` : `当前项目：${projectSessions?.threads.length ?? 0} 条会话`}</strong><span>{globalCacheStatus}</span><span>选择会话后按需读取回合与条目</span></div>
+          <div className="list-summary"><strong>{showUnassigned ? `未归属会话：${sessionTotal} 条` : `当前项目：${sessionTotal} 条会话`}</strong><span>{globalCacheStatus}</span><span>选择会话后按需读取回合与条目</span></div>
           {!showUnassigned && <p className="project-state" role="status">{projectState}</p>}
           {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "全局已归档会话" : "全局未归档会话"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "上次扫描完整" : "最近扫描未完成"}</span><small>{scope.completedAtUnixMs ? `上次完整扫描 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整扫描记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}
           {listError && <div className="page-error" role="alert">{listError} 已保存的会话仍可浏览。</div>}

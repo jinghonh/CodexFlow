@@ -34,6 +34,20 @@ pub struct WorkstreamCorrections {
     pub members: BTreeMap<String, Option<String>>,
 }
 
+/// One project Thread and the saved-summary revision used by text matching.
+pub struct ProjectThreadQueryRecord {
+    pub thread: AttributedThread,
+    pub summary: Option<ThreadSummary>,
+    pub history_generation: i64,
+}
+
+/// All persisted inputs to one project Thread query from one SQLite read snapshot.
+pub struct ProjectThreadQuerySnapshot {
+    pub threads: Vec<ProjectThreadQueryRecord>,
+    pub workstreams: Vec<Workstream>,
+    pub corrections: WorkstreamCorrections,
+}
+
 pub enum WorkstreamChange<'a> {
     Rename {
         id: &'a str,
@@ -626,24 +640,95 @@ impl SessionStore {
         let transaction = connection
             .transaction()
             .map_err(|_| AppError::store("读取工作流快照失败。"))?;
-        let streams = {
-            let mut statement = transaction
-                .prepare("SELECT stream_json FROM workstreams WHERE project_id=?1 ORDER BY id")
-                .map_err(|_| AppError::store("读取工作流失败。"))?;
-            let rows = statement
-                .query_map([project_id], |row| row.get::<_, String>(0))
-                .map_err(|_| AppError::store("读取工作流失败。"))?;
-            rows.map(|row| {
-                let json = row.map_err(|_| AppError::store("读取工作流失败。"))?;
-                serde_json::from_str(&json).map_err(|_| AppError::store("解析工作流失败。"))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-        };
+        let streams = Self::workstreams_in(&transaction, project_id)?;
         let corrections = Self::workstream_corrections_in(&transaction, project_id)?;
         transaction
             .commit()
             .map_err(|_| AppError::store("完成读取工作流快照失败。"))?;
         Ok((streams, corrections))
+    }
+
+    pub fn project_thread_query_snapshot(
+        &self,
+        project_id: &str,
+    ) -> Result<ProjectThreadQuerySnapshot, AppError> {
+        self.project_thread_query_snapshot_with_hook(project_id, || {})
+    }
+
+    fn project_thread_query_snapshot_with_hook(
+        &self,
+        project_id: &str,
+        after_snapshot_open: impl FnOnce(),
+    ) -> Result<ProjectThreadQuerySnapshot, AppError> {
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction()
+            .map_err(|_| AppError::store("读取项目会话查询快照失败。"))?;
+        let exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projects WHERE id=?1)",
+                [project_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| AppError::store("检查所选项目失败。"))?;
+        if !exists {
+            return Err(AppError::store("所选项目不存在。"));
+        }
+        after_snapshot_open();
+
+        let threads = {
+            let mut query = transaction
+                .prepare(
+                    "SELECT t.metadata_json, a.attribution_json, COALESCE(h.generation,0), s.summary_json
+                     FROM threads t
+                     JOIN thread_attributions a ON a.thread_id=t.id
+                     LEFT JOIN history_revisions h ON h.thread_id=t.id
+                     LEFT JOIN thread_summaries s ON s.thread_id=t.id
+                     WHERE a.project_id=?1 ORDER BY t.updated_at DESC, t.id",
+                )
+                .map_err(|_| AppError::store("读取项目会话查询快照失败。"))?;
+            let rows = query
+                .query_map([project_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                })
+                .map_err(|_| AppError::store("查询项目会话查询快照失败。"))?;
+            rows.map(|row| {
+                let (thread, attribution, history_generation, summary) =
+                    row.map_err(|_| AppError::store("读取项目会话查询快照失败。"))?;
+                Ok(ProjectThreadQueryRecord {
+                    thread: AttributedThread {
+                        thread: serde_json::from_str(&thread)
+                            .map_err(|_| AppError::store("会话缓存内容损坏。"))?,
+                        attribution: serde_json::from_str(&attribution)
+                            .map_err(|_| AppError::store("归属依据缓存内容损坏。"))?,
+                    },
+                    summary: summary
+                        .map(|json| {
+                            serde_json::from_str(&json)
+                                .map_err(|_| AppError::store("会话总结缓存内容损坏。"))
+                        })
+                        .transpose()?,
+                    history_generation,
+                })
+            })
+            .collect::<Result<Vec<_>, AppError>>()?
+        };
+
+        let workstreams = Self::workstreams_in(&transaction, project_id)?;
+        let corrections = Self::workstream_corrections_in(&transaction, project_id)?;
+        transaction
+            .commit()
+            .map_err(|_| AppError::store("完成读取项目会话查询快照失败。"))?;
+        Ok(ProjectThreadQuerySnapshot {
+            threads,
+            workstreams,
+            corrections,
+        })
     }
 
     fn workstream_corrections_in(
@@ -690,6 +775,23 @@ impl SessionStore {
             names,
             members,
         })
+    }
+
+    fn workstreams_in(
+        transaction: &rusqlite::Transaction<'_>,
+        project_id: &str,
+    ) -> Result<Vec<Workstream>, AppError> {
+        let mut statement = transaction
+            .prepare("SELECT stream_json FROM workstreams WHERE project_id=?1 ORDER BY id")
+            .map_err(|_| AppError::store("读取工作流失败。"))?;
+        let rows = statement
+            .query_map([project_id], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("读取工作流失败。"))?;
+        rows.map(|row| {
+            let json = row.map_err(|_| AppError::store("读取工作流失败。"))?;
+            serde_json::from_str(&json).map_err(|_| AppError::store("解析工作流失败。"))
+        })
+        .collect()
     }
 
     pub fn save_workstream_correction(
@@ -2932,7 +3034,7 @@ mod tests {
     use super::*;
     use codexflow_domain::{
         DisplayTheme, ErrorCode, EvidenceField, FactKind, FactOutcome, HistoryItem,
-        HistoryReadPath, HistoryTurn,
+        HistoryReadPath, HistoryTurn, ThreadSummaryContent,
     };
 
     fn thread(
@@ -2965,6 +3067,187 @@ mod tests {
             read_error: None,
             observed_at_unix_ms,
         }
+    }
+
+    #[test]
+    fn project_thread_query_snapshot_keeps_one_view_during_concurrent_refresh() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-thread-query-snapshot-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let source = thread("旧标题", 2, false, 3);
+        store.save_collection(&[source], &[]).unwrap();
+        store
+            .save_projects_and_attributions(
+                &[LocalProject {
+                    id: "project".into(),
+                    name: "项目".into(),
+                    root: "/tmp/example".into(),
+                    git_common_dir: None,
+                }],
+                &[ThreadAttribution {
+                    thread_id: "duplicate-thread".into(),
+                    project_id: Some("project".into()),
+                    workspace_root: Some("/tmp/example".into()),
+                    basis: "test".into(),
+                    detail: "test".into(),
+                    diagnostic: None,
+                    source_project_id: None,
+                }],
+                None,
+            )
+            .unwrap();
+        let mut summary = ThreadSummary {
+            thread_id: "duplicate-thread".into(),
+            content: ThreadSummaryContent {
+                goal: "旧总结".into(),
+                activity: "读取记录".into(),
+                outcome: "完成".into(),
+                decisions: "保留事实".into(),
+                issues: "无".into(),
+            },
+            evidence_ids: vec![],
+            evidence_refs: vec![],
+            model: "test".into(),
+            requested_model: None,
+            service_base_url: None,
+            binary_path: None,
+            binary_fingerprint: None,
+            binary_version: None,
+            input_digest: "test".into(),
+            source_updated_at: 2,
+            history_generation: 0,
+            created_at_unix_ms: 1,
+        };
+        assert!(store.save_summary_if_current(&summary, 0).unwrap());
+        let old_stream = Workstream {
+            id: "w-old".into(),
+            project_id: "project".into(),
+            name: "旧工作流".into(),
+            members: vec!["duplicate-thread".into()],
+            relation_ids: vec![],
+            algorithm_version: "test".into(),
+            name_input_version: None,
+            name_actual_model: None,
+            name_service_base_url: None,
+            name_requested_model: None,
+            name_error: None,
+            predecessor_ids: vec![],
+        };
+        assert!(store
+            .replace_workstreams("project", 0, &[old_stream])
+            .unwrap());
+
+        let database_path = dir.join("sessions.sqlite3");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        drop(connection);
+
+        let snapshot = store
+            .project_thread_query_snapshot_with_hook("project", || {
+                let mut writer = Connection::open(&database_path).unwrap();
+                writer
+                    .busy_timeout(Duration::from_secs(5))
+                    .unwrap();
+                let transaction = writer.transaction().unwrap();
+                let metadata_json: String = transaction
+                    .query_row(
+                        "SELECT metadata_json FROM threads WHERE id='duplicate-thread'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let mut metadata: ThreadMetadata =
+                    serde_json::from_str(&metadata_json).unwrap();
+                metadata.title = Some("新标题".into());
+                metadata.updated_at = 4;
+                transaction
+                    .execute(
+                        "UPDATE threads SET metadata_json=?1,updated_at=4 WHERE id='duplicate-thread'",
+                        [serde_json::to_string(&metadata).unwrap()],
+                    )
+                    .unwrap();
+
+                summary.content.goal = "新总结".into();
+                summary.source_updated_at = 4;
+                transaction
+                    .execute(
+                        "UPDATE thread_summaries SET summary_json=?1 WHERE thread_id='duplicate-thread'",
+                        [serde_json::to_string(&summary).unwrap()],
+                    )
+                    .unwrap();
+                let new_stream = Workstream {
+                    id: "w-new".into(),
+                    project_id: "project".into(),
+                    name: "新工作流".into(),
+                    members: vec!["duplicate-thread".into()],
+                    relation_ids: vec![],
+                    algorithm_version: "test".into(),
+                    name_input_version: None,
+                    name_actual_model: None,
+                    name_service_base_url: None,
+                    name_requested_model: None,
+                    name_error: None,
+                    predecessor_ids: vec![],
+                };
+                transaction
+                    .execute("DELETE FROM workstreams WHERE project_id='project'", [])
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO workstreams(id,project_id,stream_json) VALUES ('w-new','project',?1)",
+                        [serde_json::to_string(&new_stream).unwrap()],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "INSERT INTO workstream_member_corrections(project_id,thread_id,workstream_id) VALUES ('project','duplicate-thread','w-new')",
+                        [],
+                    )
+                    .unwrap();
+                transaction
+                    .execute(
+                        "UPDATE workstream_revisions SET revision=revision+1 WHERE project_id='project'",
+                        [],
+                    )
+                    .unwrap();
+                transaction.commit().unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(
+            snapshot.threads[0].thread.thread.title.as_deref(),
+            Some("旧标题")
+        );
+        assert_eq!(
+            snapshot.threads[0].summary.as_ref().unwrap().content.goal,
+            "旧总结"
+        );
+        assert_eq!(snapshot.workstreams[0].id, "w-old");
+        assert!(snapshot.corrections.members.is_empty());
+
+        let refreshed = store.project_thread_query_snapshot("project").unwrap();
+        assert_eq!(
+            refreshed.threads[0].thread.thread.title.as_deref(),
+            Some("新标题")
+        );
+        assert_eq!(
+            refreshed.threads[0].summary.as_ref().unwrap().content.goal,
+            "新总结"
+        );
+        assert_eq!(refreshed.workstreams[0].id, "w-new");
+        assert_eq!(
+            refreshed.corrections.members.get("duplicate-thread"),
+            Some(&Some("w-new".into()))
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

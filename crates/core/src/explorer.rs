@@ -1,5 +1,5 @@
 use crate::SourceService;
-use codexflow_domain::{AppError, AttributedThread, ProjectSessions};
+use codexflow_domain::{AppError, AttributedThread};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct ProjectThreadQuery {
     #[serde(default)]
     pub text: String,
+    /// Keeps the selected Thread available when it does not match the filters.
+    pub selected_thread_id: Option<String>,
     pub workstream_id: Option<String>,
     pub workspace_root: Option<String>,
     pub archived: Option<bool>,
@@ -18,15 +20,12 @@ pub struct ProjectThreadQuery {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ProjectThreadMatch {
-    pub thread_id: String,
-    pub summary: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ProjectThreadQueryResult {
-    pub matches: Vec<ProjectThreadMatch>,
+    /// Matching rows in project session order, with no summary payload.
+    pub matches: Vec<AttributedThread>,
+    /// Selected row from the same snapshot when filters exclude it.
+    pub selected: Option<AttributedThread>,
+    /// Number of project Threads before filters are applied.
     pub total: usize,
 }
 
@@ -78,11 +77,35 @@ impl SourceService {
         project_id: &str,
         query: ProjectThreadQuery,
     ) -> Result<ProjectThreadQueryResult, AppError> {
-        let ProjectSessions { threads, .. } = self.project_sessions(project_id)?;
-        // Read the saved automatic groups and human corrections. Filtering never recomputes
-        // groups or persists a new revision.
-        let (automatic, corrections) = self.sessions.workstream_snapshot(project_id)?;
-        let mut owners: BTreeMap<String, String> = automatic
+        let snapshot = self.sessions.project_thread_query_snapshot(project_id)?;
+        // Search only summaries that describe this thread's current source and history.
+        let summaries: BTreeMap<_, _> = snapshot
+            .threads
+            .iter()
+            .filter_map(|record| {
+                let summary = record.summary.as_ref()?;
+                (summary.source_updated_at == record.thread.thread.updated_at
+                    && summary.history_generation == record.history_generation)
+                    .then(|| {
+                        let content = &summary.content;
+                        (
+                            record.thread.thread.id.as_str(),
+                            [
+                                content.goal.as_str(),
+                                content.activity.as_str(),
+                                content.outcome.as_str(),
+                                content.decisions.as_str(),
+                                content.issues.as_str(),
+                            ]
+                            .join(" "),
+                        )
+                    })
+            })
+            .collect();
+        // Filtering uses saved automatic groups and user corrections only. It never
+        // recomputes groups or persists a new revision.
+        let mut owners: BTreeMap<String, String> = snapshot
+            .workstreams
             .iter()
             .flat_map(|stream| {
                 stream
@@ -91,7 +114,7 @@ impl SourceService {
                     .map(move |id| (id.clone(), stream.id.clone()))
             })
             .collect();
-        for (thread_id, target) in corrections.members {
+        for (thread_id, target) in snapshot.corrections.members {
             if let Some(target) = target {
                 owners.insert(thread_id, target);
             } else {
@@ -100,36 +123,35 @@ impl SourceService {
         }
         let mut matches = Vec::new();
         let mut seen = BTreeSet::new();
-        for item in &threads {
+        for record in &snapshot.threads {
+            let item = &record.thread;
             if !seen.insert(item.thread.id.as_str()) {
                 continue;
             }
-            let summary = self.sessions.summary(&item.thread.id)?.map(|saved| {
-                let content = saved.content;
-                [
-                    content.goal,
-                    content.activity,
-                    content.outcome,
-                    content.decisions,
-                    content.issues,
-                ]
-                .join(" ")
-            });
+            let summary = summaries.get(item.thread.id.as_str()).map(String::as_str);
             if matches_query(
                 item,
-                summary.as_deref(),
+                summary,
                 owners.get(&item.thread.id).map(String::as_str),
                 &query,
             ) {
-                matches.push(ProjectThreadMatch {
-                    thread_id: item.thread.id.clone(),
-                    summary,
-                });
+                matches.push(item.clone());
             }
         }
+        let selected = query.selected_thread_id.as_deref().and_then(|thread_id| {
+            if matches.iter().any(|item| item.thread.id == thread_id) {
+                return None;
+            }
+            snapshot
+                .threads
+                .iter()
+                .find(|record| record.thread.thread.id == thread_id)
+                .map(|record| record.thread.clone())
+        });
         Ok(ProjectThreadQueryResult {
-            total: threads.len(),
+            total: snapshot.threads.len(),
             matches,
+            selected,
         })
     }
 }
@@ -138,7 +160,8 @@ impl SourceService {
 mod tests {
     use super::*;
     use codexflow_domain::{
-        ThreadAttribution, ThreadMetadata, ThreadSummary, ThreadSummaryContent,
+        HistoryCoverage, HistoryReadPath, HistorySnapshot, ThreadAttribution, ThreadMetadata,
+        ThreadSummary, ThreadSummaryContent,
     };
 
     fn domain_snapshot(path: &std::path::Path) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
@@ -212,6 +235,7 @@ mod tests {
         let before = serde_json::to_value(&item).unwrap();
         let query = ProjectThreadQuery {
             text: "修复缓存".into(),
+            selected_thread_id: None,
             workstream_id: Some("w".into()),
             workspace_root: Some("/repo/wt".into()),
             archived: Some(false),
@@ -283,9 +307,13 @@ mod tests {
         child.session_id = "session-2".into();
         child.title = Some("继续索引".into());
         child.parent_thread_id = Some("thread-1".into());
+        let mut source_stale = thread.clone();
+        source_stale.id = "thread-3".into();
+        source_stale.session_id = "session-3".into();
+        source_stale.title = Some("浏览来源".into());
         service
             .sessions
-            .save_collection(&[thread, child], &[])
+            .save_collection(&[thread, child.clone(), source_stale.clone()], &[])
             .unwrap();
         let project_id = service
             .choose_project(workspace.to_str().unwrap())
@@ -318,6 +346,46 @@ mod tests {
             .sessions
             .save_summary_if_current(&summary, 0)
             .unwrap());
+        let mut generation_stale = summary.clone();
+        generation_stale.thread_id = "thread-2".into();
+        generation_stale.content.goal = "历史代次过期摘要词".into();
+        assert!(service
+            .sessions
+            .save_summary_if_current(&generation_stale, 0)
+            .unwrap());
+        let mut source_stale_summary = summary.clone();
+        source_stale_summary.thread_id = "thread-3".into();
+        source_stale_summary.content.goal = "来源版本过期摘要词".into();
+        assert!(service
+            .sessions
+            .save_summary_if_current(&source_stale_summary, 0)
+            .unwrap());
+        service
+            .sessions
+            .save_history(&HistorySnapshot {
+                coverage: HistoryCoverage {
+                    thread_id: "thread-2".into(),
+                    source_updated_at: 2,
+                    attempted_at_unix_ms: 5,
+                    path: HistoryReadPath::FullRead,
+                    turns_complete: true,
+                    items_complete: true,
+                    turn_pages: 0,
+                    item_pages: 0,
+                    loaded_turns: 0,
+                    loaded_items: 0,
+                    incompatible: false,
+                    error: None,
+                },
+                turns: vec![],
+                items: vec![],
+            })
+            .unwrap();
+        source_stale.updated_at = 4;
+        service
+            .sessions
+            .save_collection(&[source_stale], &[])
+            .unwrap();
         let before_sessions =
             serde_json::to_value(service.project_sessions(&project_id).unwrap()).unwrap();
         let before_domain = domain_snapshot(&root.join("data/sessions.sqlite3"));
@@ -330,9 +398,72 @@ mod tests {
             ..Default::default()
         };
         let found = service.query_project_threads(&project_id, query).unwrap();
-        assert_eq!(found.total, 2);
+        assert_eq!(found.total, 3);
         assert_eq!(found.matches.len(), 1);
-        assert_eq!(found.matches[0].thread_id, "thread-1");
+        assert_eq!(found.matches[0].thread.id, "thread-1");
+        let first = &found.matches[0];
+        assert_eq!(
+            first.attribution.workspace_root,
+            Some(
+                std::fs::canonicalize(&workspace)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        assert!(service
+            .query_project_threads(
+                &project_id,
+                ProjectThreadQuery {
+                    text: "历史代次过期摘要词".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .matches
+            .is_empty());
+        assert!(service
+            .query_project_threads(
+                &project_id,
+                ProjectThreadQuery {
+                    text: "来源版本过期摘要词".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .matches
+            .is_empty());
+        assert_eq!(
+            service
+                .query_project_threads(
+                    &project_id,
+                    ProjectThreadQuery {
+                        text: "继续索引".into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+                .matches
+                .iter()
+                .map(|item| item.thread.id.as_str())
+                .collect::<Vec<_>>(),
+            ["thread-2"]
+        );
+        let selected_while_filtered = service
+            .query_project_threads(
+                &project_id,
+                ProjectThreadQuery {
+                    archived: Some(true),
+                    selected_thread_id: Some("thread-2".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(selected_while_filtered.matches.is_empty());
+        assert_eq!(
+            selected_while_filtered.selected.as_ref().unwrap().thread.id,
+            "thread-2"
+        );
         let hidden = service
             .query_project_threads(
                 &project_id,
@@ -398,9 +529,9 @@ mod tests {
             ungrouped
                 .matches
                 .iter()
-                .map(|item| item.thread_id.as_str())
+                .map(|item| item.thread.id.as_str())
                 .collect::<Vec<_>>(),
-            ["thread-1"]
+            ["thread-3", "thread-1"]
         );
         let grouped = service
             .query_project_threads(
@@ -415,7 +546,7 @@ mod tests {
             grouped
                 .matches
                 .iter()
-                .map(|item| item.thread_id.as_str())
+                .map(|item| item.thread.id.as_str())
                 .collect::<Vec<_>>(),
             ["thread-2"]
         );
