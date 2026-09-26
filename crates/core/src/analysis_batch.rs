@@ -2487,6 +2487,7 @@ impl SourceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fake_codex_binary;
     use codexflow_domain::{
         HistoryCoverage, HistoryItem, HistoryReadPath, HistorySnapshot, HistoryTurn, LocalProject,
         ThreadAttribution, ThreadMetadata,
@@ -2496,7 +2497,6 @@ mod tests {
         fs,
         io::{Read, Write},
         net::TcpListener,
-        os::unix::fs::PermissionsExt,
         path::PathBuf,
         sync::Mutex,
     };
@@ -2621,13 +2621,7 @@ mod tests {
     }
 
     async fn service(root: &PathBuf, mode: &str, count: usize) -> Arc<SourceService> {
-        let binary = root.join(format!("fake-analysis-{mode}.py"));
-        fs::write(
-            &binary,
-            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_codex_binary(&root.join(format!("fake-analysis-{mode}.py")));
         let home = root.join("safe-auth-home");
         fs::create_dir_all(&home).unwrap();
         fs::write(home.join("config.toml"), "model = \"test-model\"\n").unwrap();
@@ -2880,7 +2874,7 @@ mod tests {
         assert!(recovered.interrupted);
         assert_eq!((recovered.succeeded, recovered.pending), (1, 2));
         assert_eq!(recovered.units[1].state, AnalysisUnitState::Pending);
-        let binary = root.join("fake-analysis-ok.py");
+        let binary = fake_codex_binary(&root.join("fake-analysis-ok.py"));
         reopened
             .connect(Some(binary.to_string_lossy().into_owned()))
             .await
@@ -5264,15 +5258,20 @@ mod tests {
             retry_limit: 0,
             ..AnalysisLimits::default()
         };
+        let stages = AnalysisStageSelection {
+            summary: true,
+            relations: false,
+            naming: true,
+        };
         let preview = service
-            .analysis_preview("project-test", limits.clone())
+            .analysis_preview_with_selection("project-test", limits.clone(), stages)
             .await
             .unwrap();
         assert_eq!(preview.stages[0].pending_items, 2);
         assert_eq!(preview.stages[3].pending_items, 1);
         assert!(preview.stages[0].service.contains(&address));
         let started = service
-            .start_project_analysis("project-test".into(), limits, |_| {})
+            .start_project_analysis_with_selection("project-test".into(), limits, stages, |_| {})
             .await
             .unwrap();
         let first = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
@@ -5368,11 +5367,16 @@ mod tests {
             .await
             .unwrap();
         let started = service
-            .start_project_analysis(
+            .start_project_analysis_with_selection(
                 "project-test".into(),
                 AnalysisLimits {
                     retry_limit: 0,
                     ..AnalysisLimits::default()
+                },
+                AnalysisStageSelection {
+                    summary: true,
+                    relations: false,
+                    naming: true,
                 },
                 |_| {},
             )
@@ -5415,12 +5419,29 @@ mod tests {
             .await
             .unwrap();
         let preview = service
-            .analysis_preview("project-test", AnalysisLimits::default())
+            .analysis_preview_with_selection(
+                "project-test",
+                AnalysisLimits::default(),
+                AnalysisStageSelection {
+                    summary: true,
+                    relations: false,
+                    naming: true,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(preview.stages[3].pending_items, 0);
         let started = service
-            .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
+            .start_project_analysis_with_selection(
+                "project-test".into(),
+                AnalysisLimits::default(),
+                AnalysisStageSelection {
+                    summary: true,
+                    relations: false,
+                    naming: true,
+                },
+                |_| {},
+            )
             .await
             .unwrap();
         let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;

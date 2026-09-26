@@ -37,6 +37,7 @@ const source = { selectedBinary: null, resolvedBinary: null, version: null, conn
 test("会话浏览使用查询快照显示行和选中会话", async () => {
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "get_settings") return { theme: "system", source };
+    if (command === "get_runtime_platform") return "macos";
     if (command === "connect_source" || command === "get_source_status") return source;
     if (command === "get_project_catalog") return { projects: [project], selectedProjectId: "project", recentProjectIds: ["project"], unassigned: [], scopes: [] };
     if (command === "get_project_sessions") return { project, workspaces: ["/repo"], threads: [attributed("t1"), attributed("t2")], scopes: [] };
@@ -86,6 +87,7 @@ test("大项目会话列表逐页展示且过滤仍覆盖全部会话", async ()
   const ids = Array.from({ length: 81 }, (_, index) => `thread-${index}`);
   vi.mocked(invoke).mockImplementation(async (command, args) => {
     if (command === "get_settings") return { theme: "system", source };
+    if (command === "get_runtime_platform") return "macos";
     if (command === "connect_source" || command === "get_source_status") return source;
     if (command === "get_project_catalog") return { projects: [project], selectedProjectId: "project", recentProjectIds: ["project"], unassigned: [], scopes: [] };
     if (command === "get_project_sessions") return { project, workspaces: ["/repo"], threads: ids.map(attributed), scopes: [] };
@@ -107,4 +109,26 @@ test("大项目会话列表逐页展示且过滤仍覆盖全部会话", async ()
   fireEvent.change(screen.getByPlaceholderText("标题、预览、Thread ID 或已生成总结"), { target: { value: "thread-80" } });
   await waitFor(() => expect(document.querySelectorAll(".thread-row")).toHaveLength(1));
   expect(screen.getByRole("button", { name: "查看会话 thread-80 的历史" })).toBeTruthy();
+});
+
+test("Windows 来源设置只自动查找 PATH 并忽略已保存的手动路径", async () => {
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_settings") return { theme: "system", source: { ...source, selectedBinary: "C:\\legacy\\codex.cmd" } };
+    if (command === "get_runtime_platform") return "windows";
+    if (command === "connect_source" || command === "get_source_status") return source;
+    if (command === "get_project_catalog") return { projects: [project], selectedProjectId: "project", recentProjectIds: ["project"], unassigned: [], scopes: [] };
+    if (command === "get_project_sessions") return { project, workspaces: ["/repo"], threads: [], scopes: [] };
+    if (command === "get_latest_index_run" || command === "get_latest_analysis_run") return null;
+    if (command === "get_jev_status") return { config: { baseUrl: "https://api.typesafe.ai", model: "jev-latest" }, credentialConfigured: false, credentialError: null };
+    if (command === "get_text_status") return { config: { baseUrl: "https://api.openai.com", model: "test" }, credentialConfigured: false, credentialError: null };
+    throw new Error(`未知接口 ${command}`);
+  });
+  window.localStorage.setItem("codexflow.active-panel", "connections");
+  render(<App />);
+  const choosePanel = await screen.findByRole("heading", { name: "Codex 可执行文件" });
+  await waitFor(() => expect(screen.getByRole("button", { name: /从 PATH 查找并诊断/ })).toBeTruthy());
+  const panel = choosePanel.closest("section")!;
+  expect(panel.querySelector("#binary")).toBeNull();
+  expect(panel.querySelector(".browse-button")).toBeNull();
+  expect(vi.mocked(invoke)).toHaveBeenCalledWith("connect_source", { selectedBinary: null });
 });

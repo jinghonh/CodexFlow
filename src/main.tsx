@@ -116,6 +116,8 @@ function errorText(error: unknown): string {
 export function App() {
   const [activePanel, setActivePanel] = useState<WorkspacePanel>(initialWorkspacePanel);
   const [source, setSource] = useState<SourceStatus | null>(null);
+  const [runtimePlatform, setRuntimePlatform] = useState<string | null>(null);
+  const credentialStoreName = runtimePlatform === "windows" ? "Windows 凭据管理器" : "macOS 钥匙串";
   const [path, setPath] = useState("");
   const [theme, setTheme] = useState<Theme>("system");
   const [busy, setBusy] = useState(true);
@@ -289,9 +291,10 @@ export function App() {
         void loadProjects().catch((error) => setListError(errorText(error)));
       }
     }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});
-    invoke<Settings>("get_settings")
-      .then(async (settings) => {
+    Promise.all([invoke<Settings>("get_settings"), invoke<string>("get_runtime_platform")])
+      .then(async ([settings, platform]) => {
         if (!active) return;
+        setRuntimePlatform(platform);
         let selectedProjectId: string | null = null;
         let cachedScopes: Scope[] = [];
         try {
@@ -311,7 +314,7 @@ export function App() {
         setPath(settings.source.selectedBinary ?? "");
         setSource(settings.source);
         setBusy(false);
-        const next = await invoke<SourceStatus>("connect_source", { selectedBinary: settings.source.selectedBinary });
+        const next = await invoke<SourceStatus>("connect_source", { selectedBinary: platform === "windows" ? null : settings.source.selectedBinary });
         if (active) setSource(next);
         if (active && next.connection === "connected" && selectedProjectId && shouldAutoRefresh(cachedScopes, latestRun)) {
           await startRefresh(selectedProjectId);
@@ -381,7 +384,7 @@ export function App() {
     setBusy(true);
     setPageError("");
     try {
-      const next = await invoke<SourceStatus>("connect_source", { selectedBinary: value.trim() || null });
+      const next = await invoke<SourceStatus>("connect_source", { selectedBinary: runtimePlatform === "windows" ? null : value.trim() || null });
       setSource(next);
       setPath(value);
       if (next.connection === "connected" && projectCatalog?.selectedProjectId) await startRefresh(projectCatalog.selectedProjectId);
@@ -501,7 +504,7 @@ export function App() {
   }
 
   async function deleteJev() {
-    if (!window.confirm("删除钥匙串中的 Jev API Key？已有本地结果会保留。")) return;
+    if (!window.confirm(`删除${credentialStoreName}中的 Jev API Key？已有本地结果会保留。`)) return;
     jevEpoch.current += 1;
     setJevDeleting(true);
     setJevError("");
@@ -555,7 +558,7 @@ export function App() {
   }
 
   async function deleteText() {
-    if (!window.confirm("删除钥匙串中的文本服务 API Key？已有结果会保留。")) return;
+    if (!window.confirm(`删除${credentialStoreName}中的文本服务 API Key？已有结果会保留。`)) return;
     textEpoch.current += 1; setTextBusy(true); setTextError("");
     try {
       setTextStatus(await invoke<TextStatus>("delete_text_credential"));
@@ -718,10 +721,12 @@ export function App() {
           <section className="panel choose-panel">
             <div className="panel-kicker">01 / 选择来源</div>
             <h2>Codex 可执行文件</h2>
-            <p className="panel-intro">选择你实际使用的 <code>codex</code>。留空时从应用可见的 <code>PATH</code> 查找。</p>
-            <label htmlFor="binary">二进制路径或命令名称</label>
-            <div className="path-row"><input id="binary" spellCheck={false} value={path} onChange={(event) => setPath(event.target.value)} placeholder="codex 或 /绝对路径/codex" /><button className="browse-button" onClick={browse} disabled={busy}>浏览…</button></div>
-            <div className="action-row"><button className="primary-button" onClick={() => connect()} disabled={busy}>{busy ? "正在诊断…" : connected ? "重新连接" : "保存并诊断"}<span>↗</span></button><button className="plain-button" disabled={busy} onClick={() => { setPath(""); void connect(""); }}>使用系统命令</button></div>
+            <p className="panel-intro">{runtimePlatform === "windows" ? <>自动从应用可见的 <code>PATH</code> 查找 <code>codex.exe</code> 或 <code>codex.cmd</code>。</> : <>选择你实际使用的 <code>codex</code>。留空时从应用可见的 <code>PATH</code> 查找。</>}</p>
+            {runtimePlatform === "windows" ? <div className="action-row"><button className="primary-button" onClick={() => connect("")} disabled={busy}>{busy ? "正在诊断…" : connected ? "重新连接" : "从 PATH 查找并诊断"}<span>↗</span></button></div> : <>
+              <label htmlFor="binary">二进制路径或命令名称</label>
+              <div className="path-row"><input id="binary" spellCheck={false} value={path} onChange={(event) => setPath(event.target.value)} placeholder="codex 或 /绝对路径/codex" /><button className="browse-button" onClick={browse} disabled={busy}>浏览…</button></div>
+              <div className="action-row"><button className="primary-button" onClick={() => connect()} disabled={busy}>{busy ? "正在诊断…" : connected ? "重新连接" : "保存并诊断"}<span>↗</span></button><button className="plain-button" disabled={busy} onClick={() => { setPath(""); void connect(""); }}>使用系统命令</button></div>
+            </>}
             <div className="path-details"><div><span>实际路径</span><strong title={source?.resolvedBinary ?? undefined}>{source?.resolvedBinary ?? "等待解析"}</strong></div><div><span>版本输出</span><strong>{source?.version ?? "尚未取得"}</strong></div></div>
           </section>
 
@@ -744,14 +749,14 @@ export function App() {
           <div className="jev-fields">
             <label htmlFor="jev-url">服务根地址<input id="jev-url" spellCheck={false} value={jevBaseUrl} onChange={(event) => setJevBaseUrl(event.target.value)} placeholder="https://api.typesafe.ai" /></label>
             <label htmlFor="jev-model">模型 ID<input id="jev-model" spellCheck={false} value={jevModel} onChange={(event) => setJevModel(event.target.value)} placeholder="jev-latest" /></label>
-            <label htmlFor="jev-key">API Key<input id="jev-key" type="password" autoComplete="off" spellCheck={false} value={jevKey} onChange={(event) => setJevKey(event.target.value)} placeholder={jevStatus?.credentialError ? "钥匙串不可用；请先解锁" : jevStatus?.credentialConfigured ? "已保存；留空则保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
+            <label htmlFor="jev-key">API Key<input id="jev-key" type="password" autoComplete="off" spellCheck={false} value={jevKey} onChange={(event) => setJevKey(event.target.value)} placeholder={jevStatus?.credentialError ? `${credentialStoreName}不可用；请检查凭据访问权限` : jevStatus?.credentialConfigured ? "已保存；留空则保留现有密钥" : `填写后存入${credentialStoreName}`} /></label>
           </div>
-          <p className="jev-key-state">钥匙串状态：{jevStatus?.credentialError ? "暂时无法读取" : jevStatus?.credentialConfigured ? "已保存地址已配置密钥" : "已保存地址未配置密钥"}。更换服务地址时需填写新密钥。{jevUnsaved ? "请先保存修改，再运行验证。" : ""}</p>
+          <p className="jev-key-state">{credentialStoreName}状态：{jevStatus?.credentialError ? "暂时无法读取" : jevStatus?.credentialConfigured ? "已保存地址已配置密钥" : "已保存地址未配置密钥"}。更换服务地址时需填写新密钥。{jevUnsaved ? "请先保存修改，再运行验证。" : ""}</p>
           {jevStatus?.credentialError && <div className="page-error" role="alert">{errorText(jevStatus.credentialError)}</div>}
           {jevError && <div className="page-error" role="alert">{jevError}</div>}
           <div className="jev-actions">
             <button className="primary-button" disabled={jevBusy} onClick={saveJev}>保存设置</button>
-            {jevStatus?.credentialError && <button className="browse-button" disabled={jevBusy} onClick={refreshJevStatus}>重查钥匙串</button>}
+            {jevStatus?.credentialError && <button className="browse-button" disabled={jevBusy} onClick={refreshJevStatus}>重试读取凭据</button>}
             <button className="browse-button" disabled={jevBusy || jevUnsaved || !jevStatus?.credentialConfigured} onClick={() => runJev("connection")}>验证连接</button>
             <button className="browse-button" disabled={jevBusy || jevUnsaved || !jevStatus?.credentialConfigured} onClick={() => runJev("inference")}>测试固定合成推理</button>
             {jevRequestBusy && <button className="plain-button" onClick={cancelJev}>取消请求</button>}
@@ -769,14 +774,14 @@ export function App() {
           <div className="jev-fields">
             <label htmlFor="text-url">服务地址<input id="text-url" spellCheck={false} value={textBaseUrl} onChange={(event) => setTextBaseUrl(event.target.value)} placeholder="https://example.com/v1" /></label>
             <label htmlFor="text-model">模型 ID<input id="text-model" spellCheck={false} value={textModel} onChange={(event) => setTextModel(event.target.value)} placeholder="模型名称" /></label>
-            <label htmlFor="text-key">API Key<input id="text-key" type="password" autoComplete="off" spellCheck={false} value={textKey} onChange={(event) => setTextKey(event.target.value)} placeholder={textStatus?.credentialConfigured ? "已保存；留空保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
+            <label htmlFor="text-key">API Key<input id="text-key" type="password" autoComplete="off" spellCheck={false} value={textKey} onChange={(event) => setTextKey(event.target.value)} placeholder={textStatus?.credentialConfigured ? "已保存；留空保留现有密钥" : `填写后存入${credentialStoreName}`} /></label>
           </div>
-          <p className="jev-key-state">钥匙串：{textStatus?.credentialError ? "暂时无法读取" : textStatus?.credentialConfigured ? "当前地址已配置密钥" : "当前地址未配置密钥"}。更换地址必须填写新密钥。{textUnsaved ? "请先保存修改。" : ""}</p>
+          <p className="jev-key-state">{credentialStoreName}：{textStatus?.credentialError ? "暂时无法读取" : textStatus?.credentialConfigured ? "当前地址已配置密钥" : "当前地址未配置密钥"}。更换地址必须填写新密钥。{textUnsaved ? "请先保存修改。" : ""}</p>
           {textStatus?.credentialError && <p className="page-error" role="alert">{errorText(textStatus.credentialError)}</p>}
           {textError && <p className="page-error" role="alert">{textError}</p>}
           <div className="jev-actions">
             <button className="primary-button" disabled={textBusy || textValidating} onClick={() => void saveText()}>保存设置</button>
-            {textStatus?.credentialError && <button className="browse-button" disabled={textBusy || textValidating} onClick={() => void invoke<TextStatus>("get_text_status").then(setTextStatus).catch((error) => setTextError(errorText(error)))}>重查钥匙串</button>}
+            {textStatus?.credentialError && <button className="browse-button" disabled={textBusy || textValidating} onClick={() => void invoke<TextStatus>("get_text_status").then(setTextStatus).catch((error) => setTextError(errorText(error)))}>重试读取凭据</button>}
             <button className="browse-button" disabled={textBusy || textValidating || textUnsaved || !textStatus?.credentialConfigured} onClick={() => void validateText()}>验证固定合成推理</button>
             {textValidating && <button className="plain-button" onClick={() => void cancelText()}>取消请求</button>}
             <button className="plain-button" disabled={textBusy || textValidating || !textStatus?.credentialConfigured} onClick={() => void deleteText()}>删除密钥</button>
@@ -794,7 +799,7 @@ export function App() {
         <section id="projects" className="panel project-panel">
           <div className="panel-kicker">准备 / 项目</div><h2>选择项目</h2>
           <p className="panel-intro">选择真实目录。Git 项目按共享 Git 目录识别，独立克隆分别显示；非 Git 项目按所选目录归属。</p>
-          <div className="project-picker"><input aria-label="本地项目目录" spellCheck={false} value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder="/本机/项目目录" /><button className="browse-button" onClick={() => void selectDirectory()}>浏览…</button><button className="primary-button" onClick={() => void chooseProject()} disabled={!projectPath.trim()}>选择目录<span>↗</span></button></div>
+          <div className="project-picker"><input aria-label="本地项目目录" spellCheck={false} value={projectPath} onChange={(event) => setProjectPath(event.target.value)} placeholder={runtimePlatform === "windows" ? "C:\\Users\\用户名\\source\\项目" : "/本机/项目目录"} /><button className="browse-button" onClick={() => void selectDirectory()}>浏览…</button><button className="primary-button" onClick={() => void chooseProject()} disabled={!projectPath.trim()}>选择目录<span>↗</span></button></div>
           {projectError && <div className="page-error" role="alert">{projectError}</div>}
           <div className="project-list">{projects.length === 0 ? <p className="empty-list">尚无项目。选择目录，或连接来源并刷新以发现 Git 项目。</p> : projects.map((project) => <button key={project.id} className={`project-choice ${project.id === projectCatalog?.selectedProjectId && !showUnassigned ? "selected" : ""}`} onClick={() => void chooseExistingProject(project.id)}><strong>{project.name}</strong><small>{project.root}</small><span>{project.gitCommonDir ? "Git 仓库" : "非 Git 目录"}{projectCatalog?.recentProjectIds.includes(project.id) ? " · 最近打开" : ""}</span></button>)}</div>
           <button className={`unassigned-choice ${showUnassigned ? "selected" : ""}`} onClick={() => setShowUnassigned(true)}>未归属会话：{projectCatalog?.unassigned.length ?? 0} 条</button>

@@ -10,6 +10,9 @@ mod text_settings;
 mod workstreams;
 
 use codexflow_codex::{diagnose, CollectionUpdate, Session};
+#[cfg(test)]
+mod test_support;
+
 use codexflow_domain::{
     build_project_timeline, AppError, CandidatePreview, ConnectionState, DisplayTheme, ErrorCode,
     EvidenceCheck, EvidenceField, EvidencePage, EvidenceState, FactPage, HistoryCoverage,
@@ -230,7 +233,7 @@ impl SourceService {
                 if restored.is_err() {
                     return Err(AppError::jev(
                         ErrorCode::JevCredentialFailed,
-                        "设置保存失败，且无法恢复之前的钥匙串状态；请重新填写当前服务地址的 API Key。",
+                        "设置保存失败，且无法恢复之前的系统凭据状态；请重新填写当前服务地址的 API Key。",
                         true,
                     ));
                 }
@@ -1526,7 +1529,8 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, io::Write, os::unix::fs::PermissionsExt};
+    use crate::test_support::{fake_codex_binary, PermissionsExt};
+    use std::{fs, io::Write};
 
     #[derive(Default)]
     struct MemoryCredentials(std::sync::Mutex<Option<(String, String)>>);
@@ -1695,7 +1699,7 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     #[tokio::test]
     async fn read_only_database_does_not_report_settings_saved() {
         let dir = temp_data_dir();
@@ -1843,13 +1847,7 @@ mod tests {
 
         let dir = temp_data_dir();
         fs::create_dir_all(&dir).unwrap();
-        let binary = dir.join("fake-gated-list-rich.py");
-        fs::write(
-            &binary,
-            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_codex_binary(&dir.join("fake-gated-list-rich.py"));
         // Keep HTTP pending without relying on an external service or response timing.
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let credentials = Arc::new(MemoryCredentials::default());
@@ -2024,12 +2022,7 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&root).unwrap();
-        let binary = root.join("fake-ok.py");
-        let mut file = fs::File::create(&binary).unwrap();
-        file.write_all(include_bytes!("../../codex/tests/fixtures/fake_codex.py"))
-            .unwrap();
-        file.set_permissions(fs::Permissions::from_mode(0o700))
-            .unwrap();
+        let binary = fake_codex_binary(&root.join("fake-ok.py"));
 
         let service = SourceService::new(root.join("data")).unwrap();
         let failed = service
@@ -2065,13 +2058,7 @@ mod tests {
     async fn session_cache_and_jev_settings_survive_each_others_lifecycle() {
         let dir = temp_data_dir();
         fs::create_dir_all(&dir).unwrap();
-        let binary = dir.join("fake-list-rich.py");
-        fs::write(
-            &binary,
-            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_codex_binary(&dir.join("fake-list-rich.py"));
         let credentials = Arc::new(MemoryCredentials::default());
         let service = SourceService::with_credentials(dir.clone(), credentials.clone()).unwrap();
         service
@@ -2140,17 +2127,12 @@ mod tests {
         ));
         fs::create_dir_all(&root).unwrap();
         for mode in ["list-rich", "list-partial", "list-moved"] {
-            let binary = root.join(format!("fake-{mode}.py"));
-            let mut file = fs::File::create(&binary).unwrap();
-            file.write_all(include_bytes!("../../codex/tests/fixtures/fake_codex.py"))
-                .unwrap();
-            file.set_permissions(fs::Permissions::from_mode(0o700))
-                .unwrap();
+            fake_codex_binary(&root.join(format!("fake-{mode}.py")));
         }
         let service = SourceService::new(root.join("data")).unwrap();
         service
             .connect(Some(
-                root.join("fake-list-rich.py")
+                fake_codex_binary(&root.join("fake-list-rich.py"))
                     .to_string_lossy()
                     .into_owned(),
             ))
@@ -2191,7 +2173,7 @@ mod tests {
         assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
         reopened
             .connect(Some(
-                root.join("fake-list-partial.py")
+                fake_codex_binary(&root.join("fake-list-partial.py"))
                     .to_string_lossy()
                     .into_owned(),
             ))
@@ -2218,7 +2200,7 @@ mod tests {
         );
         reopened
             .connect(Some(
-                root.join("fake-list-moved.py")
+                fake_codex_binary(&root.join("fake-list-moved.py"))
                     .to_string_lossy()
                     .into_owned(),
             ))
@@ -2559,13 +2541,7 @@ mod tests {
 
         let root = temp_data_dir();
         fs::create_dir_all(&root).unwrap();
-        let binary = root.join("fake-cancel-partial.py");
-        fs::write(
-            &binary,
-            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_codex_binary(&root.join("fake-cancel-partial.py"));
 
         let service = Arc::new(SourceService::new(root.join("data")).unwrap());
         let connected = service
@@ -2637,13 +2613,7 @@ mod tests {
     async fn failed_thread_history_does_not_block_another_thread_or_erase_metadata() {
         let root = temp_data_dir();
         fs::create_dir_all(&root).unwrap();
-        let binary = root.join("fake-history-partial.py");
-        fs::write(
-            &binary,
-            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_codex_binary(&root.join("fake-history-partial.py"));
         let service = SourceService::with_credentials(
             root.join("data"),
             Arc::new(MemoryCredentials::default()),
@@ -2723,13 +2693,7 @@ mod tests {
         ] {
             let root = temp_data_dir();
             fs::create_dir_all(&root).unwrap();
-            let binary = root.join(format!("fake-history-{mode}.py"));
-            fs::write(
-                &binary,
-                include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-            )
-            .unwrap();
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let binary = fake_codex_binary(&root.join(format!("fake-history-{mode}.py")));
             let service = SourceService::with_credentials(
                 root.join("data"),
                 Arc::new(MemoryCredentials::default()),
@@ -3056,13 +3020,7 @@ mod tests {
             "list-partial",
             "list-rich-exit-second",
         ] {
-            let binary = root.join(format!("fake-{mode}.py"));
-            fs::write(
-                &binary,
-                include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-            )
-            .unwrap();
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            fake_codex_binary(&root.join(format!("fake-{mode}.py")));
         }
         let service = Arc::new(SourceService::new(root.join("data")).unwrap());
         let project_id = service
@@ -3072,7 +3030,7 @@ mod tests {
             .unwrap();
         service
             .connect(Some(
-                root.join("fake-list-rich.py")
+                fake_codex_binary(&root.join("fake-list-rich.py"))
                     .to_string_lossy()
                     .into_owned(),
             ))
@@ -3099,7 +3057,7 @@ mod tests {
 
         service
             .connect(Some(
-                root.join("fake-list-rich-second-gate.py")
+                fake_codex_binary(&root.join("fake-list-rich-second-gate.py"))
                     .to_string_lossy()
                     .into_owned(),
             ))
@@ -3167,7 +3125,7 @@ mod tests {
         assert_eq!(reopened.cached_sessions().unwrap().threads.len(), 4);
         reopened
             .connect(Some(
-                root.join("fake-list-partial.py")
+                fake_codex_binary(&root.join("fake-list-partial.py"))
                     .to_string_lossy()
                     .into_owned(),
             ))
@@ -3204,7 +3162,7 @@ mod tests {
             .all(|thread| !thread.missing_from_source));
         reopened
             .connect(Some(
-                root.join("fake-list-rich-exit-second.py")
+                fake_codex_binary(&root.join("fake-list-rich-exit-second.py"))
                     .to_string_lossy()
                     .into_owned(),
             ))

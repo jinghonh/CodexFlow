@@ -79,24 +79,42 @@ pub trait CredentialStore: Send + Sync {
 }
 
 pub fn system_credentials() -> Arc<dyn CredentialStore> {
-    Arc::new(KeychainCredentialStore {
-        service: b"dev.codexflow.desktop.jev",
+    Arc::new(SystemCredentialStore {
+        service: credential_service(b"dev.codexflow.desktop.jev"),
     })
 }
 
 pub fn system_text_credentials() -> Arc<dyn CredentialStore> {
-    Arc::new(KeychainCredentialStore {
-        service: b"dev.codexflow.desktop.text",
+    Arc::new(SystemCredentialStore {
+        service: credential_service(b"dev.codexflow.desktop.text"),
     })
 }
 
-pub struct KeychainCredentialStore {
-    service: &'static [u8],
+pub struct SystemCredentialStore {
+    service: Vec<u8>,
 }
 
-impl CredentialStore for KeychainCredentialStore {
+fn credential_service(service: &[u8]) -> Vec<u8> {
+    let mut target = service.to_vec();
+    if let Some(namespace) = std::env::var_os("CODEXFLOW_CREDENTIAL_NAMESPACE") {
+        let namespace = namespace.to_string_lossy();
+        if !namespace.is_empty() {
+            target.push(b'.');
+            target.extend(namespace.bytes().map(|byte| {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+                    byte
+                } else {
+                    b'_'
+                }
+            }));
+        }
+    }
+    target
+}
+
+impl CredentialStore for SystemCredentialStore {
     fn load(&self) -> Result<Option<Credential>, AppError> {
-        let bytes = keychain::load(self.service)?;
+        let bytes = keychain::load(&self.service)?;
         bytes
             .map(|bytes| {
                 let record: KeychainRecord =
@@ -115,11 +133,11 @@ impl CredentialStore for KeychainCredentialStore {
             key: &credential.key,
         })
         .map_err(|_| credential_error())?;
-        keychain::save(self.service, &bytes)
+        keychain::save(&self.service, &bytes)
     }
 
     fn delete(&self) -> Result<(), AppError> {
-        keychain::delete(self.service)
+        keychain::delete(&self.service)
     }
 }
 
@@ -132,9 +150,24 @@ struct KeychainRecord<'a> {
 fn credential_error() -> AppError {
     error(
         ErrorCode::JevCredentialFailed,
-        "无法访问 macOS 钥匙串。请解锁钥匙串并允许应用访问后重试。",
+        credential_error_message(),
         true,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn credential_error_message() -> &'static str {
+    "无法访问 macOS 钥匙串。请解锁钥匙串并允许应用访问后重试。"
+}
+
+#[cfg(target_os = "windows")]
+fn credential_error_message() -> &'static str {
+    "无法访问 Windows 凭据管理器。请检查当前用户的系统凭据状态后重试。"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn credential_error_message() -> &'static str {
+    "当前平台没有可用的系统凭据库。凭据未保存，请在受支持的平台上重试。"
 }
 
 pub struct JevClient {
@@ -805,7 +838,116 @@ mod tests {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+mod keychain {
+    use super::{credential_error, AppError};
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::{
+        Foundation::GetLastError,
+        Security::Credentials::{
+            CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
+            CRED_TYPE_GENERIC,
+        },
+    };
+
+    const ERROR_NOT_FOUND: u32 = 1168;
+    const MAX_CREDENTIAL_BLOB_SIZE: usize = 2560;
+
+    fn target_name(service: &[u8]) -> Result<Vec<u16>, AppError> {
+        let service = std::str::from_utf8(service).map_err(|_| credential_error())?;
+        let mut target: Vec<u16> = service.encode_utf16().collect();
+        target.push(0);
+        Ok(target)
+    }
+
+    struct CredentialGuard(*mut CREDENTIALW);
+
+    impl Drop for CredentialGuard {
+        fn drop(&mut self) {
+            unsafe { CredFree(self.0.cast::<c_void>()) };
+        }
+    }
+
+    pub fn load(service: &[u8]) -> Result<Option<Vec<u8>>, AppError> {
+        let target = target_name(service)?;
+        let mut credential = ptr::null_mut();
+        let succeeded =
+            unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+        if succeeded == 0 {
+            return if unsafe { GetLastError() } == ERROR_NOT_FOUND {
+                Ok(None)
+            } else {
+                Err(credential_error())
+            };
+        }
+
+        let credential = CredentialGuard(credential);
+        let value = unsafe { &*credential.0 };
+        if value.CredentialBlobSize == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if value.CredentialBlob.is_null() {
+            return Err(credential_error());
+        }
+        Ok(Some(unsafe {
+            std::slice::from_raw_parts(value.CredentialBlob, value.CredentialBlobSize as usize)
+                .to_vec()
+        }))
+    }
+
+    pub fn save(service: &[u8], bytes: &[u8]) -> Result<(), AppError> {
+        if bytes.len() > MAX_CREDENTIAL_BLOB_SIZE {
+            return Err(credential_error());
+        }
+        let target = target_name(service)?;
+        let mut credential: CREDENTIALW = unsafe { std::mem::zeroed() };
+        credential.Type = CRED_TYPE_GENERIC;
+        credential.TargetName = target.as_ptr() as *mut u16;
+        credential.CredentialBlobSize = bytes.len() as u32;
+        credential.CredentialBlob = bytes.as_ptr() as *mut u8;
+        credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+        if unsafe { CredWriteW(&credential, 0) } == 0 {
+            return Err(credential_error());
+        }
+        Ok(())
+    }
+
+    pub fn delete(service: &[u8]) -> Result<(), AppError> {
+        let target = target_name(service)?;
+        if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0
+            && unsafe { GetLastError() } != ERROR_NOT_FOUND
+        {
+            return Err(credential_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[test]
+        fn credential_manager_round_trip_uses_an_isolated_target() {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let service = format!("dev.codexflow.test.{}.{}", std::process::id(), nonce);
+            delete(service.as_bytes()).unwrap();
+            assert_eq!(load(service.as_bytes()).unwrap(), None);
+            save(service.as_bytes(), b"synthetic-only-credential").unwrap();
+            assert_eq!(
+                load(service.as_bytes()).unwrap().as_deref(),
+                Some(&b"synthetic-only-credential"[..])
+            );
+            delete(service.as_bytes()).unwrap();
+            assert_eq!(load(service.as_bytes()).unwrap(), None);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod keychain {
     use super::{credential_error, AppError};
     pub fn load(_: &[u8]) -> Result<Option<Vec<u8>>, AppError> {

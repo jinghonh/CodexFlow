@@ -125,6 +125,16 @@ fn original_codex_home(override_home: Option<&Path>) -> Option<PathBuf> {
     override_home.map(Path::to_path_buf).or_else(|| {
         env::var_os("CODEX_HOME")
             .map(PathBuf::from)
+            .or_else(|| {
+                #[cfg(windows)]
+                {
+                    env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".codex"))
+                }
+                #[cfg(not(windows))]
+                {
+                    None
+                }
+            })
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex")))
     })
 }
@@ -133,14 +143,14 @@ pub fn analysis_isolation_issue(override_home: Option<&Path>) -> Option<String> 
     // Read-only permits file inspection. Reject file-backed login before a model
     // turn; observing a tool event afterwards would be too late to protect it.
     if original_codex_home(override_home).is_some_and(|home| home.join("auth.json").exists()) {
-        return Some("当前 Codex 认证保存在 auth.json 文件中，无法保证模型工具不能读取。请改用系统钥匙串保存认证，并移除该文件后再启用总结。".into());
+        return Some("当前 Codex 认证保存在 auth.json 文件中，无法保证模型工具不能读取。请改用系统凭据保存认证，并移除该文件后再启用总结。".into());
     }
     if ["OPENAI_API_KEY", "CODEX_API_KEY"]
         .iter()
         .any(|key| env::var_os(key).is_some())
     {
         return Some(
-            "当前进程含有模型可读取的认证环境变量，已禁用临时总结。请使用系统钥匙串认证。".into(),
+            "当前进程含有模型可读取的认证环境变量，已禁用临时总结。请使用系统凭据认证。".into(),
         );
     }
     None

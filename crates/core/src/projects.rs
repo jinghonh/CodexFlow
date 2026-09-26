@@ -278,11 +278,12 @@ pub fn reconcile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codexflow_domain::{GitMetadata, ThreadMetadata};
-    use std::{
-        os::unix::fs::symlink,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    #[cfg(unix)]
+    use codexflow_domain::GitMetadata;
+    use codexflow_domain::ThreadMetadata;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn git(args: &[&str]) {
         let output = Command::new("git").args(args).output().unwrap();
@@ -322,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn real_repositories_worktrees_clones_nested_repos_and_missing_paths() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)

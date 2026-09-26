@@ -47,9 +47,9 @@ impl AppError {
             }
             ErrorCode::ConcurrentModification => "刷新当前项目后重新提交修改。",
             ErrorCode::JevCredentialFailed => {
-                "解锁钥匙串并允许应用访问；如密钥已删除，请重新填写 API Key。"
+                "检查系统凭据库访问权限；如密钥已删除，请重新填写 API Key。"
             }
-            ErrorCode::TextCredentialFailed => "解锁钥匙串并允许应用访问，然后重试。",
+            ErrorCode::TextCredentialFailed => "检查系统凭据库访问权限，然后重试。",
             ErrorCode::TextNotConfigured => "填写文本生成服务地址、模型和当前地址的 API Key。",
             ErrorCode::TextInvalidAddress => "填写有效的 HTTPS 服务地址并重新保存。",
             ErrorCode::TextConnectionFailed | ErrorCode::TextProtocolInvalid => {

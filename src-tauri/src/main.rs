@@ -79,6 +79,11 @@ fn service<'a>(state: &'a tauri::State<'_, AppState>) -> Result<&'a Arc<SourceSe
 }
 
 #[tauri::command]
+fn get_runtime_platform() -> &'static str {
+    std::env::consts::OS
+}
+
+#[tauri::command]
 async fn get_settings(state: tauri::State<'_, AppState>) -> Result<SettingsView, AppError> {
     let (theme, source) = service(&state)?.settings().await;
     Ok(SettingsView { theme, source })
@@ -94,6 +99,7 @@ async fn connect_source(
     state: tauri::State<'_, AppState>,
     selected_binary: Option<String>,
 ) -> Result<SourceStatus, AppError> {
+    let selected_binary = if cfg!(windows) { None } else { selected_binary };
     service(&state)?.connect(selected_binary).await
 }
 
@@ -574,6 +580,7 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_runtime_platform,
             get_settings,
             record_perf_sample,
             get_source_status,

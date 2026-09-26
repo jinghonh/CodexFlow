@@ -985,8 +985,9 @@ impl SourceService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::fake_codex_binary;
     use codexflow_domain::{HistoryCoverage, HistoryReadPath, ThreadMetadata};
-    use std::{fs, os::unix::fs::PermissionsExt, time::Duration};
+    use std::{fs, time::Duration};
 
     struct CountingAnalyzer {
         active: Arc<std::sync::atomic::AtomicUsize>,
@@ -1049,7 +1050,9 @@ mod tests {
             std::process::id(),
             now_ms()
         ));
-        let service = Arc::new(SourceService::new(root.join("data")).unwrap());
+        let mut service = SourceService::new(root.join("data")).unwrap();
+        service.model_slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let service = Arc::new(service);
         service.sessions.save_collection(&[thread()], &[]).unwrap();
         service
             .sessions
@@ -1200,13 +1203,7 @@ mod tests {
             now_ms()
         ));
         fs::create_dir_all(&root).unwrap();
-        let binary = root.join("fake-analysis-ok.py");
-        fs::write(
-            &binary,
-            include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-        )
-        .unwrap();
-        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let binary = fake_codex_binary(&root.join("fake-analysis-ok.py"));
         let auth_home = root.join("safe-auth-home");
         fs::create_dir(&auth_home).unwrap();
         fs::write(auth_home.join("config.toml"), "model = \"test-model\"\n").unwrap();
@@ -1271,9 +1268,7 @@ mod tests {
             .await
             .unwrap();
         assert!(reused.reused_cache);
-        let alternate = root.join("fake-analysis-alternate.py");
-        fs::copy(&binary, &alternate).unwrap();
-        fs::set_permissions(&alternate, fs::Permissions::from_mode(0o700)).unwrap();
+        let alternate = fake_codex_binary(&root.join("fake-analysis-alternate.py"));
         service
             .connect(Some(alternate.to_string_lossy().into_owned()))
             .await
@@ -1497,13 +1492,7 @@ mod tests {
                 now_ms()
             ));
             fs::create_dir_all(&root).unwrap();
-            let binary = root.join(format!("fake-analysis-{mode}.py"));
-            fs::write(
-                &binary,
-                include_bytes!("../../codex/tests/fixtures/fake_codex.py"),
-            )
-            .unwrap();
-            fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+            let binary = fake_codex_binary(&root.join(format!("fake-analysis-{mode}.py")));
             let auth_home = root.join("safe-auth-home");
             fs::create_dir(&auth_home).unwrap();
             let mut service = SourceService::new(root.join("data")).unwrap();
