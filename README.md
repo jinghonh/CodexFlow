@@ -1,27 +1,40 @@
 # CodexFlow
 
-CodexFlow 是 macOS 本地桌面应用，用于查看 Codex 项目的会话、回合、证据、活动时间线、关系与工作流。同一 Git 仓库的主工作区和 worktree 归入同一项目；独立克隆分别归属。来源读取与模型分析是两个独立操作：连接和刷新列表不会调用模型，分析必须由用户手动启动。
+CodexFlow 是面向 macOS 与 Windows 11 x64 的本地桌面应用，用于查看 Codex 项目的会话、回合、证据、活动时间线、关系与工作流。同一 Git 仓库的主工作区和 worktree 归入同一项目；独立克隆分别归属。来源读取与模型分析是两个独立操作：连接和刷新列表不会调用模型，分析必须由用户手动启动。
 
 ## 安装与启动
 
-当前源码版本为 `0.1.0`。需要 macOS、Apple Silicon 或相应构建目标，以及可运行的 Codex CLI。应用构建需要 Node.js、npm、Rust 1.88（`rust-toolchain.toml`）和 Xcode 命令行工具。
+当前源码版本为 `0.1.0`。运行应用需要可用的 Codex CLI。构建需要 Node.js、npm 和 Rust 1.88（`rust-toolchain.toml`）；macOS 还需要 Xcode 命令行工具，Windows 11 x64 还需要 Visual Studio C++ Build Tools 与 Windows SDK。
+
+macOS 本地构建：
 
 ```sh
 npm ci
 npm run build:macos:local
 ```
 
-构建结果位于 `target/release/bundle/macos/CodexFlow.app`。本机脚本会对应用包做临时签名并验证包完整性；它不提供开发者证书签名或公证。把整个 `.app` 复制到「应用程序」或其他本机目录后启动；不要只复制其中的可执行文件。首次运行先检查「实际路径」和「版本输出」，确认应用找到的是你打算使用的 Codex CLI。桌面应用从 `PATH` 查找 `codex`；若图形界面的 `PATH` 与终端不同，请在「Codex 可执行文件」中填写绝对路径，点击「保存并诊断」。诊断只探测协议和来源能力，不代表真实历史或模型推理已经通过。
+Windows 11 x64 原生构建与 NSIS 安装器：
+
+在已加载 MSVC 与 Windows SDK 环境的 Visual Studio Developer PowerShell 中运行：
+
+```powershell
+npm ci
+npm run build:windows:local
+```
+
+安装器生成在 `target/x86_64-pc-windows-msvc/release/bundle/nsis/`。它是未签名的单文件 `.exe`；安装时可选择当前用户或全机范围，因此启动安装器会请求管理员权限，即使选择当前用户安装也一样。缺少 WebView2 Runtime 时安装器可联网获取 bootstrapper；Windows 11 通常已包含该 Runtime。正式支持的 Windows CLI 来源为应用可见的 `PATH`：自动查找 `codex.exe` 或 `codex.cmd`，不提供手动路径选择。
+
+macOS 构建结果位于 `target/release/bundle/macos/CodexFlow.app`。本机脚本会对应用包做临时签名并验证包完整性；它不提供开发者证书签名或公证。把整个 `.app` 复制到「应用程序」或其他本机目录后启动；不要只复制其中的可执行文件。首次运行先检查「实际路径」和「版本输出」，确认应用找到的是你打算使用的 Codex CLI。macOS 桌面应用从 `PATH` 查找 `codex`；若图形界面的 `PATH` 与终端不同，可在「Codex 可执行文件」中填写绝对路径。诊断只探测协议和来源能力，不代表真实历史或模型推理已经通过。
 
 打开应用后，在「本地项目」选择目录并刷新列表。可查看已归档会话、子代理和派生关系的来源元数据；选择会话后按需读取回合与条目。项目内可切换时间线与关系图、查看证据、搜索和过滤会话、整理工作流。来源不完整或暂时不可用时，应用保留已保存的缓存并显示相应状态；不要把缓存视为最新来源。
 
 ## 配置文本服务、Jev 与运行分析
 
-在「文本模型连接设置」填写 OpenAI 兼容 Chat Completions 服务的 Base URL、模型 ID 和 API Key。地址可带 `/v1` 或网关路径前缀，应用会请求相应的 `chat/completions` 端点。API Key 只保存在独立的 macOS 钥匙串条目中；界面不读回明文。留空保存会保留当前地址的密钥，更换地址必须填写新密钥；可单独替换或删除。点击「验证固定合成推理」会发送固定合成材料，消耗一次推理调用，不发送项目历史。连接、保存设置和预览不会自动发起模型请求。
+在「文本模型连接设置」填写 OpenAI 兼容 Chat Completions 服务的 Base URL、模型 ID 和 API Key。地址可带 `/v1` 或网关路径前缀，应用会请求相应的 `chat/completions` 端点。API Key 只保存在操作系统凭据库中（macOS 钥匙串或 Windows 凭据管理器）；界面不读回明文。留空保存会保留当前地址的密钥，更换地址必须填写新密钥；可单独替换或删除。点击「验证固定合成推理」会发送固定合成材料，消耗一次推理调用，不发送项目历史。连接、保存设置和预览不会自动发起模型请求。
 
-在「Jev 连接设置」填写服务根地址、模型 ID 和 API Key，然后点击「保存设置」。默认根地址提示为 `https://api.typesafe.ai`，默认模型为 `jev-latest`；也可填写版本化模型 ID。根地址不应附加 `/v1/models`、`/v1/systemone` 或重复的 `/v1`。API Key 存入 macOS 钥匙串，界面只显示配置状态；留空保存会保留当前地址下已有密钥，更换服务地址时需填写新密钥。可在界面替换或删除密钥。不要在日志、议题或验收记录中粘贴真实密钥。
+在「Jev 连接设置」填写服务根地址、模型 ID 和 API Key，然后点击「保存设置」。默认根地址提示为 `https://api.typesafe.ai`，默认模型为 `jev-latest`；也可填写版本化模型 ID。根地址不应附加 `/v1/models`、`/v1/systemone` 或重复的 `/v1`。API Key 存入操作系统凭据库，界面只显示配置状态；留空保存会保留当前地址下已有密钥，更换服务地址时需填写新密钥。可在界面替换或删除密钥。不要在日志、议题或验收记录中粘贴真实密钥。
 
-文本服务与 Jev 的凭据分别使用固定的钥匙串服务名 `dev.codexflow.desktop.text` 和 `dev.codexflow.desktop.jev`。对这两类凭据执行保存、替换或删除的生命周期测试时，必须使用独立的 macOS 测试用户；只更改应用标识或 `CODEX_HOME` 不能隔离钥匙串，同一用户下的测试可能影响正式应用的密钥。
+文本服务与 Jev 的凭据分别使用固定服务名 `dev.codexflow.desktop.text` 和 `dev.codexflow.desktop.jev`。系统凭据库不可用或写入失败时，应用不会回退到明文文件。对生产凭据执行生命周期测试前，应使用隔离的操作系统用户或唯一测试凭据目标，避免触及当前用户已有条目。
 
 Jev 的「验证连接」只请求模型列表，不会推理；「测试固定合成推理」会发送固定合成材料并消耗一次推理调用，不读取项目历史。模型列表成功不能代替推理成功；推理结果中会显示实际模型版本和用量。会话总结可在详情中单独手动生成；项目「预览与批次」会先显示各阶段服务、发送范围及调用上限，再由用户启动。文本服务负责总结与已确定工作流成员的命名，Jev 负责候选关系判断与证据选择。各推理请求共用本批调用预算。可暂停、继续或取消；取消只确认本地请求结束，不保证远端计算或计费停止。
 
@@ -29,6 +42,6 @@ Jev 的「验证连接」只请求模型列表，不会推理；「测试固定�
 
 ## 验证与交付状态
 
-维护者的构建、受控验收步骤和逐项证据见 [#33 发布验收记录](docs/release/issue-33-acceptance.md)。源码回归入口为 `npm run test:ui`、相关 Rust 包的 `cargo test` 和正式 `npm run tauri -- build`；正式包验收应使用独立应用数据目录与受控会话，不能触碰用户原有会话。
+维护者的构建、受控验收步骤和逐项证据见 [#33 发布验收记录](docs/release/issue-33-acceptance.md) 与 [Windows 11 x64 验收记录](docs/release/windows-11-x64-acceptance.md)。源码回归入口为 `npm run test:ui`、相关 Rust 包的 `cargo test`；正式包验收应使用独立应用数据目录与受控会话，不能触碰用户原有会话。Windows 构建目前由维护者本地执行，暂不纳入 GitHub Actions。
 
 V1 范围与完整验收条件以 [规格](docs/SPEC.md)、[#35 文本服务后续需求](https://github.com/jinghonh/CodexFlow/issues/35)及 [#33](https://github.com/jinghonh/CodexFlow/issues/33) 为准。#35 补充并覆盖旧规格中总结与命名只能使用 Codex 临时会话的限制。当前发布准备不等于整体验收完成：真实 Jev 关系质量仍依赖 #31、#32；性能门槛按 [#30 最终记录](docs/performance/issue-30-final-acceptance.md)区分已通过和用户授权暂缓的项目。外部渠道发布不在本次默认动作内。

@@ -8,9 +8,24 @@ use tokio_util::sync::CancellationToken;
 fn credential_error() -> AppError {
     AppError::text(
         ErrorCode::TextCredentialFailed,
-        "无法访问 macOS 钥匙串。请解锁并允许应用访问后重试。",
+        credential_error_message(),
         true,
     )
+}
+
+#[cfg(target_os = "macos")]
+fn credential_error_message() -> &'static str {
+    "无法访问 macOS 钥匙串。请解锁并允许应用访问后重试。"
+}
+
+#[cfg(target_os = "windows")]
+fn credential_error_message() -> &'static str {
+    "无法访问 Windows 凭据管理器。请检查当前用户的系统凭据状态后重试。"
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn credential_error_message() -> &'static str {
+    "当前平台没有可用的系统凭据库。凭据未保存，请在受支持的平台上重试。"
 }
 fn not_configured() -> AppError {
     AppError::text(

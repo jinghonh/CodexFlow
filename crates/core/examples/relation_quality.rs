@@ -367,7 +367,7 @@ async fn execute() -> Result<(), String> {
         return Err(error.message);
     }
     if !status.credential_configured {
-        return Err("当前应用 Jev 配置尚无匹配钥匙串凭据；未发起模型调用。".into());
+        return Err("当前应用 Jev 配置尚无匹配的系统凭据；未发起模型调用。".into());
     }
     let mut report = read_json(&output.join("report.json"))?;
     let baseline = total_calls(&service, &dataset.pairs)?;

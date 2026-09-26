@@ -327,7 +327,7 @@ fn parse_thread(value: &Value, archived: bool, observed_at_unix_ms: i64) -> Opti
 
 pub fn resolve_binary(choice: Option<&str>) -> Result<PathBuf, AppError> {
     let input = choice.filter(|s| !s.trim().is_empty()).unwrap_or("codex");
-    let candidate = if input.contains('/') {
+    let candidate = if input.contains('/') || input.contains('\\') {
         let path = PathBuf::from(input);
         if !path.is_absolute() {
             return Err(AppError::codex(
@@ -339,7 +339,7 @@ pub fn resolve_binary(choice: Option<&str>) -> Result<PathBuf, AppError> {
         path
     } else {
         env::split_paths(&env::var_os("PATH").unwrap_or_default())
-            .map(|dir| dir.join(input))
+            .flat_map(|dir| path_candidates(&dir, input))
             .find(|path| is_executable(path))
             .ok_or_else(|| {
                 AppError::codex(
@@ -364,6 +364,30 @@ pub fn resolve_binary(choice: Option<&str>) -> Result<PathBuf, AppError> {
         ));
     }
     Ok(resolved)
+}
+
+fn path_candidates(directory: &Path, input: &str) -> Vec<PathBuf> {
+    let command = Path::new(input);
+    #[cfg(windows)]
+    {
+        if command.extension().is_some() {
+            return vec![directory.join(command)];
+        }
+        return ["exe", "cmd", ""]
+            .into_iter()
+            .map(|extension| {
+                if extension.is_empty() {
+                    directory.join(command)
+                } else {
+                    directory.join(command).with_extension(extension)
+                }
+            })
+            .collect();
+    }
+    #[cfg(not(windows))]
+    {
+        vec![directory.join(command)]
+    }
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -521,7 +545,11 @@ async fn diagnose_with_timeouts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, os::unix::fs::PermissionsExt, process::Command as StdCommand};
+    use std::io::Write;
+    #[cfg(windows)]
+    use std::process::Command as StdCommand;
+    #[cfg(unix)]
+    use std::{os::unix::fs::PermissionsExt, process::Command as StdCommand};
 
     fn fake_binary(mode: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -534,13 +562,43 @@ mod tests {
             NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("fake-{mode}.py"));
-        let mut file = fs::File::create(&path).unwrap();
+        let script = dir.join(format!("fake-{mode}.py"));
+        let mut file = fs::File::create(&script).unwrap();
         file.write_all(include_bytes!("../tests/fixtures/fake_codex.py"))
             .unwrap();
-        file.set_permissions(fs::Permissions::from_mode(0o700))
+        #[cfg(unix)]
+        {
+            file.set_permissions(fs::Permissions::from_mode(0o700))
+                .unwrap();
+            script
+        }
+        #[cfg(windows)]
+        {
+            let launcher = script.with_extension("cmd");
+            let script_name = script.file_name().unwrap().to_string_lossy();
+            fs::write(
+                &launcher,
+                format!(
+                    "@echo off\r\npython \"%~dp0{script_name}\" %*\r\nexit /b %ERRORLEVEL%\r\n"
+                ),
+            )
             .unwrap();
-        path
+            launcher
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_lookup_includes_exe_and_cmd_launchers() {
+        let candidates = path_candidates(Path::new(r"C:\tools"), "codex");
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from(r"C:\tools\codex.exe"),
+                PathBuf::from(r"C:\tools\codex.cmd"),
+                PathBuf::from(r"C:\tools\codex"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -1116,6 +1174,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(any(unix, windows))]
     async fn timed_out_auxiliary_processes_are_reaped_across_retries() {
         let path = fake_binary("slow-aux");
         for _ in 0..2 {
@@ -1146,6 +1205,7 @@ mod tests {
         );
         let mut lingering = Vec::new();
         for pid in pids {
+            #[cfg(unix)]
             let alive = StdCommand::new("/bin/kill")
                 .args(["-0", pid])
                 .stdout(Stdio::null())
@@ -1153,9 +1213,22 @@ mod tests {
                 .status()
                 .unwrap()
                 .success();
+            #[cfg(windows)]
+            let alive = {
+                let output = StdCommand::new("tasklist")
+                    .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
+            };
             if alive {
                 lingering.push(pid);
+                #[cfg(unix)]
                 let _ = StdCommand::new("/bin/kill").args(["-9", pid]).status();
+                #[cfg(windows)]
+                let _ = StdCommand::new("taskkill")
+                    .args(["/PID", pid, "/T", "/F"])
+                    .status();
             }
         }
         let _ = fs::remove_dir_all(path.parent().unwrap());
@@ -1282,13 +1355,17 @@ async fn inspect_analysis_schema(binary: &Path, limit: Duration) -> Capability {
 struct AuxiliaryGroup {
     #[cfg(unix)]
     pgid: Option<i32>,
+    #[cfg(windows)]
+    job: Option<std::os::windows::io::OwnedHandle>,
 }
 
 impl AuxiliaryGroup {
     fn configure(command: &mut Command) {
         #[cfg(unix)]
         command.as_std_mut().process_group(0);
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let _ = command;
+        #[cfg(not(any(unix, windows)))]
         let _ = command;
     }
 
@@ -1299,7 +1376,13 @@ impl AuxiliaryGroup {
                 pgid: child.id().map(|pid| pid as i32),
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            Self {
+                job: windows_process_job(child),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = child;
             Self {}
@@ -1311,12 +1394,81 @@ impl AuxiliaryGroup {
         if let Some(pgid) = self.pgid.take() {
             unsafe { libc::kill(-pgid, libc::SIGKILL) };
         }
+        #[cfg(windows)]
+        if let Some(job) = self.job.take() {
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            unsafe {
+                TerminateJobObject(
+                    std::os::windows::io::AsRawHandle::as_raw_handle(&job)
+                        as windows_sys::Win32::Foundation::HANDLE,
+                    1,
+                );
+            }
+            drop(job);
+        }
     }
 }
 
 impl Drop for AuxiliaryGroup {
     fn drop(&mut self) {
         self.kill();
+    }
+}
+
+#[cfg(windows)]
+fn windows_process_job(child: &Child) -> Option<std::os::windows::io::OwnedHandle> {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        System::{
+            JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+                SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+        },
+    };
+
+    let job: HANDLE = unsafe { CreateJobObjectW(ptr::null(), ptr::null()) };
+    if job.is_null() {
+        return None;
+    }
+    let mut information: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    information.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if unsafe {
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&information as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast::<c_void>(),
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    } == 0
+    {
+        unsafe { CloseHandle(job) };
+        return None;
+    }
+    let Some(process_id) = child.id() else {
+        unsafe { CloseHandle(job) };
+        return None;
+    };
+    let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, process_id) };
+    if process.is_null() {
+        unsafe { CloseHandle(job) };
+        return None;
+    }
+    let assigned = unsafe { AssignProcessToJobObject(job, process) } != 0;
+    unsafe { CloseHandle(process) };
+    if assigned {
+        Some(unsafe {
+            <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(job)
+        })
+    } else {
+        unsafe {
+            TerminateJobObject(job, 1);
+            CloseHandle(job);
+        }
+        None
     }
 }
 
@@ -1412,6 +1564,22 @@ impl Session {
                 .env("PATH", env::var_os("PATH").unwrap_or_default())
                 .env("LANG", env::var_os("LANG").unwrap_or_default())
                 .current_dir(cwd.unwrap_or(home));
+            #[cfg(windows)]
+            for name in [
+                "SystemRoot",
+                "SystemDrive",
+                "ComSpec",
+                "USERPROFILE",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "ProgramData",
+                "TEMP",
+                "TMP",
+            ] {
+                if let Some(value) = env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
         }
         AuxiliaryGroup::configure(&mut command);
         let mut child = command.spawn().map_err(|_| {
