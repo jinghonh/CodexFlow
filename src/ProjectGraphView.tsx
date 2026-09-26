@@ -6,6 +6,7 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { formatAppError } from "./appError";
 import { threadDisplayTitle } from "./threadDisplay";
+import { loadProjectQuery, useProjectQueryCache } from "./projectQueryCache";
 import "@xyflow/react/dist/style.css";
 
 type GraphNode = { id: string; title: string | null; sourceKind?: string | null; referenceOnly: boolean };
@@ -34,6 +35,7 @@ type ProjectGraph = { project: { id: string; name: string }; nodes: GraphNode[];
   inferredRelations?: InferredRelation[]; reviewedRelations?: ReviewedRelation[]; inferenceOutcomes?: InferenceOutcome[]; diagnostics: Diagnostic[] };
 type GraphNodeData = { title: string; id: string; referenceOnly: boolean };
 type Selection = { type: "node" | "edge"; id: string } | null;
+type GraphLayout = { nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string };
 
 const nodeWidth = 224;
 const nodeHeight = 82;
@@ -291,12 +293,13 @@ async function layoutGraph(graph: ProjectGraph, signal?: AbortSignal): Promise<{
   return { nodes, edges: graphEdges(graph), warning };
 }
 
-export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, selectedThreadId = null, onSelectThread, visibleThreadIds, relationSource = "all", onRelationSourceChange, relationKind = "all", onRelationKindChange, minimumConfidence = 0.7, onMinimumConfidenceChange, renderSessionInspector, onOpenFullHistory }: { projectId: string; refreshVersion: number;
+export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, selectedThreadId = null, onSelectThread, visibleThreadIds, relationSource = "all", onRelationSourceChange, relationKind = "all", onRelationKindChange, minimumConfidence = 0.7, onMinimumConfidenceChange, renderSessionInspector, onOpenFullHistory, onGraphChanged }: { projectId: string; refreshVersion: number;
   onSelectEvidence?: (evidence: EvidenceReference) => void; selectedThreadId?: string | null; onSelectThread?: (id: string) => void;
   visibleThreadIds?: Set<string>; relationSource?: string; onRelationSourceChange?: (value: string) => void;
   relationKind?: string; onRelationKindChange?: (value: string) => void; minimumConfidence?: number; onMinimumConfidenceChange?: (value: number) => void;
   renderSessionInspector?: (handlers: { onSelectEvidence: (evidence: EvidenceReference) => void; onSelectThread: (id: string) => void }) => ReactNode;
-  onOpenFullHistory?: () => void }) {
+  onOpenFullHistory?: () => void; onGraphChanged?: () => void }) {
+  const queryCache = useProjectQueryCache();
   const loadedProjectId = useRef(projectId);
   const [graph, setGraph] = useState<ProjectGraph | null>(null);
   const [layout, setLayout] = useState<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }>({ nodes: [], edges: [], warning: "" });
@@ -326,7 +329,8 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
       setGraph(null);
     }
     setError("");
-    invoke<ProjectGraph>("get_project_graph", { projectId })
+    loadProjectQuery(queryCache, `project-graph:${projectId}`, refreshVersion,
+      () => invoke<ProjectGraph>("get_project_graph", { projectId }))
       .then((next) => {
         if (!active) return;
         setLayoutPending(true);
@@ -337,7 +341,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
       })
       .catch((cause) => { if (active) setError(formatAppError(cause, "关系图读取失败。请重试刷新。")); });
     return () => { active = false; };
-  }, [projectId, refreshVersion]);
+  }, [projectId, refreshVersion, queryCache]);
 
   const visibleGraph = useMemo(() => graph
     ? filteredGraph(graph, visibleThreadIds, relationSource, relationKind, threshold)
@@ -345,14 +349,36 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
 
   useEffect(() => {
     if (!visibleGraph) return;
+    const layoutSignature = JSON.stringify([
+      visibleGraph.nodes.map((node) => [node.id, node.title, node.sourceKind, node.referenceOnly])
+        .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+      visibleGraph.relations.map((relation) => [relation.id, relation.fromThreadId, relation.toThreadId, relation.kind, relation.source, relation.confidence])
+        .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+      (visibleGraph.derivedRelations ?? []).map((relation) => [relation.id, relation.fromThreadId, relation.toThreadId, relation.kind])
+        .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+      (visibleGraph.inferredRelations ?? []).map((relation) => [relation.id, relation.fromThreadId, relation.toThreadId, relation.kind, relation.confidence])
+        .sort((left, right) => String(left[0]).localeCompare(String(right[0]))),
+    ]);
+    const layoutKey = `project-graph-layout:${projectId}`;
+    const cachedLayout = queryCache?.get<GraphLayout>(layoutKey, layoutSignature);
+    if (cachedLayout) {
+      setLayout(cachedLayout);
+      setLayoutPending(false);
+      return;
+    }
     let active = true;
     const controller = new AbortController();
     setLayoutPending(true);
     setLayout((current) => ({ ...current, edges: graphEdges(visibleGraph) }));
     layoutGraph(visibleGraph, controller.signal)
-      .then((positioned) => { if (active) { setLayout(positioned); setLayoutPending(false); } });
+      .then((positioned) => {
+        if (!active) return;
+        if (!positioned.warning) queryCache?.set(layoutKey, layoutSignature, positioned);
+        setLayout(positioned);
+        setLayoutPending(false);
+      });
     return () => { active = false; controller.abort(); };
-  }, [visibleGraph]);
+  }, [visibleGraph, projectId, queryCache]);
 
   const visibleNodeIds = new Set(visibleGraph?.nodes.map((node) => node.id) ?? []);
   const visibleRelationIds = new Set([
@@ -399,8 +425,12 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
         projectId, relationId: relation.id, decision, expectedRevision: relation.review.revision,
         expectedEvidenceVersion: relation.evidenceVersion,
       });
-      const next = await invoke<ProjectGraph>("get_project_graph", { projectId });
-      setGraph(next);
+      if (onGraphChanged) onGraphChanged();
+      else {
+        const next = await loadProjectQuery(queryCache, `project-graph:${projectId}`, refreshVersion,
+          () => invoke<ProjectGraph>("get_project_graph", { projectId }), true);
+        setGraph(next);
+      }
     } catch (cause) {
       const failure = cause as { code?: string; message?: string };
       setDecisionError(failure?.code === "CONCURRENT_MODIFICATION"
@@ -415,7 +445,8 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
     setDecisionError("");
     setLayoutPending(true);
     try {
-      const next = await invoke<ProjectGraph>("get_project_graph", { projectId });
+      const next = await loadProjectQuery(queryCache, `project-graph:${projectId}`, refreshVersion,
+        () => invoke<ProjectGraph>("get_project_graph", { projectId }), true);
       setGraph(next);
     } catch (cause) {
       setLayoutPending(false);

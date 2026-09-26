@@ -70,6 +70,7 @@ test("配置错误保留预览并允许修正预算后启动", async () => {
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "0" } });
   expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(true);
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "5" } });
+  fireEvent.click(screen.getByRole("button", { name: "应用参数并刷新预览" }));
   await screen.findByText("2 条待总结");
   fireEvent.click(screen.getByRole("button", { name: "启动项目分析" }));
   expect(await screen.findByText("来源配置已变化")).toBeTruthy();

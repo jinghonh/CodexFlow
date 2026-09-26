@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatAppError } from "./appError";
+import { loadProjectQuery, useProjectQueryCache } from "./projectQueryCache";
 
 type Limits = { callLimit: number; concurrencyLimit: number; timeoutSeconds: number; retryLimit: number; inputCharacterLimit: number };
 type StageSelection = { summary: boolean; relations: boolean; naming: boolean };
@@ -51,10 +52,15 @@ function selectionDescription(selection?: StageSelection): string {
   return selected.join("、") || "无阶段";
 }
 
-export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0, stage = "summary", onRelationResultsChanged }: {
-  projectId: string; refreshVersion: string; settingsRevision?: number; stage?: PanelStage; onRelationResultsChanged?: () => void;
+export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0, stage = "summary", onRelationResultsChanged, onNamingResultsChanged, onSettingsApplied }: {
+  projectId: string; refreshVersion: string; settingsRevision?: number; stage?: PanelStage;
+  onRelationResultsChanged?: (revision: string) => void; onNamingResultsChanged?: (revision: string) => void; onSettingsApplied?: () => void;
 }) {
-  const [limits, setLimits] = useState<Limits>(initialLimits);
+  const queryCache = useProjectQueryCache();
+  const limitsKey = `analysis-limits:${projectId}:${stage}`;
+  const savedLimits = queryCache?.get<{ applied: Limits; draft: Limits }>(limitsKey, 0);
+  const [limits, setLimits] = useState<Limits>(() => savedLimits?.applied ?? initialLimits);
+  const [draftLimits, setDraftLimits] = useState<Limits>(() => savedLimits?.draft ?? initialLimits);
   const stageSelection = stageSelectionFor(stage);
   const [previewState, setPreviewState] = useState<{ key: string; value: Preview } | null>(null);
   const [run, setRun] = useState<Run | null>(null);
@@ -65,22 +71,33 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
     .filter((unit) => (unit.stage === "relation" || unit.stage === "evidenceSelection") && unit.state === "succeeded")
     .map((unit) => unit.id).sort().join("|") || "";
   const relationResultsRevision = succeededRelationUnits ? `${run?.id}:${succeededRelationUnits}` : "";
-  useEffect(() => {
-    if (stage === "relations" && relationResultsRevision) onRelationResultsChanged?.();
-  }, [stage, relationResultsRevision, onRelationResultsChanged]);
+  const succeededNamingUnits = run?.units.filter((unit) => unit.stage === "naming" && unit.state === "succeeded")
+    .map((unit) => unit.id).sort().join("|") || "";
+  const namingResultsRevision = succeededNamingUnits ? `${run?.id}:${succeededNamingUnits}` : "";
   const terminalRun = run && ["paused", "cancelled", "complete", "partial", "failed"].includes(run.state)
     ? `${run.id}:${run.state}:${run.totalCalls}:${run.processed}` : "";
+  useEffect(() => {
+    if (stage === "relations" && relationResultsRevision && terminalRun) onRelationResultsChanged?.(relationResultsRevision);
+  }, [stage, relationResultsRevision, terminalRun, onRelationResultsChanged]);
+  useEffect(() => {
+    if (stage === "naming" && namingResultsRevision && terminalRun) onNamingResultsChanged?.(namingResultsRevision);
+  }, [stage, namingResultsRevision, terminalRun, onNamingResultsChanged]);
   const previewKey = JSON.stringify([projectId, refreshVersion, settingsRevision, limits, stageSelection, terminalRun]);
   const preview = previewState?.key === previewKey ? previewState.value : null;
 
   useEffect(() => {
+    queryCache?.set(limitsKey, 0, { applied: limits, draft: draftLimits });
+  }, [queryCache, limitsKey, limits, draftLimits]);
+
+  useEffect(() => {
     let active = true;
     setPreviewState(null); setError("");
-    invoke<Preview>("get_analysis_preview", { projectId, limits, stageSelection })
+    loadProjectQuery(queryCache, `analysis-preview:${projectId}:${stage}`, previewKey,
+      () => invoke<Preview>("get_analysis_preview", { projectId, limits, stageSelection }))
       .then((value) => { if (active) setPreviewState({ key: previewKey, value }); })
       .catch((caught) => { if (active) setError(message(caught)); });
     return () => { active = false; };
-  }, [previewKey]);
+  }, [previewKey, queryCache, stage]);
 
   useEffect(() => {
     let active = true;
@@ -128,15 +145,22 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   const textWorkUnavailable = (stage === "summary" && (summaryStage?.pendingItems ?? 0) > 0 && !summaryStage?.available) ||
     (stage === "naming" && namingMayRun && !namingStage?.available);
   const relationWorkUnavailable = stage === "relations" && (relationStage?.pendingItems ?? 0) > 0 && !relationStage?.available;
+  const hasUnappliedLimits = JSON.stringify(draftLimits) !== JSON.stringify(limits);
   const canStart = selectedWorkPending && !textWorkUnavailable && !relationWorkUnavailable &&
-    !active && run?.state !== "paused" && !busy && runLoaded;
-  const valid = Number.isInteger(limits.callLimit) && limits.callLimit > 0 && Number.isInteger(limits.timeoutSeconds) && limits.timeoutSeconds > 0 &&
-    Number.isInteger(limits.concurrencyLimit) && limits.concurrencyLimit >= 1 && limits.concurrencyLimit <= maxConcurrencyLimit &&
-    Number.isInteger(limits.retryLimit) && limits.retryLimit >= 0 && limits.retryLimit <= maxRetryLimit &&
-    Number.isInteger(limits.inputCharacterLimit) && limits.inputCharacterLimit >= 2000;
+    !active && run?.state !== "paused" && !busy && runLoaded && !hasUnappliedLimits;
+  const valid = Number.isInteger(draftLimits.callLimit) && draftLimits.callLimit > 0 && Number.isInteger(draftLimits.timeoutSeconds) && draftLimits.timeoutSeconds > 0 &&
+    Number.isInteger(draftLimits.concurrencyLimit) && draftLimits.concurrencyLimit >= 1 && draftLimits.concurrencyLimit <= maxConcurrencyLimit &&
+    Number.isInteger(draftLimits.retryLimit) && draftLimits.retryLimit >= 0 && draftLimits.retryLimit <= maxRetryLimit &&
+    Number.isInteger(draftLimits.inputCharacterLimit) && draftLimits.inputCharacterLimit >= 2000;
   const visibleStages = preview?.stages.filter((item) => stage === "relations"
     ? item.stage === "relation" || item.stage === "evidenceSelection"
     : item.stage === stage) ?? [];
+
+  function applyLimits() {
+    if (!valid || !hasUnappliedLimits || busy) return;
+    setLimits(draftLimits);
+    onSettingsApplied?.();
+  }
 
   return <section className="panel analysis-panel" aria-label={`${panelStageNames[stage]}分析`}>
     <div className="panel-kicker">分析阶段</div>
@@ -149,13 +173,17 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
     <details className="analysis-settings">
       <summary>运行参数</summary>
       <div className="analysis-limits">
-        <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={limits.callLimit} onChange={(event) => setLimits({ ...limits, callLimit: Number(event.target.value) })} /></label>
-        <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max={maxConcurrencyLimit} value={limits.concurrencyLimit} onChange={(event) => setLimits({ ...limits, concurrencyLimit: Number(event.target.value) })} /></label>
-        <label>单次超时（秒）<input aria-label="单次超时" type="number" min="1" value={limits.timeoutSeconds} onChange={(event) => setLimits({ ...limits, timeoutSeconds: Number(event.target.value) })} /></label>
-        <label>自动重试次数<input aria-label="自动重试次数" type="number" min="0" max={maxRetryLimit} value={limits.retryLimit} onChange={(event) => setLimits({ ...limits, retryLimit: Number(event.target.value) })} /></label>
-        <label>单次输入字符上限<input aria-label="单次输入字符上限" type="number" min="2000" value={limits.inputCharacterLimit} onChange={(event) => setLimits({ ...limits, inputCharacterLimit: Number(event.target.value) })} /></label>
+        <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={draftLimits.callLimit} onChange={(event) => setDraftLimits({ ...draftLimits, callLimit: Number(event.target.value) })} /></label>
+        <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max={maxConcurrencyLimit} value={draftLimits.concurrencyLimit} onChange={(event) => setDraftLimits({ ...draftLimits, concurrencyLimit: Number(event.target.value) })} /></label>
+        <label>单次超时（秒）<input aria-label="单次超时" type="number" min="1" value={draftLimits.timeoutSeconds} onChange={(event) => setDraftLimits({ ...draftLimits, timeoutSeconds: Number(event.target.value) })} /></label>
+        <label>自动重试次数<input aria-label="自动重试次数" type="number" min="0" max={maxRetryLimit} value={draftLimits.retryLimit} onChange={(event) => setDraftLimits({ ...draftLimits, retryLimit: Number(event.target.value) })} /></label>
+        <label>单次输入字符上限<input aria-label="单次输入字符上限" type="number" min="2000" value={draftLimits.inputCharacterLimit} onChange={(event) => setDraftLimits({ ...draftLimits, inputCharacterLimit: Number(event.target.value) })} /></label>
       </div>
       {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；总并发为 1–{maxConcurrencyLimit}，自动重试为 0–{maxRetryLimit}，输入至少 2000 字符。</p>}
+      <div className="summary-actions">
+        <button className="browse-button" disabled={!valid || !hasUnappliedLimits || busy} onClick={applyLimits}>应用参数并刷新预览</button>
+        {hasUnappliedLimits && <span className="analysis-note">应用后会重新计算本阶段预览并刷新项目关系图。</span>}
+      </div>
       <small className="analysis-note">参数仅用于本阶段新启动的批次；继续已有批次时沿用原有参数，仅更新调用上限。</small>
     </details>
     {textWorkUnavailable && <p className="analysis-note">待处理任务需要文本服务。请先在“来源设置”面板配置文本服务。</p>}
@@ -188,7 +216,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       <button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits, stageSelection })}>启动{panelStageNames[stage]}</button>
       {runBelongsHere && active && run?.state !== "cancelling" && <button className="browse-button" disabled={busy || !!run?.pauseReason} onClick={() => void operate("pause_analysis_run", { runId: run!.id })}>暂停</button>}
       {runBelongsHere && (active || run?.state === "paused") && <button className="browse-button" disabled={busy || run?.state === "cancelling"} onClick={() => void operate("cancel_analysis_run", { runId: run!.id })}>取消</button>}
-      {runBelongsHere && run && ["paused", "cancelled", "partial", "failed"].includes(run.state) && <button className="browse-button" disabled={busy || !valid} onClick={() => void operate("continue_analysis_run", { runId: run.id, callLimit: limits.callLimit })}>继续未完成项</button>}
+      {runBelongsHere && run && ["paused", "cancelled", "partial", "failed"].includes(run.state) && <button className="browse-button" disabled={busy || !valid} onClick={() => void operate("continue_analysis_run", { runId: run.id, callLimit: draftLimits.callLimit })}>继续未完成项</button>}
     </div>
     {runBelongsHere && run && <div className="analysis-progress" role="status"><strong>分析{stateNames[run.state]} · 第 {run.batchNumber} 批</strong>
       <span>运行 {run.id}</span><span>已处理 {run.processed}；成功 {run.succeeded}；失败 {run.failed}；待处理 {run.pending}</span>

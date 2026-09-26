@@ -12,6 +12,7 @@ import { formatAppError } from "./appError";
 import { ProjectThreadDetailsView } from "./ProjectThreadDetailsView";
 import { threadDisplayTitle } from "./threadDisplay";
 import { finishResponse, recordStartupReady, startEvidence, startResponse } from "./performanceProbe";
+import { loadProjectQuery, ProjectQueryCacheProvider, useProjectQueryCache } from "./projectQueryCache";
 import "./style.css";
 
 type Theme = "system" | "light" | "dark";
@@ -122,7 +123,35 @@ export function App() {
   const [projectCatalog, setProjectCatalog] = useState<ProjectCatalog | null>(null);
   const [projectSessions, setProjectSessions] = useState<ProjectSessions | null>(null);
   const [graphVersion, setGraphVersion] = useState(0);
-  const refreshGraphForAnalysis = React.useCallback(() => setGraphVersion((version) => version + 1), []);
+  const [workstreamVersion, setWorkstreamVersion] = useState(0);
+  const [timelineVersion, setTimelineVersion] = useState(0);
+  const [projectDataVersion, setProjectDataVersion] = useState(0);
+  const queryCache = useProjectQueryCache();
+  const lastRelationRefresh = useRef("");
+  const lastWorkstreamRefresh = useRef("");
+  const refreshAllProjectData = React.useCallback(() => {
+    setGraphVersion((version) => version + 1);
+    setWorkstreamVersion((version) => version + 1);
+    setTimelineVersion((version) => version + 1);
+    setProjectDataVersion((version) => version + 1);
+  }, []);
+  const refreshGraphForSettings = React.useCallback(() => setGraphVersion((version) => version + 1), []);
+  const refreshGraphForDecision = React.useCallback(() => setGraphVersion((version) => version + 1), []);
+  const refreshRelationsAndWorkstreams = React.useCallback((revision = "") => {
+    if (revision) {
+      if (lastRelationRefresh.current === revision) return;
+      lastRelationRefresh.current = revision;
+    }
+    setGraphVersion((version) => version + 1);
+    setWorkstreamVersion((version) => version + 1);
+  }, []);
+  const refreshWorkstreams = React.useCallback((revision = "") => {
+    if (revision) {
+      if (lastWorkstreamRefresh.current === revision) return;
+      lastWorkstreamRefresh.current = revision;
+    }
+    setWorkstreamVersion((version) => version + 1);
+  }, []);
   const [projectPath, setProjectPath] = useState("");
   const [projectError, setProjectError] = useState("");
   const [showUnassigned, setShowUnassigned] = useState(false);
@@ -196,18 +225,19 @@ export function App() {
       workstreamProjectId.current = projectId;
       setWorkstreams(null);
     }
-    invoke<WorkstreamView>("get_project_workstreams", { projectId })
+    loadProjectQuery(queryCache, `project-workstreams:${projectId}`, workstreamVersion,
+      () => invoke<WorkstreamView>("get_project_workstreams", { projectId }))
       .then((value) => { if (active) { setWorkstreams(value); setWorkstreamError(""); } })
       .catch((error) => { if (active) setWorkstreamError(errorText(error)); });
     return () => { active = false; };
-  }, [projectSessions?.project.id, showUnassigned, graphVersion]);
+  }, [projectSessions?.project.id, showUnassigned, workstreamVersion, queryCache]);
 
   useEffect(() => {
     if (activePanel !== "sessions") return;
     const projectId = projectSessions?.project.id;
     if (!projectId || showUnassigned) { setThreadMatches(null); setQueryError(null); return; }
     let active = true;
-    const queryKey = JSON.stringify([projectId, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, workstreams?.revision ?? null]);
+    const queryKey = JSON.stringify([projectId, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, workstreams?.revision ?? null, projectDataVersion]);
     setQueryError(null);
     const textChanged = previousQuery.current !== query;
     previousQuery.current = query;
@@ -220,7 +250,7 @@ export function App() {
         .catch((error) => { if (active) setQueryError({ queryKey, message: errorText(error) }); });
     }, textChanged ? 180 : 0);
     return () => { active = false; window.clearTimeout(timer); };
-  }, [activePanel, projectSessions?.project.id, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, graphVersion, workstreams?.revision]);
+  }, [activePanel, projectSessions?.project.id, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, projectDataVersion, workstreamVersion, workstreams?.revision]);
 
   function selectEvidence(evidence: { threadId: string; turnId: string; itemId: string }) {
     setSelectedThreadId(evidence.threadId);
@@ -245,7 +275,7 @@ export function App() {
     if (epoch !== projectEpoch.current) return;
     setProjectCatalog(catalog);
     setProjectSessions(sessions);
-    setGraphVersion((version) => version + 1);
+    refreshAllProjectData();
   }
 
   useEffect(() => {
@@ -270,7 +300,7 @@ export function App() {
             selectedProjectId = catalog.selectedProjectId;
             cachedScopes = catalog.scopes;
             if (catalog.selectedProjectId) setProjectSessions(await invoke<ProjectSessions>("get_project_sessions", { projectId: catalog.selectedProjectId }));
-            setGraphVersion((version) => version + 1);
+            refreshAllProjectData();
           }
         } catch (error) { if (active) setListError(errorText(error)); }
         if (!active) return;
@@ -293,7 +323,7 @@ export function App() {
       invoke<IndexRun | null>("get_latest_index_run").then((run) => { if (active) recordRun(run); }).catch(() => {});
     }, 4000);
     return () => { active = false; unlisten?.(); window.clearInterval(timer); };
-  }, []);
+  }, [refreshAllProjectData]);
 
   useEffect(() => {
     const projectId = projectSessions?.project.id;
@@ -311,13 +341,20 @@ export function App() {
   useEffect(() => {
     let active = true;
     let unlisten: (() => void) | undefined;
-    listen<{ state: string }>("analysis-run", (event) => {
-      if (active && ["paused", "complete", "partial", "failed", "cancelled"].includes(event.payload.state)) {
-        setGraphVersion((version) => version + 1);
-      }
+    const projectId = projectSessions?.project.id;
+    listen<{ id: string; projectId: string; state: string; units?: { id: string; stage: string; state: string }[] }>("analysis-run", (event) => {
+      if (!active || event.payload.projectId !== projectId || !["paused", "complete", "partial", "failed", "cancelled"].includes(event.payload.state)) return;
+      const run = event.payload;
+      const units = run.units ?? [];
+      const relationUnits = units.filter((unit) => (unit.stage === "relation" || unit.stage === "evidenceSelection") && unit.state === "succeeded")
+        .map((unit) => unit.id).sort().join("|");
+      if (relationUnits) refreshRelationsAndWorkstreams(`${run.id}:${relationUnits}`);
+      const namingUnits = units.filter((unit) => unit.stage === "naming" && unit.state === "succeeded")
+        .map((unit) => unit.id).sort().join("|");
+      if (namingUnits) refreshWorkstreams(`${run.id}:${namingUnits}`);
     }).then((stop) => { if (active) unlisten = stop; else stop(); }).catch(() => {});
     return () => { active = false; unlisten?.(); };
-  }, []);
+  }, [projectSessions?.project.id, refreshRelationsAndWorkstreams, refreshWorkstreams]);
 
   useEffect(() => {
     invoke<JevStatus>("get_jev_status").then((status) => {
@@ -412,7 +449,7 @@ export function App() {
       setProjectCatalog(catalog);
       setProjectSessions(sessions);
       setQuery(""); setWorkstreamFilter(""); setWorkspaceFilter(""); setArchiveFilter("all"); setCompleteFilter("all"); setSelectedThreadId(null);
-      setGraphVersion((version) => version + 1);
+      refreshAllProjectData();
       setShowUnassigned(false);
       setProjectError("");
       await refreshGlobalIndexIfNeeded(catalog.selectedProjectId, catalog.scopes);
@@ -428,7 +465,7 @@ export function App() {
       setProjectCatalog(catalog);
       setProjectSessions(sessions);
       setQuery(""); setWorkstreamFilter(""); setWorkspaceFilter(""); setArchiveFilter("all"); setCompleteFilter("all"); setSelectedThreadId(null);
-      setGraphVersion((version) => version + 1);
+      refreshAllProjectData();
       setShowUnassigned(false);
       setProjectError("");
       await refreshGlobalIndexIfNeeded(projectId, catalog.scopes);
@@ -773,7 +810,7 @@ export function App() {
           {threadLimit < visibleThreads.length && <button className="browse-button" onClick={() => setThreadLimit((limit) => limit + 40)}>显示更多会话（{shownThreads.length} / {visibleThreads.length}）</button>}
         </section>
         {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} settingsRevision={analysisSettingsRevision} locationRequest={evidenceLocation} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />}
-        {!showUnassigned && projectSessions && <ProjectAnalysisView key={`${projectSessions.project.id}:summary`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="summary" />}
+        {!showUnassigned && projectSessions && <ProjectAnalysisView key={`${projectSessions.project.id}:summary`} projectId={projectSessions.project.id} refreshVersion={String(projectDataVersion)} settingsRevision={analysisSettingsRevision} stage="summary" onSettingsApplied={refreshGraphForSettings} />}
         <p className="disclaimer">会话列表只包含来源元数据。查看回合会按需读取会话正文；项目总结需要在本面板手动启动。</p>
         </>}
         {activePanel === "workstreams" && <>
@@ -781,21 +818,22 @@ export function App() {
         <div className="page-heading"><div><h1>工作流<span className="accent">.</span></h1><p>整理项目工作流、活动时间线，并按需命名关系分组。</p></div></div>
         {!showUnassigned && projectSessions ? <>
           <ProjectWorkstreamsView key={`${projectSessions.project.id}:workstreams`} projectId={projectSessions.project.id}
-            refreshVersion={graphVersion} onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} activeWorkstreamId={workstreamFilter} onFilterWorkstream={setWorkstreamFilter} onChanged={refreshGraphForAnalysis} />
-          <ProjectTimelineView key={`${projectSessions.project.id}:timeline`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} connected={connected} onSelectThread={setSelectedThreadId} selectedThreadId={selectedThreadId} visibleThreadIds={projectThreadIds} workstreams={workstreams?.workstreams ?? []} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />
-          <ProjectAnalysisView key={`${projectSessions.project.id}:naming`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="naming" />
+            refreshVersion={graphVersion} graphRevision={graphVersion} workstreamRevision={workstreamVersion}
+            onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} activeWorkstreamId={workstreamFilter} onFilterWorkstream={setWorkstreamFilter} onChanged={refreshWorkstreams} />
+          <ProjectTimelineView key={`${projectSessions.project.id}:timeline`} projectId={projectSessions.project.id} refreshVersion={String(timelineVersion)} connected={connected} onSelectThread={setSelectedThreadId} selectedThreadId={selectedThreadId} visibleThreadIds={projectThreadIds} workstreams={workstreams?.workstreams ?? []} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />
+          <ProjectAnalysisView key={`${projectSessions.project.id}:naming`} projectId={projectSessions.project.id} refreshVersion={String(workstreamVersion)} settingsRevision={analysisSettingsRevision} stage="naming" onNamingResultsChanged={refreshWorkstreams} onSettingsApplied={refreshGraphForSettings} />
         </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>工作流和时间线按项目整理。先选择一个本地项目即可查看。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
         </>}
         {activePanel === "relations" && <>
         <div className="eyebrow">审查 / 关系审查 <span /></div>
         <div className="page-heading"><div><h1>关系审查<span className="accent">.</span></h1><p>从模型判断进入证据，再回到会话来源核实上下文。</p></div></div>
         {!showUnassigned && projectSessions ? <>
-          <ProjectGraphView key={`${projectSessions.project.id}:relations`} projectId={projectSessions.project.id} refreshVersion={graphVersion} onSelectEvidence={selectEvidence} selectedThreadId={selectedThreadId} onSelectThread={setSelectedThreadId} visibleThreadIds={projectThreadIds} relationSource={relationSource} onRelationSourceChange={setRelationSource} relationKind={relationKind} onRelationKindChange={setRelationKind} minimumConfidence={minimumConfidence} onMinimumConfidenceChange={setMinimumConfidence}
+          <ProjectGraphView key={`${projectSessions.project.id}:relations`} projectId={projectSessions.project.id} refreshVersion={graphVersion} onSelectEvidence={selectEvidence} selectedThreadId={selectedThreadId} onSelectThread={setSelectedThreadId} visibleThreadIds={projectThreadIds} relationSource={relationSource} onRelationSourceChange={setRelationSource} relationKind={relationKind} onRelationKindChange={setRelationKind} minimumConfidence={minimumConfidence} onMinimumConfidenceChange={setMinimumConfidence} onGraphChanged={refreshGraphForDecision}
             renderSessionInspector={({ onSelectEvidence, onSelectThread }) => selectedThread && selectedAttribution
               ? <ProjectThreadDetailsView projectId={projectSessions.project.id} thread={selectedThread} attribution={selectedAttribution} refreshVersion={graphVersion} hidden={selectionHidden} onSelectThread={onSelectThread} onSelectEvidence={onSelectEvidence} relationSource={relationSource} relationKind={relationKind} minimumConfidence={minimumConfidence} />
               : <p className="inspector-empty">此会话不在当前项目的可读列表中。</p>}
             onOpenFullHistory={selectedThread ? () => setReviewHistoryOpen(true) : undefined} />
-          <ProjectAnalysisView key={`${projectSessions.project.id}:relations-analysis`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="relations" onRelationResultsChanged={refreshGraphForAnalysis} />
+          <ProjectAnalysisView key={`${projectSessions.project.id}:relations-analysis`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="relations" onRelationResultsChanged={refreshRelationsAndWorkstreams} onSettingsApplied={refreshGraphForSettings} />
         </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>关系图按项目生成。先选择一个本地项目即可查看关系和来源证据。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
         </>}
       </div>
@@ -808,4 +846,4 @@ export function App() {
 }
 
 const root = document.getElementById("root");
-if (root) createRoot(root).render(<App />);
+if (root) createRoot(root).render(<ProjectQueryCacheProvider><App /></ProjectQueryCacheProvider>);

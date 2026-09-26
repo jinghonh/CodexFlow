@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatAppError } from "./appError";
 import { threadDisplayTitle } from "./threadDisplay";
+import { loadProjectQuery, useProjectQueryCache } from "./projectQueryCache";
 
 type Stream = { id: string; name: string; members: string[]; relationIds: string[];
   nameInputVersion: string | null; nameError: string | null;
@@ -15,11 +16,15 @@ type Relation = { id: string; fromThreadId: string; toThreadId: string; kind: st
 type Graph = { nodes: Node[]; relations: Relation[]; derivedRelations: Relation[]; inferredRelations: Relation[] };
 const PAGE_SIZE = 40;
 
-export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThread, onSelectEvidence, activeWorkstreamId = "", onFilterWorkstream, onChanged }: {
+export function ProjectWorkstreamsView({ projectId, refreshVersion, graphRevision, workstreamRevision, onSelectThread, onSelectEvidence, activeWorkstreamId = "", onFilterWorkstream, onChanged }: {
   projectId: string; refreshVersion: number; onSelectThread: (id: string) => void;
+  graphRevision?: number; workstreamRevision?: number;
   onSelectEvidence: (evidence: { threadId: string; turnId: string; itemId: string }) => void;
   activeWorkstreamId?: string; onFilterWorkstream?: (id: string) => void; onChanged?: () => void;
 }) {
+  const queryCache = useProjectQueryCache();
+  const graphVersion = graphRevision ?? refreshVersion;
+  const workstreamsVersion = workstreamRevision ?? refreshVersion;
   const loadedProjectId = useRef(projectId);
   const [view, setView] = useState<View | null>(null);
   const [graph, setGraph] = useState<Graph | null>(null);
@@ -41,13 +46,15 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
       setView(null); setGraph(null); setSelectedId(null);
     }
     Promise.all([
-      invoke<View>("get_project_workstreams", { projectId }),
-      invoke<Graph>("get_project_graph", { projectId }),
+      loadProjectQuery(queryCache, `project-workstreams:${projectId}`, workstreamsVersion,
+        () => invoke<View>("get_project_workstreams", { projectId })),
+      loadProjectQuery(queryCache, `project-graph:${projectId}`, graphVersion,
+        () => invoke<Graph>("get_project_graph", { projectId })),
     ]).then(([nextView, nextGraph]) => {
       if (active) { setView(nextView); setGraph(nextGraph); setError(""); }
     }).catch((caught) => { if (active) setError(formatAppError(caught, "无法读取工作流。")); });
     return () => { active = false; };
-  }, [projectId, refreshVersion]);
+  }, [projectId, graphVersion, workstreamsVersion, queryCache]);
   const selected = view?.workstreams.find((item) => item.id === selectedId) ?? view?.workstreams[0];
   useEffect(() => { setMemberLimit(PAGE_SIZE); setRelationLimit(PAGE_SIZE); }, [projectId, selected?.id]);
   useEffect(() => { setUngroupedLimit(PAGE_SIZE); setCrossLimit(PAGE_SIZE); }, [projectId]);
@@ -63,8 +70,10 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
   async function refresh() {
     try {
       const [nextView, nextGraph] = await Promise.all([
-        invoke<View>("get_project_workstreams", { projectId }),
-        invoke<Graph>("get_project_graph", { projectId }),
+        loadProjectQuery(queryCache, `project-workstreams:${projectId}`, workstreamsVersion,
+          () => invoke<View>("get_project_workstreams", { projectId }), true),
+        loadProjectQuery(queryCache, `project-graph:${projectId}`, graphVersion,
+          () => invoke<Graph>("get_project_graph", { projectId })),
       ]);
       setView(nextView); setGraph(nextGraph); setError(""); setSaved("");
     } catch (caught) { setError(failureMessage(caught)); }
@@ -74,8 +83,13 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, onSelectThre
     setSaving(key); setError(""); setSaved("");
     try {
       await invoke(command, { projectId, expectedRevision: view.revision, ...args });
-      const next = await invoke<View>("get_project_workstreams", { projectId });
-      setView(next); done(); setSaved("已保存。"); onChanged?.();
+      if (onChanged) {
+        done(); setSaved("已保存。"); onChanged();
+      } else {
+        const next = await loadProjectQuery(queryCache, `project-workstreams:${projectId}`, workstreamsVersion,
+          () => invoke<View>("get_project_workstreams", { projectId }), true);
+        setView(next); done(); setSaved("已保存。");
+      }
     } catch (caught) { setError(failureMessage(caught)); }
     finally { setSaving(""); }
   }

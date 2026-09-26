@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatAppError } from "./appError";
 import { threadDisplayTitle, threadPreviewExcerpt } from "./threadDisplay";
+import { loadProjectQuery, useProjectQueryCache } from "./projectQueryCache";
 
 type Evidence = { threadId: string; turnId: string; itemId: string; excerpt: string };
 type Relation = { id: string; source: string; kind: string; fromThreadId: string; toThreadId: string;
@@ -29,6 +30,7 @@ export function ProjectThreadDetailsView({ projectId, thread, attribution, refre
   onSelectThread: (id: string) => void; onSelectEvidence: (evidence: Evidence) => void;
   relationSource?: string; relationKind?: string; minimumConfidence?: number;
 }) {
+  const queryCache = useProjectQueryCache();
   const loadedProjectId = useRef(projectId);
   const [graph, setGraph] = useState<Graph | null>(null);
   const [error, setError] = useState("");
@@ -39,10 +41,12 @@ export function ProjectThreadDetailsView({ projectId, thread, attribution, refre
       setGraph(null);
     }
     setError("");
-    invoke<Graph>("get_project_graph", { projectId }).then((value) => { if (active) { setGraph(value); setError(""); } })
+    loadProjectQuery(queryCache, `project-graph:${projectId}`, refreshVersion,
+      () => invoke<Graph>("get_project_graph", { projectId }))
+      .then((value) => { if (active) { setGraph(value); setError(""); } })
       .catch((cause) => { if (active) setError(formatAppError(cause, "关系暂不可用；来源事实与回合仍可查看。")); });
     return () => { active = false; };
-  }, [projectId, refreshVersion]);
+  }, [projectId, refreshVersion, queryCache]);
   const relations = [...(graph?.relations ?? []), ...(graph?.derivedRelations ?? []), ...(graph?.inferredRelations ?? [])]
     .filter((relation) => (relation.fromThreadId === thread.id || relation.toThreadId === thread.id)
       && (relationSource === "all" || relationSource === (relation.source === "jev" ? "inferred" : relation.source))

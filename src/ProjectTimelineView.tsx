@@ -1,6 +1,7 @@
 import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { formatAppError } from "./appError";
+import { loadProjectQuery, useProjectQueryCache } from "./projectQueryCache";
 
 type Grain = "day" | "week" | "month";
 type Quality = "complete" | "partial" | "unknown";
@@ -278,6 +279,7 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
   selectedThreadId?: string | null; visibleThreadIds?: Set<string>; workstreams?: { id: string; name: string; members: string[] }[];
   onHistoryLoaded?: () => void;
 }) {
+  const queryCache = useProjectQueryCache();
   const loadedProjectId = useRef(projectId);
   const [timeline, setTimeline] = useState<Timeline | null>(null);
   const [error, setError] = useState("");
@@ -334,11 +336,12 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
       setTimeline(null);
     }
     setError("");
-    invoke<Timeline>("get_project_timeline", { projectId })
+    loadProjectQuery(queryCache, `project-timeline:${projectId}`, refreshVersion,
+      () => invoke<Timeline>("get_project_timeline", { projectId }))
       .then((value) => { if (active) setTimeline(value); })
       .catch((caught) => { if (active) setError(formatAppError(caught, "读取项目时间线失败。")); });
     return () => { active = false; };
-  }, [projectId, refreshVersion]);
+  }, [projectId, refreshVersion, queryCache]);
 
   const visible = useMemo(() => (timeline?.threads ?? []).filter((thread) => !visibleThreadIds || visibleThreadIds.has(thread.threadId)), [timeline, visibleThreadIds]);
   const owners = useMemo(() => new Map(workstreams.flatMap((stream) => stream.members.map((id) => [id, stream.id] as const))), [workstreams]);
