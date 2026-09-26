@@ -103,7 +103,7 @@ export function ProjectWorkstreamsView({ projectId, refreshVersion, graphRevisio
   const relation = (id: string) => relations.find((item) => item.id === id);
   const evidence = (item: Relation): Evidence | undefined => Array.isArray(item.evidence)
     ? item.evidence[0] : item.evidence?.left;
-  const sourceName = (item: Relation) => item.source === "observed" ? "观察关系" : item.source === "derived" ? "规则关系" : "推断关系";
+  const sourceName = (item: Relation) => item.source === "observed" ? "观察关系" : item.source === "derived" ? "候选信号" : "Jev 判断关系";
   const ownerOf = (id: string) => view?.workstreams.find((stream) => stream.members.includes(id))?.id ?? "";
   const threadRow = (id: string) => {
     const current = ownerOf(id);

@@ -46,7 +46,7 @@ function selectionDescription(selection?: StageSelection): string {
   if (!selection) return "会话总结、候选关系判断和工作流命名";
   const selected = [
     selection.summary ? "会话总结" : null,
-    selection.relations ? "候选关系判断及必要的证据选择" : null,
+    selection.relations ? "候选关系类型与执行状态判断" : null,
     selection.naming ? "工作流命名" : null,
   ].filter((item): item is string => item !== null);
   return selected.join("、") || "无阶段";
@@ -196,7 +196,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
     {preview && <>
       <div className="candidate-summary">
         {stage === "summary" && <><strong>{summaryStage?.pendingItems ?? 0} 条待总结</strong><span>{preview.cachedSummaries} 条有效缓存</span><span>{preview.unavailableSummaries} 条来源内容暂不可用</span></>}
-        {stage === "relations" && <><strong>{relationStage?.pendingItems ?? 0} 对待判断</strong><span>最多检查 {preview.maximumCandidates} 对候选</span><span>证据选择最多 {preview.evidenceSelectionCallLimit} 次</span></>}
+        {stage === "relations" && <><strong>{relationStage?.pendingItems ?? 0} 对待判断</strong><span>最多检查 {preview.maximumCandidates} 对候选</span><span>每对关系一次结构化判断</span></>}
         {stage === "naming" && <><strong>{preview.pendingGroups ?? 0} 组待命名</strong><span>工作流命名使用已保存的关系分组</span></>}
       </div>
       <div className="analysis-stage-list">{visibleStages.map((item) => {
@@ -209,7 +209,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
           <small>{item.sendScope}</small><small>{item.note}</small>
         </div>;
       })}</div>
-      {stage === "relations" && <p className="analysis-note">候选排序仅用于筛选，不代表关系概率；证据选择会在判断发现支持关系时自动执行。缓存命中不计推理调用，重试另计调用。Jev {preview.jevConfigured ? "已配置" : "未配置"}。</p>}
+      {stage === "relations" && <p className="analysis-note">候选排序只用于扩大召回，不代表关系概率或分组决定。Jev 一次返回关系类型、方向、执行阶段和结果；缓存命中不计调用，重试另计调用。Jev {preview.jevConfigured ? "已配置" : "未配置"}。</p>}
       {stage === "naming" && preview.pendingGroups === null && <p className="analysis-note">当前待命名分组尚未计算。完成关系判断后重新载入此面板。</p>}
     </>}
     <div className="summary-actions">

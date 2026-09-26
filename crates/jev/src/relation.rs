@@ -4,53 +4,83 @@ use super::{
     InferenceResponse, JevClient,
 };
 use codexflow_domain::{
-    AppError, ErrorCode, EvidenceOption, InferredRelationKind, JevChoiceAnswer, JevEvidenceChoice,
-    JevEvidenceSelection, JevRelationClassification, RelationCandidate, RelationChoice,
-    RelationJudgment,
+    AppError, ErrorCode, EvidenceOption, ExecutionAssessment, ExecutionOutcome, ExecutionStage,
+    InferredRelationKind, JevChoiceAnswer, JevEvidenceChoice, JevEvidenceSelection,
+    JevRelationClassification, JevTopicClassification, RelationCandidate, RelationChoice,
+    RelationJudgment, TopicLabel,
 };
 use reqwest::header;
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeMap, time::Duration};
 
 /// 关系题目、证据选项或解释规则变化时递增，防止复用旧判断。
-pub const RELATION_RULES_VERSION: &str = "v1-12-choice-2";
+pub const RELATION_RULES_VERSION: &str = "v2-typed-stage-outcome-summary-relations-3";
 
-const KINDS: &[(InferredRelationKind, &str)] = &[
+const KINDS: &[(InferredRelationKind, &str, &str)] = &[
     (
         InferredRelationKind::Continues,
         "后续会话延续前序会话未完成的同一工作",
+        "from 是前序会话，to 是继续该工作的后续会话",
     ),
     (
         InferredRelationKind::Implements,
         "后续会话落实前序会话提出的具体方案",
+        "from 是提出方案的会话，to 是落实方案的会话",
     ),
     (
         InferredRelationKind::Fixes,
         "后续会话修复前序会话暴露的具体问题",
+        "from 是暴露问题的会话，to 是修复该问题的会话",
     ),
     (
         InferredRelationKind::Validates,
         "后续会话验证前序会话的具体结果或结论",
+        "from 是产出结果或结论的会话，to 是验证它的会话",
     ),
     (
         InferredRelationKind::Investigates,
         "后续会话调查前序会话提出的问题或现象",
+        "from 是记录问题或现象的会话，to 是调查它的会话",
+    ),
+    (
+        InferredRelationKind::DependsOn,
+        "一条会话的工作依赖另一条会话的具体产物或决定",
+        "from 是依赖方会话，to 是它所依赖的前置工作会话",
+    ),
+    (
+        InferredRelationKind::Modifies,
+        "一条会话对另一条会话提出或产出的具体方案/实现作出修改",
+        "from 是执行修改的会话，to 是被修改工作所属的会话",
+    ),
+    (
+        InferredRelationKind::Reviews,
+        "一条会话审查另一条会话产出的具体工作",
+        "from 是评审会话，to 是被评审工作所属的会话",
+    ),
+    (
+        InferredRelationKind::HandoffTo,
+        "一条会话把具体任务、决定或结果交接给另一条会话",
+        "from 是交接方会话，to 是接收方会话",
     ),
     (
         InferredRelationKind::Supersedes,
         "后续会话明确取代前序会话的方案或结果",
+        "from 是被取代工作的会话，to 是取代它的新会话",
     ),
     (
         InferredRelationKind::MotivatedBy,
         "后续会话因前序会话的发现或决定而展开",
+        "from 是发现或决定的会话，to 是由此展开工作的会话",
     ),
     (
         InferredRelationKind::AlternativeTo,
         "两条会话给同一目标提供互斥或可替代方案",
+        "无向，端点次序不表示方向",
     ),
     (
         InferredRelationKind::Related,
         "两条会话有具体工作联系，但不满足其他类型",
+        "无向，端点次序不表示方向",
     ),
 ];
 
@@ -97,7 +127,7 @@ fn classification_questions(
 ) -> (Map<String, Value>, Vec<ClassificationSpec>) {
     let mut questions = Map::new();
     let mut specifications = Vec::new();
-    for &(kind, meaning) in KINDS {
+    for &(kind, meaning, direction_meaning) in KINDS {
         for reverse in 0..(if kind.directed() { 2 } else { 1 }) {
             let (from, to, direction) = if reverse == 0 {
                 (
@@ -118,7 +148,7 @@ fn classification_questions(
                 if reverse == 0 { "ab" } else { "ba" }
             );
             let (instructions, support, reject) = if kind.directed() {
-                (format!("独立判断具体关系 {key}：{meaning}。方向为 {direction}，即前序 {from} 指向后续 {to}。只能根据 state 中双方实际材料判断；同一对可有多种关系，不依赖其他题的答案。"),
+                (format!("独立判断具体关系 {key}：{meaning}。方向为 {direction}；{direction_meaning}，具体端点是 {from} → {to}。不因端点顺序或更新时间推断方向，只按此关系类型定义判断双方实际材料。同一对可有多种关系，不依赖其他题的答案。"),
                     "双方材料明确支持这一具体类型和方向", "双方材料不支持这一具体类型和方向，或明显是另一回事")
             } else {
                 (format!("独立判断具体无向关系 {key}：{meaning}。双方是 leftThread {from} 与 rightThread {to}；端点顺序仅用于稳定身份，不表示时间先后或因果。只能根据 state 中双方实际材料判断；同一对可有多种关系，不依赖其他题的答案。"),
@@ -131,6 +161,32 @@ fn classification_questions(
             specifications.push((key, kind, from.clone(), to.clone()));
         }
     }
+    questions.insert(
+        "execution_stage".into(),
+        json!({
+            "type": "choice",
+            "instructions": "判断双方具体工作关系目前达到的执行阶段。只根据 state 中双方实际材料；材料不足时选择 UNKNOWN。",
+            "criteria": {
+                "PLANNED": "已形成明确计划，但尚未开始执行",
+                "STARTED": "已经开始执行，但尚未完成",
+                "COMPLETED": "相关工作已经完成",
+                "UNKNOWN": "材料不足或关系是否执行无法判断"
+            }
+        }),
+    );
+    questions.insert(
+        "execution_outcome".into(),
+        json!({
+            "type": "choice",
+            "instructions": "判断双方具体工作关系可见的执行结果。结果与执行阶段分开；材料不足时选择 UNKNOWN。",
+            "criteria": {
+                "SUCCESSFUL": "已达到预期目标或得到可用结果",
+                "BLOCKED": "遇到未解决阻碍，工作无法继续",
+                "FAILED": "执行失败或结果明确不可用",
+                "UNKNOWN": "材料不足或执行结果无法判断"
+            }
+        }),
+    );
     (questions, specifications)
 }
 
@@ -206,6 +262,8 @@ impl JevRelationAnalyzer {
         let classification = json!({
             "leftThread": candidate.left_thread_id, "rightThread": candidate.right_thread_id,
             "candidateReasons": candidate.reasons,
+            "leftFullHistorySummary": candidate.left_summary,
+            "rightFullHistorySummary": candidate.right_summary,
             "sampledEvidencePairs": sampled.clone().map(|pair| json!({
                 "left": {"excerpt": pair.left.excerpt, "turn": pair.left.turn_id},
                 "right": {"excerpt": pair.right.excerpt, "turn": pair.right.turn_id}
@@ -353,10 +411,118 @@ impl JevRelationAnalyzer {
                 answer: parsed,
             });
         }
+        let stage_answer = answer(
+            body.answers
+                .get("execution_stage")
+                .ok_or_else(protocol_error)?,
+            &[
+                "PLANNED".into(),
+                "STARTED".into(),
+                "COMPLETED".into(),
+                "UNKNOWN".into(),
+            ],
+        )?;
+        let outcome_answer = answer(
+            body.answers
+                .get("execution_outcome")
+                .ok_or_else(protocol_error)?,
+            &[
+                "SUCCESSFUL".into(),
+                "BLOCKED".into(),
+                "FAILED".into(),
+                "UNKNOWN".into(),
+            ],
+        )?;
+        let execution = ExecutionAssessment {
+            stage: match stage_answer.choice.as_str() {
+                "PLANNED" => ExecutionStage::Planned,
+                "STARTED" => ExecutionStage::Started,
+                "COMPLETED" => ExecutionStage::Completed,
+                _ => ExecutionStage::Unknown,
+            },
+            outcome: match outcome_answer.choice.as_str() {
+                "SUCCESSFUL" => ExecutionOutcome::Successful,
+                "BLOCKED" => ExecutionOutcome::Blocked,
+                "FAILED" => ExecutionOutcome::Failed,
+                _ => ExecutionOutcome::Unknown,
+            },
+            stage_confidence: stage_answer.confidence,
+            outcome_confidence: outcome_answer.confidence,
+        };
         Ok(JevRelationClassification {
             requested_model: model.into(),
             actual_model: body.model,
             choices,
+            execution: Some(execution),
+            input_tokens: body.usage.input_tokens,
+            output_tokens: body.usage.output_tokens,
+        })
+    }
+
+    pub async fn classify_topic(
+        &self,
+        credential: &Credential,
+        model: &str,
+        thread_id: &str,
+        summary: &str,
+        labels: &[TopicLabel],
+    ) -> Result<JevTopicClassification, AppError> {
+        if thread_id.trim().is_empty()
+            || summary.trim().is_empty()
+            || labels.is_empty()
+            || labels.len() > 80
+        {
+            return Err(protocol_error());
+        }
+        let mut criteria = Map::new();
+        criteria.insert(
+            "UNCLASSIFIED".into(),
+            json!("当前主题词表没有足够匹配的主题"),
+        );
+        let mut keys = BTreeMap::new();
+        for (index, label) in labels.iter().enumerate() {
+            let key = format!("TOPIC_{index}");
+            let description = if label.description.trim().is_empty() {
+                label.name.clone()
+            } else {
+                format!("{}：{}", label.name, label.description)
+            };
+            criteria.insert(key.clone(), json!(description));
+            keys.insert(key, label.id.clone());
+        }
+        let options = criteria.keys().cloned().collect::<Vec<_>>();
+        let state = json!({"threadId": thread_id, "fullHistorySummary": summary});
+        let questions = Map::from_iter([(
+            "primary_topic".into(),
+            json!({
+                "type": "choice",
+                "instructions": "为这条会话选择一个最能概括其主要工作内容的全局主题。只选择一个主题；仅在所有主题都不合适或材料不足时选择 UNCLASSIFIED。相同技术词或文件名本身不代表同一主题。",
+                "criteria": criteria
+            }),
+        )]);
+        if request_characters(&state, model, &questions) > self.material_limit {
+            return Err(input_limit_error());
+        }
+        let body = self.submit(credential, model, state, questions).await?;
+        let parsed = answer(
+            body.answers
+                .get("primary_topic")
+                .ok_or_else(protocol_error)?,
+            &options,
+        )?;
+        let selected_topic_id = keys.get(&parsed.choice).cloned();
+        let mut probabilities = BTreeMap::new();
+        for (key, probability) in &parsed.probabilities {
+            if let Some(topic_id) = keys.get(key) {
+                probabilities.insert(topic_id.clone(), *probability);
+            }
+        }
+        Ok(JevTopicClassification {
+            requested_model: model.to_owned(),
+            actual_model: body.model,
+            selected_topic_id,
+            confidence: parsed.confidence,
+            probabilities,
             input_tokens: body.usage.input_tokens,
             output_tokens: body.usage.output_tokens,
         })
@@ -460,6 +626,8 @@ mod tests {
                     right: evidence("b", "thread-b", "修复中文故障"),
                 }],
             },
+            left_summary: None,
+            right_summary: None,
         }
     }
 

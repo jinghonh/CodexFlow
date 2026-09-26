@@ -9,6 +9,7 @@ codexflow-codex = { path = "../codex" }
 codexflow-store = { path = "../store" }
 codexflow-jev = { path = "../jev" }
 codexflow-text = { path = "../text" }
+codexflow-embedding = { path = "../embedding" }
 tokio = { version = "1", features = ["sync", "macros", "rt", "rt-multi-thread", "time", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 sha2 = "0.10"

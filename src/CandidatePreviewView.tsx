@@ -5,6 +5,7 @@ import { formatAppError } from "./appError";
 type Evidence = { id: string; threadId: string; turnId: string; itemId: string; excerpt: string; contentVersion: string };
 type Pair = { id: string; left: Evidence; right: Evidence };
 type Candidate = { id: string; leftThreadId: string; rightThreadId: string; score: number;
+  leftSummary?: string | null; rightSummary?: string | null;
   reasons: { signal: string; detail: string }[];
   evidence: { leftAvailable: number; rightAvailable: number; combinationsAvailable: number;
     combinationsShown: number; leftSampled: number; rightSampled: number; samplingRule: string; pairs: Pair[] } };
@@ -41,8 +42,8 @@ export function CandidatePreviewView({ projectId, refreshVersion, onSelectEviden
     {error && <p className="page-error" role="alert">{error}</p>}
     {!preview && !error && <p>正在计算候选…</p>}
     {preview && <>
-      <div className="candidate-summary"><strong>{preview.candidateCount} 对候选</strong><span>{preview.threadCount} 条会话</span><span>每条会话最多选取 {preview.neighborLimit} 个邻居；无序候选对去重</span></div>
-      {!!preview.unavailableThreads && <p className="thread-warning">{preview.unavailableThreads} 条会话内容部分可读、读取失败或来源已更新，暂不参与新候选；旧关系证据仍可在关系图中检查。</p>}
+      <div className="candidate-summary"><strong>{preview.candidateCount} 对候选</strong><span>{preview.threadCount} 条会话</span><span>明确引用和共享产物候选不受配额限制；其他线索每条会话最多 10 对</span></div>
+      {!!preview.unavailableThreads && <p className="thread-warning">{preview.unavailableThreads} 条会话历史不完整或来源版本已变化，仍参与标题、预览、分支和时间线索召回；未读取的来源事实不作为信号。</p>}
       {preview.candidateCount === 0 && <p className="empty-list">当前没有具备筛选信号的候选。</p>}
       <div className="candidate-list">
         {preview.candidates.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE).map((candidate) => <button key={candidate.id}
@@ -67,7 +68,8 @@ export function CandidatePreviewView({ projectId, refreshVersion, onSelectEviden
         {selected.reasons.map((reason, index) => <p key={`${reason.signal}-${index}`}><strong>{reason.signal}</strong>：{reason.detail}</p>)}
         <h3>双侧来源证据组合 {selected.evidence.combinationsShown} / {selected.evidence.combinationsAvailable}</h3>
         <p>{selected.evidence.samplingRule} 左侧 {selected.evidence.leftSampled} / {selected.evidence.leftAvailable} 条；右侧 {selected.evidence.rightSampled} / {selected.evidence.rightAvailable} 条。</p>
-        {!selected.evidence.pairs.length && <p className="thread-warning">证据不足：至少一侧没有可定位的来源条目。后续判断不得凭总结补造证据。</p>}
+        {!selected.evidence.pairs.length && <p className="analysis-note">此候选没有双侧来源摘录；关系判断可使用双方当前有效的完整会话总结，Jev 结果不会被伪装成来源引用。</p>}
+        {(selected.leftSummary || selected.rightSummary) && <div className="candidate-summaries"><h3>双方完整会话总结</h3>{selected.leftSummary && <article><strong>左侧 · {selected.leftThreadId}</strong><p>{selected.leftSummary}</p></article>}{selected.rightSummary && <article><strong>右侧 · {selected.rightThreadId}</strong><p>{selected.rightSummary}</p></article>}</div>}
         {selected.evidence.pairs.map((pair, index) => <div className="candidate-pair" key={pair.id}>
           <strong>组合 {index + 1}</strong>{([pair.left, pair.right] as const).map((evidence, side) => <div key={evidence.id}>
             <small>{side === 0 ? "左侧" : "右侧"} · 回合 {evidence.turnId} · 条目 {evidence.itemId} · 内容版本 {evidence.contentVersion.slice(0, 12)}</small>
