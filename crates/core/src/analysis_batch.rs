@@ -19,6 +19,12 @@ use tokio_util::sync::CancellationToken;
 
 static NEXT_BATCH: AtomicU64 = AtomicU64::new(0);
 const UNCONFIGURED_TEXT_MODEL: &str = "未配置文本模型";
+const MAX_ANALYSIS_CONCURRENCY: u8 = 10;
+const MAX_ANALYSIS_RETRIES: u8 = 5;
+
+pub(crate) fn model_slot_weight(concurrency_limit: u8) -> u32 {
+    crate::MODEL_CONCURRENCY_SLOTS / u32::from(concurrency_limit)
+}
 
 #[derive(Clone, Copy)]
 struct NamingConfig<'a> {
@@ -123,13 +129,13 @@ fn core_error(code: ErrorCode, message: &str, retryable: bool) -> AppError {
 
 fn validate_limits(limits: &AnalysisLimits) -> Result<(), AppError> {
     if limits.call_limit == 0
-        || !(1..=2).contains(&limits.concurrency_limit)
+        || !(1..=MAX_ANALYSIS_CONCURRENCY).contains(&limits.concurrency_limit)
         || limits.timeout_seconds == 0
-        || limits.retry_limit > 2
+        || limits.retry_limit > MAX_ANALYSIS_RETRIES
         || limits.input_character_limit < 2_000
     {
         return Err(core_error(ErrorCode::AnalysisBudgetInvalid,
-            "调用上限和超时必须为正整数；全部后端并发最多 2，自动重试最多 2 次，输入至少 2000 字符。", false));
+            "调用上限和超时必须为正整数；全部后端并发最多 10，自动重试最多 5 次，输入至少 2000 字符。", false));
     }
     Ok(())
 }
@@ -1683,8 +1689,14 @@ impl SourceService {
         let permit = tokio::select! {
             _ = control.cancel.cancelled() => return Ok(()),
             _ = control.queue_pause.cancelled() => return Ok(()),
-            acquired = self.model_slots.acquire() => acquired.map_err(|_| core_error(
-                ErrorCode::AnalysisUnavailable, "模型并发队列已关闭。", true))?,
+            acquired = self
+                .model_slots
+                .acquire_many(model_slot_weight(run.limits.concurrency_limit)) => acquired
+                .map_err(|_| core_error(
+                    ErrorCode::AnalysisUnavailable,
+                    "模型并发队列已关闭。",
+                    true,
+                ))?,
         };
         let dispatch = control.dispatch.lock().await;
         if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
@@ -1865,7 +1877,16 @@ impl SourceService {
             _ = control.cancel.cancelled() => return Ok(()),
             _ = control.queue_pause.cancelled() => return Ok(()),
             _ = credential_cancel.cancelled() => return Ok(()),
-            value = self.model_slots.acquire() => value.map_err(|_| core_error(ErrorCode::AnalysisUnavailable, "模型并发队列已关闭。", true))?,
+            value = self
+                .model_slots
+                .acquire_many(model_slot_weight(run.limits.concurrency_limit)) => value
+                .map_err(|_| {
+                    core_error(
+                        ErrorCode::AnalysisUnavailable,
+                        "模型并发队列已关闭。",
+                        true,
+                    )
+                })?,
         };
         let gate = tokio::select! {
             _ = control.cancel.cancelled() => return Ok(()),
@@ -2121,7 +2142,16 @@ impl SourceService {
             _ = control.cancel.cancelled() => return Ok(()),
             _ = control.queue_pause.cancelled() => return Ok(()),
             _ = credential_cancel.cancelled() => return Ok(()),
-            value = self.model_slots.acquire() => value.map_err(|_| core_error(ErrorCode::AnalysisUnavailable, "模型并发队列已关闭。", true))?,
+            value = self
+                .model_slots
+                .acquire_many(model_slot_weight(run.limits.concurrency_limit)) => value
+                .map_err(|_| {
+                    core_error(
+                        ErrorCode::AnalysisUnavailable,
+                        "模型并发队列已关闭。",
+                        true,
+                    )
+                })?,
         };
         let gate = tokio::select! {
             _ = control.cancel.cancelled() => return Ok(()),
@@ -2948,7 +2978,7 @@ mod tests {
         let root = root("queued-cancel");
         let service = service(&root, "ok", 1).await;
         let held = Arc::clone(&service.model_slots)
-            .acquire_many_owned(2)
+            .acquire_many_owned(crate::MODEL_CONCURRENCY_SLOTS)
             .await
             .unwrap();
         let started = service
@@ -3014,7 +3044,7 @@ mod tests {
             ..AnalysisLimits::default()
         };
         let held = Arc::clone(&service.model_slots)
-            .acquire_many_owned(2)
+            .acquire_many_owned(crate::MODEL_CONCURRENCY_SLOTS)
             .await
             .unwrap();
         let first = service
@@ -3040,7 +3070,7 @@ mod tests {
         let root = root("queued-pause");
         let service = service(&root, "ok", 1).await;
         let held = Arc::clone(&service.model_slots)
-            .acquire_many_owned(2)
+            .acquire_many_owned(crate::MODEL_CONCURRENCY_SLOTS)
             .await
             .unwrap();
         let started = service
@@ -3083,7 +3113,7 @@ mod tests {
         let root = root("pause-retry");
         let service = service(&root, "twice-flaky", 1).await;
         let held = Arc::clone(&service.model_slots)
-            .acquire_many_owned(2)
+            .acquire_many_owned(crate::MODEL_CONCURRENCY_SLOTS)
             .await
             .unwrap();
         let limits = AnalysisLimits {
@@ -3291,19 +3321,19 @@ mod tests {
     }
 
     #[test]
-    fn limits_reject_zero_and_more_than_two_shared_calls() {
+    fn limits_reject_zero_and_values_above_expanded_caps() {
         assert!(validate_limits(&AnalysisLimits {
             call_limit: 0,
             ..AnalysisLimits::default()
         })
         .is_err());
         assert!(validate_limits(&AnalysisLimits {
-            concurrency_limit: 3,
+            concurrency_limit: 11,
             ..AnalysisLimits::default()
         })
         .is_err());
         assert!(validate_limits(&AnalysisLimits {
-            retry_limit: 3,
+            retry_limit: 6,
             ..AnalysisLimits::default()
         })
         .is_err());

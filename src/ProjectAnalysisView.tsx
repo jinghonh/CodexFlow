@@ -19,6 +19,8 @@ type Run = { id: string; projectId: string; state: "queued" | "running" | "cance
   interrupted: boolean; error: { message: string } | null; limits: Limits;
   units: { id: string; stage: Stage["stage"]; state: string; attempts: number; actualModel: string | null; error: { message: string } | null }[] };
 
+const maxConcurrencyLimit = 10;
+const maxRetryLimit = 5;
 const initialLimits: Limits = { callLimit: 100, concurrencyLimit: 2, timeoutSeconds: 180, retryLimit: 2, inputCharacterLimit: 40000 };
 const stageNames: Record<Stage["stage"], string> = { summary: "会话总结", relation: "候选关系判断", evidenceSelection: "证据选择", naming: "工作流命名" };
 const panelStageNames: Record<PanelStage, string> = { summary: "会话总结", relations: "候选关系判断", naming: "工作流命名" };
@@ -129,8 +131,8 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   const canStart = selectedWorkPending && !textWorkUnavailable && !relationWorkUnavailable &&
     !active && run?.state !== "paused" && !busy && runLoaded;
   const valid = Number.isInteger(limits.callLimit) && limits.callLimit > 0 && Number.isInteger(limits.timeoutSeconds) && limits.timeoutSeconds > 0 &&
-    Number.isInteger(limits.concurrencyLimit) && limits.concurrencyLimit >= 1 && limits.concurrencyLimit <= 2 &&
-    Number.isInteger(limits.retryLimit) && limits.retryLimit >= 0 && limits.retryLimit <= 2 &&
+    Number.isInteger(limits.concurrencyLimit) && limits.concurrencyLimit >= 1 && limits.concurrencyLimit <= maxConcurrencyLimit &&
+    Number.isInteger(limits.retryLimit) && limits.retryLimit >= 0 && limits.retryLimit <= maxRetryLimit &&
     Number.isInteger(limits.inputCharacterLimit) && limits.inputCharacterLimit >= 2000;
   const visibleStages = preview?.stages.filter((item) => stage === "relations"
     ? item.stage === "relation" || item.stage === "evidenceSelection"
@@ -148,12 +150,12 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       <summary>运行参数</summary>
       <div className="analysis-limits">
         <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={limits.callLimit} onChange={(event) => setLimits({ ...limits, callLimit: Number(event.target.value) })} /></label>
-        <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max="2" value={limits.concurrencyLimit} onChange={(event) => setLimits({ ...limits, concurrencyLimit: Number(event.target.value) })} /></label>
+        <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max={maxConcurrencyLimit} value={limits.concurrencyLimit} onChange={(event) => setLimits({ ...limits, concurrencyLimit: Number(event.target.value) })} /></label>
         <label>单次超时（秒）<input aria-label="单次超时" type="number" min="1" value={limits.timeoutSeconds} onChange={(event) => setLimits({ ...limits, timeoutSeconds: Number(event.target.value) })} /></label>
-        <label>自动重试次数<input aria-label="自动重试次数" type="number" min="0" max="2" value={limits.retryLimit} onChange={(event) => setLimits({ ...limits, retryLimit: Number(event.target.value) })} /></label>
+        <label>自动重试次数<input aria-label="自动重试次数" type="number" min="0" max={maxRetryLimit} value={limits.retryLimit} onChange={(event) => setLimits({ ...limits, retryLimit: Number(event.target.value) })} /></label>
         <label>单次输入字符上限<input aria-label="单次输入字符上限" type="number" min="2000" value={limits.inputCharacterLimit} onChange={(event) => setLimits({ ...limits, inputCharacterLimit: Number(event.target.value) })} /></label>
       </div>
-      {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；总并发为 1–2，自动重试为 0–2，输入至少 2000 字符。</p>}
+      {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；总并发为 1–{maxConcurrencyLimit}，自动重试为 0–{maxRetryLimit}，输入至少 2000 字符。</p>}
       <small className="analysis-note">参数仅用于本阶段新启动的批次；继续已有批次时沿用原有参数，仅更新调用上限。</small>
     </details>
     {textWorkUnavailable && <p className="analysis-note">待处理任务需要文本服务。请先在“来源设置”面板配置文本服务。</p>}

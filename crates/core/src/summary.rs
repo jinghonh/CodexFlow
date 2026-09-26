@@ -658,8 +658,15 @@ impl SourceService {
         self: &Arc<Self>,
         thread_id: String,
     ) -> Result<SummaryRun, AppError> {
-        self.start_summary_inner(thread_id, false, LIMIT, None, 1, CancellationToken::new())
-            .await
+        self.start_summary_inner(
+            thread_id,
+            false,
+            LIMIT,
+            None,
+            crate::analysis_batch::model_slot_weight(2),
+            CancellationToken::new(),
+        )
+        .await
     }
 
     pub(crate) async fn start_summary_for_batch(
@@ -670,7 +677,7 @@ impl SourceService {
         concurrency_limit: u8,
         queue_pause: CancellationToken,
     ) -> Result<SummaryRun, AppError> {
-        let permits = if concurrency_limit == 1 { 2 } else { 1 };
+        let permits = crate::analysis_batch::model_slot_weight(concurrency_limit);
         self.start_summary_inner(
             thread_id,
             true,

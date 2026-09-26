@@ -37,6 +37,8 @@ use std::{
 pub use summary::SummaryAnalyzer;
 pub const EVALUATION_CANDIDATE_RULES_VERSION: &str = candidates::CANDIDATE_RULE_VERSION;
 pub const EVALUATION_FACT_RULES_VERSION: &str = facts::RULE_VERSION;
+// Divisible by every accepted analysis concurrency limit from 1 through 10.
+pub(crate) const MODEL_CONCURRENCY_SLOTS: u32 = 2_520;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -138,7 +140,9 @@ impl SourceService {
             analysis_active: std::sync::Mutex::new(std::collections::HashMap::new()),
             analysis_update_lock: std::sync::Mutex::new(()),
             analysis_clock: Arc::new(|| now_ms() as i64),
-            model_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            model_slots: Arc::new(tokio::sync::Semaphore::new(
+                MODEL_CONCURRENCY_SLOTS as usize,
+            )),
             #[cfg(test)]
             analysis_auth_home: None,
         };
@@ -279,8 +283,12 @@ impl SourceService {
         let _slot = tokio::select! {
             biased;
             _ = token.cancelled() => return Err(jev_cancelled()),
-            acquired = self.model_slots.acquire() => acquired.map_err(|_| AppError::jev(
-                ErrorCode::AnalysisUnavailable, "模型调用队列不可用。", true))?,
+            acquired = self.model_slots.acquire_many(analysis_batch::model_slot_weight(2)) => acquired
+                .map_err(|_| AppError::jev(
+                    ErrorCode::AnalysisUnavailable,
+                    "模型调用队列不可用。",
+                    true,
+                ))?,
         };
         let _gate = self.jev_gate.read().await;
         tokio::select! {
