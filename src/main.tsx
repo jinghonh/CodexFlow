@@ -364,6 +364,15 @@ export function App() {
     }
   }
 
+  async function refreshGlobalIndexIfNeeded(projectId: string | null, cachedScopes: Scope[]) {
+    if (!projectId || source?.connection !== "connected") return;
+    const latestRun = await invoke<IndexRun | null>("get_latest_index_run").catch(() => null);
+    const currentRun = latestRun ?? indexRun;
+    recordRun(currentRun);
+    if (currentRun?.state === "queued" || currentRun?.state === "running") return;
+    if (shouldAutoRefresh(cachedScopes, currentRun)) await startRefresh(projectId);
+  }
+
   async function cancelRefresh() {
     if (!indexRun || !refreshing) return;
     try { await invoke<IndexRun>("cancel_index_run", { id: indexRun.id }); }
@@ -406,7 +415,7 @@ export function App() {
       setGraphVersion((version) => version + 1);
       setShowUnassigned(false);
       setProjectError("");
-      await startRefresh(catalog.selectedProjectId);
+      await refreshGlobalIndexIfNeeded(catalog.selectedProjectId, catalog.scopes);
     } catch (error) { setProjectError(errorText(error)); }
   }
 
@@ -422,7 +431,7 @@ export function App() {
       setGraphVersion((version) => version + 1);
       setShowUnassigned(false);
       setProjectError("");
-      await startRefresh(projectId);
+      await refreshGlobalIndexIfNeeded(projectId, catalog.scopes);
     } catch (error) { setProjectError(errorText(error)); }
   }
 
@@ -546,6 +555,18 @@ export function App() {
   const scopes = projectSessions?.scopes ?? projectCatalog?.scopes ?? [];
   const attempted = scopes.some((scope) => scope.attemptedAtUnixMs !== null);
   const complete = scopes.length === 2 && scopes.every((scope) => scope.complete);
+  const lastCompleteIndexAtUnixMs = scopes.length === 2 && scopes.every((scope) => scope.completedAtUnixMs !== null)
+    ? Math.min(...scopes.map((scope) => scope.completedAtUnixMs ?? Number.POSITIVE_INFINITY))
+    : null;
+  const lastCompleteIndexLabel = lastCompleteIndexAtUnixMs === null
+    ? "尚无完整扫描记录"
+    : `上次完整扫描于 ${new Date(lastCompleteIndexAtUnixMs).toLocaleString("zh-CN")}`;
+  const globalCacheStatus = refreshing
+    ? `全局扫描中；当前仍显示缓存（${lastCompleteIndexLabel}）`
+    : !attempted ? "尚未完成全局扫描"
+    : !connected ? `来源当前不可用；显示缓存（${lastCompleteIndexLabel}）`
+    : complete ? `全局列表完整；${lastCompleteIndexLabel}`
+    : `最近全局扫描未完成；继续显示缓存（${lastCompleteIndexLabel}）`;
   const threadQueryKey = JSON.stringify([projectSessions?.project.id ?? null, showUnassigned, query, workstreamFilter, workspaceFilter, archiveFilter, completeFilter, workstreams?.revision ?? null]);
   useEffect(() => { setThreadLimit(40); }, [threadQueryKey]);
   const currentThreadMatches = threadMatches?.queryKey === threadQueryKey ? threadMatches.value : null;
@@ -591,7 +612,7 @@ export function App() {
     window.scrollTo({ top: 0, behavior: "auto" });
   }
   const projectState = !projectSessions ? "首次使用：请选择本地项目并连接数据源。"
-    : refreshing ? "读取中：正在刷新来源；已有缓存仍可查看。"
+    : refreshing ? "本机 Codex 全局索引刷新中；当前项目的会话缓存仍可查看。"
     : indexRun?.state === "failed" ? "读取失败：已保存缓存仍可查看，请检查来源并重试。"
     : projectSessions.threads.length === 0 ? attempted ? "无会话：当前项目没有已索引会话。" : "首次使用：此项目尚未采集，连接来源后刷新。"
     : !complete ? "来源不完整：部分历史或列表未取得，继续查看已保存事实。"
@@ -731,12 +752,12 @@ export function App() {
         <div className="eyebrow">探索 / 会话浏览 <span /></div>
         <div className="page-heading"><div><h1>会话浏览<span className="accent">.</span></h1><p>{projectSessions?.project.name ?? "浏览所选本地项目的会话、摘要和来源事实。"}</p></div><div className="heading-badge">按需读取<br /><strong>列表仅含元数据</strong></div></div>
         <section id="sessions" className="panel session-panel">
-          <div className="session-heading"><div><div className="panel-kicker">探索 / 会话清单</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "正在刷新…" : "刷新列表"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
-          {indexRun && <div className="index-run" role="status"><strong>索引{runLabels[indexRun.state]}</strong><span>运行 {indexRun.id}</span><span>已保存 {indexRun.pagesSaved} 页，读取 {indexRun.threadsSeen} 条</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}{refreshing && <div className="index-progress" role="progressbar" aria-label="会话列表加载进度" aria-valuetext={`已保存 ${indexRun.pagesSaved} 页，读取 ${indexRun.threadsSeen} 条`}><span /></div>}</div>}
+          <div className="session-heading"><div><div className="panel-kicker">探索 / 会话清单</div><h2>{showUnassigned ? "未归属会话" : projectSessions?.project.name ?? "请先选择项目"}</h2><p className="panel-intro">{showUnassigned ? "这些会话没有可确认的本地项目；逐条查看原因。" : projectSessions ? projectSessions.project.root : "项目选择会保存，重新打开应用时先显示缓存。"}</p></div><div className="refresh-actions"><button className="primary-button" disabled={!connected || refreshing} title="扫描本机 Codex 来源的全部未归档和已归档会话，更新所有项目的会话目录。" onClick={() => void startRefresh(projectCatalog?.selectedProjectId ?? null)}>{refreshing ? "全局索引中…" : "刷新全局索引"}<span>↻</span></button>{refreshing && <button className="browse-button" onClick={() => void cancelRefresh()}>取消刷新</button>}</div></div>
+          {indexRun && <div className="index-run" role="status"><strong>本机 Codex 全局索引 · {runLabels[indexRun.state]}</strong><span>范围：全部未归档与已归档会话</span><span>已处理 {indexRun.pagesSaved} 页；识别 {indexRun.threadsSeen} 条有效元数据</span>{indexRun.interrupted && <span>上次运行中断，可重新刷新</span>}{indexRun.error && <em>{errorText(indexRun.error)}</em>}{refreshing && <div className="index-progress" role="progressbar" aria-label="本机 Codex 全局索引进度" aria-valuetext={`全局已处理 ${indexRun.pagesSaved} 页，识别 ${indexRun.threadsSeen} 条有效元数据`}><span /></div>}</div>}
           {!showUnassigned && projectSessions && <div className="workspace-list"><strong>实际工作区</strong>{projectSessions.workspaces.length ? projectSessions.workspaces.map((workspace) => <code key={workspace}>{workspace}</code>) : <span>当前没有可验证的工作区</span>}</div>}
-          <div className="list-summary"><strong>{showUnassigned ? projectCatalog?.unassigned.length ?? 0 : projectSessions?.threads.length ?? 0} 条会话</strong><span>{refreshing ? "刷新中；缓存可浏览" : !attempted ? "尚未采集" : complete ? connected ? "上次列表刷新完整" : "缓存上次列表完整；来源当前不可用" : "最近刷新未完成；旧缓存仍在"}</span><span>选择会话后按需读取回合与条目</span></div>
+          <div className="list-summary"><strong>{showUnassigned ? `未归属会话：${projectCatalog?.unassigned.length ?? 0} 条` : `当前项目：${projectSessions?.threads.length ?? 0} 条会话`}</strong><span>{globalCacheStatus}</span><span>选择会话后按需读取回合与条目</span></div>
           {!showUnassigned && <p className="project-state" role="status">{projectState}</p>}
-          {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "已归档" : "未归档"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "上次列表完整" : "最近读取未完成"}</span><small>{scope.completedAtUnixMs ? `上次完整读取 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整读取记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}
+          {scopes.map((scope) => <div className="scope-line" key={String(scope.archived)}><strong>{scope.archived ? "全局已归档会话" : "全局未归档会话"}</strong><span>{scope.attemptedAtUnixMs === null ? "尚未读取" : scope.complete ? "上次扫描完整" : "最近扫描未完成"}</span><small>{scope.completedAtUnixMs ? `上次完整扫描 ${new Date(scope.completedAtUnixMs).toLocaleString("zh-CN")}` : "没有完整扫描记录"}</small>{scope.error && <em>{scope.error}</em>}</div>)}
           {listError && <div className="page-error" role="alert">{listError} 已保存的会话仍可浏览。</div>}
           <label className="session-search">查找会话<input value={query} onChange={(event) => { startResponse("query"); setQuery(event.target.value); }} placeholder="标题、预览、Thread ID 或已生成总结" /></label>
           {!showUnassigned && projectSessions && <div className="explorer-filters" aria-label="会话过滤">
