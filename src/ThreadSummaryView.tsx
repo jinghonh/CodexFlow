@@ -162,7 +162,7 @@ export function ThreadSummaryView({ threadId, revision, onLocate }: {
     {!busy && run && <div className="analysis-progress prominent" role="status"><strong>单条会话总结 · {run.state === "running" ? "执行中" : run.state === "cancelling" ? "取消中" : run.state === "complete" ? "完成" : run.state === "cancelled" ? "已取消" : "失败"}</strong>
       <ProgressMeter progress={summaryProgress(run)} label="单条会话总结进度" />
       {run.error && <em>{errorText(run.error)}</em>}</div>}
-    {run && <p className="history-lookup-message" role="status">{run.state === "running" ? "分析中" : run.state === "cancelling" ? "取消中，等待回合终态或专用进程退出" : run.state === "complete" ? run.reusedCache ? "已复用有效缓存" : "总结已保存" : run.state === "cancelled" ? "已取消，旧总结保留" : "分析失败，旧总结保留"}{run.error ? `：${errorText(run.error)}` : ""}</p>}
+    {run && <p className="history-lookup-message" role="status">{run.state === "running" ? "分析中" : run.state === "cancelling" ? "取消中" : run.state === "complete" ? run.reusedCache ? "已复用有效缓存" : "总结已保存" : run.state === "cancelled" ? "已取消，旧总结保留" : "分析失败，旧总结保留"}{run.error ? `：${errorText(run.error)}` : ""}</p>}
     {error && <p className="page-error" role="alert">{error}</p>}
     {summary ? <div className="summary-fields">{(Object.keys(labels) as (keyof typeof labels)[]).map((key) =>
       <div key={key}><strong>{labels[key]}</strong><p>{summary.content[key]}</p></div>)}
@@ -173,7 +173,7 @@ export function ThreadSummaryView({ threadId, revision, onLocate }: {
           {check && <small className={check.state === "valid" ? "" : "thread-warning"}>{check.message}</small>}
           {check?.excerpt && <blockquote>{check.excerpt}</blockquote>}</div>;
       })}{evidenceMessage && <p role="status">{evidenceMessage}</p>}</div>
-      <small>服务 {summary.serviceBaseUrl || "旧版 Codex"} · 请求模型 {summary.requestedModel || "未知"} · 实际模型 {summary.model} · 来源更新版本 {summary.sourceUpdatedAt} · 输入版本 {summary.inputDigest?.slice(0, 12) ?? "旧版未记录"} · 保存于 {new Date(summary.createdAtUnixMs).toLocaleString("zh-CN")}</small></div>
-      : <p className="empty-list">待分析：尚无已保存的 AI 总结。点击“手动生成”后才会调用文本服务。</p>}
+      <details className="technical-details"><summary>生成详情</summary><small>服务 {summary.serviceBaseUrl || "旧版 Codex"} · 请求模型 {summary.requestedModel || "未知"} · 实际模型 {summary.model} · 来源更新版本 {summary.sourceUpdatedAt} · 输入版本 {summary.inputDigest?.slice(0, 12) ?? "旧版未记录"} · 保存于 {new Date(summary.createdAtUnixMs).toLocaleString("zh-CN")}</small></details></div>
+      : <p className="empty-list">尚无总结。</p>}
   </section>;
 }

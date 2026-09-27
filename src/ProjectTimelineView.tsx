@@ -274,8 +274,8 @@ function duration(value: number | null): string {
   return hours ? `${hours} 小时 ${minutes} 分钟` : minutes ? `${minutes} 分钟 ${seconds % 60} 秒` : `${seconds} 秒`;
 }
 
-export function ProjectTimelineView({ projectId, refreshVersion, connected, onSelectThread, selectedThreadId = null, visibleThreadIds, workstreams = [], onHistoryLoaded }: {
-  projectId: string; refreshVersion: string; connected: boolean; onSelectThread: (threadId: string) => void;
+export function ProjectTimelineView({ projectId, refreshVersion, connected, onSelectThread, onOpenThread, selectedThreadId = null, visibleThreadIds, workstreams = [], onHistoryLoaded }: {
+  projectId: string; refreshVersion: string; connected: boolean; onSelectThread: (threadId: string) => void; onOpenThread?: (threadId: string) => void;
   selectedThreadId?: string | null; visibleThreadIds?: Set<string>; workstreams?: { id: string; name: string; members: string[] }[];
   onHistoryLoaded?: () => void;
 }) {
@@ -435,8 +435,7 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
   }
 
   return <section id="project-timeline" className="panel timeline-panel" aria-label="项目活动时间线">
-    <div className="timeline-heading"><div><div className="panel-kicker">探索 / 活动时间线</div><h2>回合活动</h2>
-      <p className="panel-intro">每段色条来自一个回合的活动区间。恢复间隔留白；跨日活动在本地午夜处分段。</p></div>
+    <div className="timeline-heading"><div><h2>活动时间线</h2></div>
       <div className="timeline-controls" aria-label="时间线视图控制">
         {connected && incompleteCount > 0 && <button className="timeline-load" onClick={() => loading ? stopLoading.current = true : void loadMissingTurns()}>{loading ? `停止读取 · ${loading.done}/${loading.total}` : "读取缺失回合"}</button>}
         <div className="timeline-grains">{(["day", "week", "month"] as const).map((value) => <button key={value} className={grain === value ? "active" : ""} aria-pressed={grain === value} onClick={() => changeView(value, zoom)}>{ { day: "日", week: "周", month: "月" }[value] }</button>)}</div>
@@ -483,9 +482,9 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
         </div>}
       </div>
     </div>
-    <div className="timeline-legend"><strong>工作流泳道</strong><span>显示 {rows.length} / {visible.length} 条会话（所选范围内）；每条会话只占一个主要工作流</span><span>系统时区：{zone}</span>
+    <div className="timeline-legend"><strong>工作流泳道</strong><span>显示 {rows.length} / {visible.length} 条会话</span><span>系统时区：{zone}</span>
       {incompleteCount > 0 && <span className="timeline-incomplete-hint">{incompleteCount} 条会话历史未完整；活动条和日历小点依据已读取回合</span>}
-      <span>横向滚动查看所选日／周／月</span></div>
+</div>
     {error && <div className="page-error" role="alert">{error}</div>}
     {loadError && <div className="page-error" role="alert">{loadError}</div>}
     {!timeline && !error && <p className="empty-list">正在读取已缓存回合…</p>}
@@ -534,10 +533,10 @@ export function ProjectTimelineView({ projectId, refreshVersion, connected, onSe
             <dt>结束</dt><dd>{preciseTime(selectedTurn.completedAtUnixMs)}{selectedTurn.completedAtUnixMs !== null && <small> UTC {new Date(selectedTurn.completedAtUnixMs).toISOString()}</small>}</dd>
             <dt>来源时长</dt><dd>{duration(selectedTurn.durationMs)}{selectedTurn.durationMs !== null && selectedTurn.durationMs >= 1000 && <small>{selectedTurn.durationMs.toLocaleString("zh-CN")} 毫秒</small>}</dd>{selectedTurn.timeError && <><dt>异常</dt><dd>{selectedTurn.timeError}</dd></>}</dl>
             : <p>{selectedThread.turns.length ? "选择回合查看精确来源时间与异常信息。" : "尚无已缓存回合。"}</p>}
-          <button className="browse-button timeline-open" onClick={() => onSelectThread(selectedThread.threadId)}>打开会话历史</button></>
-          : <p>选择会话或活动段，查看本地时间、UTC 来源时间和缺失原因。</p>}
+          <button className="browse-button timeline-open" onClick={() => (onOpenThread ?? onSelectThread)(selectedThread.threadId)}>打开会话历史</button></>
+          : <p>选择会话或活动段查看详情。</p>}
       </div>
-      <p className="timeline-note">已知时长只累计来源提供的有效毫秒时长，不用起止差值补算。回合经过时间不等于用户工时，也不等于纯模型计算时间。只有列表更新时间时，它只是元数据更新时间，不能证明活动结束。</p>
+      <details className="technical-details"><summary>时长口径</summary><p className="timeline-note">已知时长只累计来源提供的有效毫秒时长，不用起止差值补算。回合经过时间不等于用户工时，也不等于纯模型计算时间。只有列表更新时间时，它只是元数据更新时间，不能证明活动结束。</p></details>
     </>}
   </section>;
 }

@@ -132,3 +132,82 @@ test("Windows 来源设置只自动查找 PATH 并忽略已保存的手动路径
   expect(panel.querySelector(".browse-button")).toBeNull();
   expect(vi.mocked(invoke)).toHaveBeenCalledWith("connect_source", { selectedBinary: null });
 });
+
+function mockWorkspace() {
+  let selected = project;
+  const second = { ...project, id: "second", name: "另一个项目", root: "/second" };
+  vi.mocked(invoke).mockImplementation(async (command, args) => {
+    if (command === "get_settings") return { theme: "light", source };
+    if (command === "get_runtime_platform") return "macos";
+    if (command === "connect_source" || command === "get_source_status") return source;
+    if (command === "choose_existing_project") selected = (args as { projectId: string }).projectId === "second" ? second : project;
+    if (command === "get_project_catalog" || command === "choose_existing_project") return { projects: [project, second], selectedProjectId: selected.id, recentProjectIds: [selected.id], unassigned: [attributed("orphan")], scopes: [] };
+    if (command === "get_project_sessions") return { project: selected, workspaces: [selected.root], threads: [attributed("t1"), attributed("t2")], scopes: [] };
+    if (command === "get_model_runs") return { runs: [] };
+    if (command === "get_latest_index_run" || command === "get_latest_analysis_run") return null;
+    if (command === "get_jev_status" || command === "get_text_status" || command === "get_embedding_status") return { config: { baseUrl: "https://model.example", model: "test" }, credentialConfigured: false, credentialError: null };
+    if (command === "get_project_workstreams") return { workstreams: [], ungroupedThreadIds: ["t1", "t2"], revision: 1 };
+    if (command === "query_project_threads") {
+      const query = (args as { query: { text: string; selectedThreadId: string | null } }).query;
+      const rows = [attributed("t1"), attributed("t2")];
+      return { total: 2, matches: rows.filter(({ thread }) => thread.id.includes(query.text)), selected: rows.find(({ thread }) => thread.id === query.selectedThreadId) ?? null };
+    }
+    throw new Error(`未模拟接口 ${command}`);
+  });
+}
+
+test("同项目视图切换保留会话筛选和选择，时间线独立显示", async () => {
+  mockWorkspace();
+  window.localStorage.setItem("codexflow.active-panel", "sessions");
+  render(<App />);
+  fireEvent.click(await screen.findByRole("button", { name: "查看会话 t1 的历史" }));
+  fireEvent.change(screen.getByLabelText("查找会话"), { target: { value: "t2" } });
+  await waitFor(() => expect(document.querySelectorAll(".thread-row")).toHaveLength(1));
+  fireEvent.click(screen.getByRole("button", { name: "关系" }));
+  expect(screen.getByLabelText("关系图").textContent).toContain("选择：t1");
+  fireEvent.click(screen.getByRole("button", { name: "时间线" }));
+  expect(screen.getByLabelText("时间线").textContent).toContain("选择：t1");
+  expect(document.querySelector("#sessions")?.closest(".workspace-view")?.hasAttribute("hidden")).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: /^会话/ }));
+  expect((screen.getByLabelText("查找会话") as HTMLInputElement).value).toBe("t2");
+  expect(await screen.findByText(/当前选择的会话被过滤条件隐藏/)).toBeTruthy();
+  expect(screen.getByLabelText("回合事实").textContent).toBe("t1@2");
+});
+
+test("侧栏选项目直接进入工作区，记住各项目视图并清除跨项目筛选", async () => {
+  mockWorkspace();
+  window.localStorage.setItem("codexflow.active-panel", "sessions");
+  window.localStorage.setItem("codexflow.project-panel:second", "relations");
+  render(<App />);
+  await screen.findByRole("button", { name: "查看会话 t1 的历史" });
+  fireEvent.change(screen.getByLabelText("查找会话"), { target: { value: "t1" } });
+  fireEvent.click(screen.getByRole("button", { name: "时间线" }));
+  fireEvent.click(screen.getByRole("button", { name: /另一个项目/ }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "关系" }).getAttribute("aria-current")).toBe("page"));
+  expect(screen.getByRole("heading", { name: "另一个项目" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: /项目.*\/repo/ }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "时间线" }).getAttribute("aria-current")).toBe("page"));
+  fireEvent.click(screen.getByRole("button", { name: /^会话/ }));
+  expect((screen.getByLabelText("查找会话") as HTMLInputElement).value).toBe("");
+});
+
+test("分析通过抽屉按需打开，关闭后返回原视图", async () => {
+  mockWorkspace();
+  const showModal = vi.fn(function (this: HTMLDialogElement) { this.setAttribute("open", ""); });
+  Object.defineProperty(HTMLDialogElement.prototype, "showModal", { configurable: true, value: showModal });
+  const close = vi.fn(function (this: HTMLDialogElement) { this.removeAttribute("open"); });
+  Object.defineProperty(HTMLDialogElement.prototype, "close", { configurable: true, value: close });
+  window.localStorage.setItem("codexflow.active-panel", "sessions");
+  render(<App />);
+  await screen.findByRole("button", { name: "查看会话 t1 的历史" });
+  expect(screen.queryByRole("button", { name: "模拟分析结果更新" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "分析" }));
+  expect(screen.getByRole("dialog", { name: "项目分析" })).toBeTruthy();
+  expect(showModal).toHaveBeenCalledTimes(1);
+  fireEvent.click(screen.getByRole("button", { name: "关闭项目分析" }));
+  expect(screen.queryByRole("dialog")).toBeNull();
+  expect(close).toHaveBeenCalledTimes(1);
+  expect(screen.getByRole("button", { name: /^会话/ }).getAttribute("aria-current")).toBe("page");
+  Reflect.deleteProperty(HTMLDialogElement.prototype, "showModal");
+  Reflect.deleteProperty(HTMLDialogElement.prototype, "close");
+});

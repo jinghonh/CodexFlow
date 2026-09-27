@@ -31,7 +31,7 @@ test("已保存的关系分析结果通知项目图刷新", async () => {
     ] };
     throw new Error(`Unexpected command ${command}`);
   });
-  render(<ProjectAnalysisView projectId="project" refreshVersion="1" onRelationResultsChanged={onRelationResultsChanged} />);
+  render(<ProjectAnalysisView projectId="project" refreshVersion="1" stage="relations" onRelationResultsChanged={onRelationResultsChanged} />);
   await waitFor(() => expect(onRelationResultsChanged).toHaveBeenCalledTimes(1));
 });
 
@@ -46,13 +46,13 @@ test("预览明确未配置阶段，手动启动后可暂停和继续", async ()
   });
   render(<ProjectAnalysisView projectId="project" refreshVersion="1" />);
   expect(await screen.findByText("2 条待总结")).toBeTruthy();
-  expect(screen.getAllByText(/尚不可执行/)).toHaveLength(3);
-  expect(screen.getByText(/Jev 未配置/)).toBeTruthy();
+  expect(screen.queryByText(/尚不可执行/)).toBeNull();
+  expect(screen.getByText("100 次")).toBeTruthy();
   expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("start_project_analysis", expect.anything());
-  fireEvent.click(screen.getByRole("button", { name: "启动项目分析" }));
+  fireEvent.click(screen.getByRole("button", { name: "启动会话总结" }));
   await waitFor(() => expect(screen.getByText(/分析执行中/)).toBeTruthy());
   fireEvent.click(screen.getByRole("button", { name: "暂停" }));
-  expect(await screen.findByText("用户暂停")).toBeTruthy();
+  expect((await screen.findAllByText("用户暂停")).length).toBeGreaterThan(0);
   fireEvent.click(screen.getByRole("button", { name: "继续未完成项" }));
   expect(await screen.findByText(/分析完成/)).toBeTruthy();
   expect(vi.mocked(invoke)).toHaveBeenCalledWith("continue_analysis_run", { runId: "analysis-1", callLimit: 100 });
@@ -68,13 +68,13 @@ test("配置错误保留预览并允许修正预算后启动", async () => {
   render(<ProjectAnalysisView projectId="project" refreshVersion="1" />);
   await screen.findByText("2 条待总结");
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "0" } });
-  expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.getByRole("button", { name: "启动会话总结" }).hasAttribute("disabled")).toBe(true);
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "5" } });
   fireEvent.click(screen.getByRole("button", { name: "应用参数并刷新预览" }));
   await screen.findByText("2 条待总结");
-  fireEvent.click(screen.getByRole("button", { name: "启动项目分析" }));
+  fireEvent.click(screen.getByRole("button", { name: "启动会话总结" }));
   expect(await screen.findByText("来源配置已变化")).toBeTruthy();
-  expect(screen.getByText(/候选最多 2 对/)).toBeTruthy();
+  expect(screen.getByText("2 条待总结")).toBeTruthy();
 });
 
 test("暂停运行的继续请求出错后仍可重试", async () => {
@@ -111,16 +111,16 @@ test("Jev 设置版本变化后清除旧预览，取得新服务范围前不可�
     if (command === "start_project_analysis") return run;
     throw new Error(`Unexpected command ${command}`);
   });
-  const { rerender } = render(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={0} />);
+  const { rerender } = render(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={0} stage="relations" />);
   expect(await screen.findByText("发送到 https://old.example")).toBeTruthy();
-  rerender(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={1} />);
-  expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(true);
+  rerender(<ProjectAnalysisView projectId="project" refreshVersion="1" settingsRevision={1} stage="relations" />);
+  expect(screen.getByRole("button", { name: "启动候选关系判断" }).hasAttribute("disabled")).toBe(true);
   expect(screen.queryByText("发送到 https://old.example")).toBeNull();
   resolveNew?.({ ...preview, stages: preview.stages.map((stage) => stage.stage === "relation"
-    ? { ...stage, model: "jev-new", sendScope: "发送到 https://new.example" } : stage) });
+    ? { ...stage, available: true, model: "jev-new", sendScope: "发送到 https://new.example" } : stage) });
   expect(await screen.findByText("发送到 https://new.example")).toBeTruthy();
   expect(screen.getByText("Jev / jev-new")).toBeTruthy();
-  expect(screen.getByRole("button", { name: "启动项目分析" }).hasAttribute("disabled")).toBe(false);
+  expect(screen.getByRole("button", { name: "启动候选关系判断" }).hasAttribute("disabled")).toBe(false);
 });
 
 test("分析进度展示别名探测后固定的实际模型版本", async () => {

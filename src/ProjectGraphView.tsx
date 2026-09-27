@@ -464,26 +464,26 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   }
 
   return <section id="relations" className="panel graph-panel">
-    <div className="panel-kicker">审查 / 项目关系</div>
-    <h2>{graph?.project.name ?? "项目关系"}</h2>
-    <p className="panel-intro">沿关系查看项目中的会话脉络。规则信号只用于召回候选；工作流依据 Jev 已判断的具体关系和执行阶段形成。</p>
     {error && <div className="page-error" role="alert">{error}</div>}
     {!graph && !error && <p className="empty-list">正在读取项目关系图…</p>}
     {graph && <>
-      <div className="graph-summary"><strong>{visibleNodes.filter((node) => !node.data.referenceOnly).length} 条可见会话</strong><span>{visibleEdges.length} 条可见关系</span><span>{graph.relations.length} 条观察关系</span><span>{graph.derivedRelations?.length ?? 0} 条候选信号</span><span>{visibleInferred(graph, threshold).length} 条符合当前置信度条件的推断关系</span></div>
+      <div className="graph-summary"><strong>{visibleNodes.filter((node) => !node.data.referenceOnly).length} 条可见会话</strong><span>{visibleEdges.length} 条可见关系</span><span>{graph.relations.length} 条观察关系</span><span>{graph.derivedRelations?.length ?? 0} 条候选信号</span><span>{visibleInferred(graph, threshold).length} 条推断关系</span></div>
       <div className="explorer-filters" aria-label="关系过滤"><label>来源类别<select aria-label="按来源类别过滤关系" value={relationSource} onChange={(event) => onRelationSourceChange?.(event.target.value)}><option value="all">全部</option><option value="observed">观察</option><option value="derived">候选信号</option><option value="inferred">推断</option></select></label><label>关系类型<select aria-label="按关系类型过滤" value={relationKind} onChange={(event) => onRelationKindChange?.(event.target.value)}><option value="all">全部类型</option>{[...new Set([...graph.relations, ...(graph.derivedRelations ?? []), ...(graph.inferredRelations ?? [])].map((item) => item.kind))].sort().map((kind) => <option value={kind} key={kind}>{kind}</option>)}</select></label><label>最低关系置信度<select aria-label="最低关系置信度" value={threshold} onChange={(event) => changeThreshold(Number(event.target.value))}><option value={0}>全部</option><option value={0.5}>0.50</option><option value={0.7}>0.70</option><option value={0.9}>0.90</option></select></label></div>
       {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid).length > 0 &&
-        <div className="graph-review-list"><strong>已拒绝或过期的推断关系</strong>
+        <details className="technical-details">
+          <summary>已拒绝或过期的推断关系</summary>
+          <div className="graph-review-list">
           {reviewedRelations(graph).filter((relation) => relation.review.decision === "rejected" || !relation.evidenceValid)
             .map((relation) => <button className="browse-button" key={relation.id} onClick={() => { setSelection({ type: "edge", id: relation.id }); setInspectorPage("relation"); }}>
               {inferredText[relation.kind]} · {reviewStatus(relation)} · {relation.staleReason ?? "可查看旧证据"} · {relation.fromThreadId} ↔ {relation.toThreadId}
             </button>)}
-        </div>}
-      {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}；只有 Jev 支持的具体关系才形成图边。</p>}
+          </div>
+        </details>}
+      {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}。</p>}
       <button className="browse-button" onClick={() => void refreshGraph()}>自动布局</button>
       <p className="graph-layout-status" role="status">{layoutPending ? "正在布局关系图…" : "关系图布局完成"}</p>
       {layout.warning && <div className="graph-layout-warning" role="status">{layout.warning}</div>}
-      {visibleNodes.length > 80 && <p className="analysis-note">大图先显示当前视口；平移或缩放可浏览其余会话和关系。图中保留全部 {visibleNodes.length} 个节点、{visibleEdges.length} 条关系。</p>}
+      {visibleNodes.length > 80 && <p className="analysis-note">共 {visibleNodes.length} 个节点、{visibleEdges.length} 条关系；拖动或缩放查看。</p>}
       <div className="graph-inspection-layout">
       {visibleNodes.length ? <div className="graph-canvas" aria-label="项目结构关系图">
         <ReactFlow nodes={visibleNodes.map((node) => ({ ...node, selected: node.id === selectedThreadId }))} edges={visibleEdges} nodeTypes={nodeTypes} fitView={visibleNodes.length <= 80} onlyRenderVisibleElements fitViewOptions={{ padding: 0.18 }}
@@ -504,7 +504,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
           <div className="graph-session-inspector">{sessionInspectorContent}</div>
           {onOpenFullHistory && <button className="history-open-button" onClick={onOpenFullHistory}>打开完整会话历史 <span>↗</span></button>}
         </> : <>
-        {!detail && <div className="inspector-empty"><span>选择一个节点或关系</span><p>关系判断、证据和会话详情会在这里连续展开。</p></div>}
+        {!detail && <div className="inspector-empty"><span>选择一个节点或关系</span></div>}
         {detail?.type === "node" && <><h3>{detail.node.referenceOnly ? "仅有引用的端点" : "会话"}</h3><strong>{detail.node.referenceOnly ? detail.node.title ?? detail.node.id : threadDisplayTitle({ title: detail.node.title, sourceKind: detail.node.sourceKind ?? "" })}</strong><code>{detail.node.id}</code>{detail.node.referenceOnly && <p>来源记录了此会话 ID，当前项目图没有可展示的会话内容。</p>}</>}
         {detail?.type === "derived" && <><h3>候选信号 · {derivedText[detail.relation.kind]}</h3>
           <p><code>{detail.relation.fromThreadId}</code> ↔ <code>{detail.relation.toThreadId}</code></p>

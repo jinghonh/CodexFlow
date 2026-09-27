@@ -36,6 +36,8 @@ type EvidenceCheck = { state: "valid" | "missingThread" | "missingTurn" | "missi
 const TURN_LIMIT = 20;
 const ITEM_LIMIT = 20;
 const FACT_LIMIT = 20;
+const turnLabels: Record<string, string> = { completed: "已完成", inProgress: "进行中", failed: "失败", interrupted: "已中断" };
+const itemLabels: Record<string, string> = { userMessage: "用户", agentMessage: "助手", commandExecution: "命令执行", fileChange: "文件修改", reasoning: "推理", plan: "计划" };
 
 function errorText(error: unknown): string {
   return formatAppError(error, "读取历史失败。");
@@ -96,7 +98,6 @@ function SourceFactsView({ threadId, updatedAt, coverage, revision, onLocate }: 
     add: "新增", added: "新增", create: "创建", modify: "修改", modified: "修改", delete: "删除", deleted: "删除" };
   const sources = new Map(evidence?.evidence.map((item) => [item.id, item]) ?? []);
   return <div className="source-facts"><h3>结构化事实 <small>{page?.total ?? 0}</small></h3>
-    <p className="source-facts-note">仅提取结构化来源条目；分支与产物只在明确成功的操作中显示。</p>
     {coverage && (!coverage.turnsComplete || !coverage.itemsComplete) && <p className="thread-warning">来源仅部分完整，事实可能缺失。</p>}
     {!page?.total && <p className="empty-list">暂无可提取的文件或命令事实。</p>}
     {page?.facts.map((fact) => {
@@ -118,10 +119,11 @@ function SourceFactsView({ threadId, updatedAt, coverage, revision, onLocate }: 
   </div>;
 }
 
-export function ThreadHistoryView({ threadId, updatedAt, connected, settingsRevision = 0, onHistoryLoaded, locationRequest }: {
-  threadId: string; updatedAt: number; connected: boolean; settingsRevision?: number; onHistoryLoaded?: () => void;
+export function ThreadHistoryView({ threadId, updatedAt, connected, settingsRevision = 0, initialView = "history", onHistoryLoaded, locationRequest }: {
+  threadId: string; updatedAt: number; connected: boolean; settingsRevision?: number; initialView?: "history" | "summary"; onHistoryLoaded?: () => void;
   locationRequest?: { threadId: string; turnId: string; itemId: string; nonce: number } | null;
 }) {
+  const [view, setView] = useState<"history" | "summary" | "facts">(initialView);
   const [turns, setTurns] = useState<TurnPage | null>(null);
   const [items, setItems] = useState<ItemPage | null>(null);
   const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null);
@@ -233,6 +235,7 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, settingsRevi
   async function showLocation(location: Location, itemId: string) {
     const nextTurnOffset = Math.floor(location.turnOffset / TURN_LIMIT) * TURN_LIMIT;
     const page = await invoke<TurnPage>("get_history_turns", { threadId, offset: nextTurnOffset, limit: TURN_LIMIT });
+    setView("history");
     setTurns(page);
     setTurnOffset(nextTurnOffset);
     setSelectedTurnId(location.turnId);
@@ -254,35 +257,37 @@ export function ThreadHistoryView({ threadId, updatedAt, connected, settingsRevi
 
   const coverage = turns?.coverage ?? null;
   return <section id="thread-history" className="panel history-panel" aria-label="会话历史">
-    <div className="history-heading"><div><div className="panel-kicker">探索 / 会话历史</div><h2>回合与条目</h2><small className="history-thread-id">{threadId}</small></div>
+    <div className="history-heading"><div><nav className="detail-tabs" aria-label="会话内容">{(["history", "summary", "facts"] as const).map((item) => <button key={item} className={view === item ? "active" : ""} aria-pressed={view === item} onClick={() => setView(item)}>{{ history: "历史", summary: "总结", facts: "来源事实" }[item]}</button>)}</nav></div>
       <button className="browse-button" disabled={!connected || loading} onClick={() => void reload()}>{loading ? "正在读取…" : coverage ? "重新读取历史" : "读取历史"}</button></div>
     <div className="history-status" role="status"><strong>{status(coverage, updatedAt)}</strong>
-      <span>{coverage ? `读取方式：${coverage.path === "paginated" ? "分页" : coverage.path === "fullRead" ? "完整读取兼容路径" : "未取得内容"}；已取得 ${coverage.loadedTurns} 回合、${coverage.loadedItems} 条目` : "打开详情后按需读取，按页浏览本地缓存。"}</span>
-      {coverage && <small>来源版本：{coverage.sourceUpdatedAt}；采集时间：{time(coverage.attemptedAtUnixMs)}</small>}
+      <span>{coverage ? ` ${coverage.loadedTurns} 回合 · ${coverage.loadedItems} 条目` : ""}</span>
+
       {coverage?.error && <em>{coverage.error}</em>}
       {!connected && <em>来源当前不可用；已保存的历史仍可浏览。</em>}
     </div>
     {error && <div className="page-error" role="alert">{error}</div>}
-    <ThreadSummaryView threadId={threadId} connected={connected} revision={revision + settingsRevision} onLocate={showLocation} />
-    <SourceFactsView threadId={threadId} updatedAt={updatedAt} coverage={coverage} revision={revision} onLocate={showLocation} />
-    <div className="history-locator"><label>回合标识<input value={lookupTurn} onChange={(event) => setLookupTurn(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Turn ID" /></label><label>条目标识<input value={lookup} onChange={(event) => setLookup(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Item ID" /></label><button className="browse-button" onClick={() => void locate()}>定位</button></div>
+    {view === "summary" && <ThreadSummaryView threadId={threadId} connected={connected} revision={revision + settingsRevision} onLocate={showLocation} />}
+    {view === "facts" && <SourceFactsView threadId={threadId} updatedAt={updatedAt} coverage={coverage} revision={revision} onLocate={showLocation} />}
+    <div hidden={view !== "history"}>
+    <details className="history-locate-details"><summary>按标识定位</summary><div className="history-locator"><label>回合标识<input value={lookupTurn} onChange={(event) => setLookupTurn(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Turn ID" /></label><label>条目标识<input value={lookup} onChange={(event) => setLookup(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void locate(); }} placeholder="输入完整 Item ID" /></label><button className="browse-button" onClick={() => void locate()}>定位</button></div></details>
     {lookupMessage && <p className="history-lookup-message" role="status">{lookupMessage}</p>}
     <div className="history-columns">
       <div className="history-turns"><h3>回合 <small>{turns?.total ?? 0}</small></h3>
         {!turns?.total && <p className="empty-list">{coverage?.itemsComplete ? "此会话没有可读取的回合。" : "尚无可显示回合。"}</p>}
-        {turns?.turns.map((turn) => <button key={turn.id} className={`history-turn ${selectedTurnId === turn.id ? "selected" : ""}`} onClick={() => { setSelectedTurnId(turn.id); setItemOffset(0); setHighlight(null); }}><strong>{turn.ordinal + 1}. {turn.status}</strong><small>{time(turn.startedAtUnixMs)}</small><code>{turn.id}</code>{turn.sourceUpdatedAt !== updatedAt && <em>旧缓存</em>}</button>)}
+        {turns?.turns.map((turn) => <button key={turn.id} className={`history-turn ${selectedTurnId === turn.id ? "selected" : ""}`} onClick={() => { setSelectedTurnId(turn.id); setItemOffset(0); setHighlight(null); }}><strong>{turn.ordinal + 1}. {turnLabels[turn.status] ?? turn.status}</strong><small>{time(turn.startedAtUnixMs)}</small><code>{turn.id}</code>{turn.sourceUpdatedAt !== updatedAt && <em>旧缓存</em>}</button>)}
         <div className="history-pager"><button disabled={turnOffset === 0} onClick={() => void showTurnPage(Math.max(0, turnOffset - TURN_LIMIT))}>上一页</button><span>{turns?.total ? `${turnOffset + 1}–${Math.min(turnOffset + TURN_LIMIT, turns.total)} / ${turns.total}` : "0 / 0"}</span><button disabled={!turns || turnOffset + TURN_LIMIT >= turns.total} onClick={() => void showTurnPage(turnOffset + TURN_LIMIT)}>下一页</button></div>
       </div>
       <div id="thread-history-items" className="history-items"><h3>条目 <small>{items?.total ?? 0}</small></h3>
         {!selectedTurnId && <p className="empty-list">选择回合后查看条目。</p>}
         {selectedTurnId && !items?.total && <p className="empty-list">{coverage?.itemsComplete ? "此回合没有条目。" : "此回合的条目尚未完整取得。"}</p>}
-        {items?.items.map((item) => <article key={item.id} className={`history-item ${highlight === item.id ? "located" : ""}`}><div><strong>{item.sourceType}</strong>{!item.supported && <span className="thread-warning">内容类型暂不支持</span>}{item.sourceUpdatedAt !== updatedAt && <span className="thread-warning">旧缓存</span>}</div><code>{item.id}</code><small>内容版本 {item.contentVersion.slice(0, 12)}</small>
+        {items?.items.map((item) => <article key={item.id} className={`history-item ${highlight === item.id ? "located" : ""}`}><div><strong>{itemLabels[item.sourceType] ?? item.sourceType}</strong>{!item.supported && <span className="thread-warning">内容类型暂不支持</span>}{item.sourceUpdatedAt !== updatedAt && <span className="thread-warning">旧缓存</span>}</div><details className="technical-details"><summary>来源标识</summary><code>{item.id}</code><small>内容版本 {item.contentVersion.slice(0, 12)}</small></details>
           {item.text && <pre>{item.text}</pre>}{item.command && <><code className="history-command">{item.command}</code><small>{item.cwd ?? ""} · 状态 {item.status ?? "未知"} · 退出码 {item.exitCode ?? "未知"}</small></>}
           {item.output && <details><summary>命令输出</summary><pre>{item.output}</pre></details>}
           {item.changes.map((change, index) => <details key={`${change.path}-${index}`}><summary>{change.kind} · {change.path}</summary><pre>{change.diff}</pre></details>)}
         </article>)}
         <div className="history-pager"><button disabled={itemOffset === 0} onClick={() => setItemOffset(Math.max(0, itemOffset - ITEM_LIMIT))}>上一页</button><span>{items?.total ? `${itemOffset + 1}–${Math.min(itemOffset + ITEM_LIMIT, items.total)} / ${items.total}` : "0 / 0"}</span><button disabled={!items || itemOffset + ITEM_LIMIT >= items.total} onClick={() => setItemOffset(itemOffset + ITEM_LIMIT)}>下一页</button></div>
       </div>
+    </div>
     </div>
   </section>;
 }

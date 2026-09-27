@@ -97,11 +97,14 @@ test("事实证据检查后跳到对应来源条目，过期证据保留说明",
     throw new Error(`Unexpected command ${command}`);
   });
   render(<ThreadHistoryView threadId="thread-h" updatedAt={200} connected />);
+  fireEvent.click(screen.getByRole("button", { name: "来源事实" }));
   await screen.findAllByText("cargo test");
   fireEvent.click(screen.getByRole("button", { name: "检查证据并定位条目" }));
-  expect(await screen.findByText("已定位到回合 turn-25 的来源条目。")).toBeTruthy();
+  await waitFor(() => expect(screen.getByRole("button", { name: "历史" }).getAttribute("aria-pressed")).toBe("true"));
   expect(await screen.findByText("目标正文")).toBeTruthy();
   stale = true;
+  fireEvent.click(screen.getByRole("button", { name: "来源事实" }));
+  await screen.findAllByText("cargo test");
   fireEvent.click(screen.getByRole("button", { name: "检查证据并定位条目" }));
   expect((await screen.findAllByText("证据内容版本已失效；请重新读取来源历史。")).length).toBeGreaterThan(0);
   expect(screen.getByText("证据过期")).toBeTruthy();

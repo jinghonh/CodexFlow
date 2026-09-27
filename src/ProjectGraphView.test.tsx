@@ -110,7 +110,7 @@ test("大图默认仅绘制当前视口并保留全部关系输入", async () =>
       sourceField: "forkedFromId", confidence: 1, parentEndpoint: "inProject" })), diagnostics: [],
   });
   render(<ProjectGraphView projectId="project" refreshVersion={0} />);
-  await screen.findByText(/图中保留全部 81 个节点、80 条关系/);
+  await screen.findByText(/共 81 个节点、80 条关系/);
   await screen.findByText("关系图布局完成");
   const canvas = document.querySelector(".graph-canvas > div") as HTMLElement;
   expect(canvas.dataset.fitView).toBe("false");
