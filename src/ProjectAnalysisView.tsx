@@ -46,9 +46,9 @@ function selectionDescription(selection?: StageSelection): string {
   return selected.join("、") || "无阶段";
 }
 
-export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0, stage = "summary", onRelationResultsChanged, onNamingResultsChanged, onSettingsApplied }: {
+export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevision = 0, stage = "summary", onRelationResultsChanged, onNamingResultsChanged }: {
   projectId: string; refreshVersion: string; settingsRevision?: number; stage?: PanelStage;
-  onRelationResultsChanged?: (revision: string) => void; onNamingResultsChanged?: (revision: string) => void; onSettingsApplied?: () => void;
+  onRelationResultsChanged?: (revision: string) => void; onNamingResultsChanged?: (revision: string) => void;
 }) {
   const queryCache = useProjectQueryCache();
   const limitsKey = `analysis-limits:${projectId}:${stage}`;
@@ -156,7 +156,6 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   function applyLimits() {
     if (!valid || !hasUnappliedLimits || busy) return;
     setLimits(draftLimits);
-    onSettingsApplied?.();
   }
 
   return <section className="panel analysis-panel" aria-label={`${panelStageNames[stage]}分析`}>
@@ -176,15 +175,15 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       <summary>运行参数</summary>
       <div className="analysis-limits">
         <label>本批调用上限<input aria-label="本批调用上限" type="number" min="1" value={draftLimits.callLimit} onChange={(event) => setDraftLimits({ ...draftLimits, callLimit: Number(event.target.value) })} /></label>
-        <label>总并发上限<input aria-label="总并发上限" type="number" min="1" max={maxConcurrencyLimit} value={draftLimits.concurrencyLimit} onChange={(event) => setDraftLimits({ ...draftLimits, concurrencyLimit: Number(event.target.value) })} /></label>
+        <label>本批并发上限<input aria-label="本批并发上限" type="number" min="1" max={maxConcurrencyLimit} value={draftLimits.concurrencyLimit} onChange={(event) => setDraftLimits({ ...draftLimits, concurrencyLimit: Number(event.target.value) })} /></label>
         <label>单次超时（秒）<input aria-label="单次超时" type="number" min="1" value={draftLimits.timeoutSeconds} onChange={(event) => setDraftLimits({ ...draftLimits, timeoutSeconds: Number(event.target.value) })} /></label>
         <label>自动重试次数<input aria-label="自动重试次数" type="number" min="0" max={maxRetryLimit} value={draftLimits.retryLimit} onChange={(event) => setDraftLimits({ ...draftLimits, retryLimit: Number(event.target.value) })} /></label>
         <label>单次输入字符上限<input aria-label="单次输入字符上限" type="number" min="2000" value={draftLimits.inputCharacterLimit} onChange={(event) => setDraftLimits({ ...draftLimits, inputCharacterLimit: Number(event.target.value) })} /></label>
       </div>
-      {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；总并发为 1–{maxConcurrencyLimit}，自动重试为 0–{maxRetryLimit}，输入至少 2000 字符。</p>}
+      {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；本批并发为 1–{maxConcurrencyLimit}，自动重试为 0–{maxRetryLimit}，输入至少 2000 字符。</p>}
       <div className="summary-actions">
         <button className="browse-button" disabled={!valid || !hasUnappliedLimits || busy} onClick={applyLimits}>应用参数并刷新预览</button>
-        {hasUnappliedLimits && <span className="analysis-note">应用后会重新计算本阶段预览并刷新项目关系图。</span>}
+        {hasUnappliedLimits && <span className="analysis-note">应用后会重新计算本阶段预览。</span>}
       </div>
       <small className="analysis-note">参数仅用于本阶段新启动的批次；继续已有批次时沿用原有参数，仅更新调用上限。</small>
     </details>

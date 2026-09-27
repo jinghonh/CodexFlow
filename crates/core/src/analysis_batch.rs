@@ -22,8 +22,13 @@ const UNCONFIGURED_TEXT_MODEL: &str = "未配置文本模型";
 const MAX_ANALYSIS_CONCURRENCY: u8 = 10;
 const MAX_ANALYSIS_RETRIES: u8 = 5;
 
-pub(crate) fn model_slot_weight(concurrency_limit: u8) -> u32 {
-    crate::MODEL_CONCURRENCY_SLOTS / u32::from(concurrency_limit)
+// Shared scheduler weights stay fixed; the run-local semaphore applies the batch limit.
+pub(crate) fn batch_model_slot_weight() -> u32 {
+    crate::MODEL_CONCURRENCY_SLOTS / u32::from(MAX_ANALYSIS_CONCURRENCY)
+}
+
+pub(crate) fn default_model_slot_weight() -> u32 {
+    crate::MODEL_CONCURRENCY_SLOTS / 2
 }
 
 #[derive(Clone, Copy)]
@@ -111,9 +116,20 @@ pub(crate) struct AnalysisControl {
     pub project_id: String,
     pub cancel: CancellationToken,
     pub pause: Arc<AtomicBool>,
+    batch_model_slots: Arc<tokio::sync::Semaphore>,
     queue_pause: CancellationToken,
     dispatch: Arc<tokio::sync::Mutex<()>>,
     update: Update,
+}
+
+async fn acquire_batch_model_slot(
+    control: &AnalysisControl,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
+        _ = control.cancel.cancelled() => None,
+        _ = control.queue_pause.cancelled() => None,
+        permit = Arc::clone(&control.batch_model_slots).acquire_owned() => permit.ok(),
+    }
 }
 
 fn core_error(code: ErrorCode, message: &str, retryable: bool) -> AppError {
@@ -134,8 +150,11 @@ fn validate_limits(limits: &AnalysisLimits) -> Result<(), AppError> {
         || limits.retry_limit > MAX_ANALYSIS_RETRIES
         || limits.input_character_limit < 2_000
     {
-        return Err(core_error(ErrorCode::AnalysisBudgetInvalid,
-            "调用上限和超时必须为正整数；全部后端并发最多 10，自动重试最多 5 次，输入至少 2000 字符。", false));
+        return Err(core_error(
+            ErrorCode::AnalysisBudgetInvalid,
+            "调用上限和超时必须为正整数；本批并发最多 10，自动重试最多 5 次，输入至少 2000 字符。",
+            false,
+        ));
     }
     Ok(())
 }
@@ -765,6 +784,9 @@ impl SourceService {
             project_id: project_id.clone(),
             cancel: CancellationToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            batch_model_slots: Arc::new(tokio::sync::Semaphore::new(usize::from(
+                limits.concurrency_limit,
+            ))),
             queue_pause: CancellationToken::new(),
             dispatch: Arc::new(tokio::sync::Mutex::new(())),
             update: Arc::new(on_update),
@@ -902,6 +924,9 @@ impl SourceService {
             project_id: project_id.clone(),
             cancel: CancellationToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            batch_model_slots: Arc::new(tokio::sync::Semaphore::new(usize::from(
+                limits.concurrency_limit,
+            ))),
             queue_pause: CancellationToken::new(),
             dispatch: Arc::new(tokio::sync::Mutex::new(())),
             update: Arc::new(on_update),
@@ -1187,6 +1212,9 @@ impl SourceService {
             project_id: run.project_id.clone(),
             cancel: CancellationToken::new(),
             pause: Arc::new(AtomicBool::new(false)),
+            batch_model_slots: Arc::new(tokio::sync::Semaphore::new(usize::from(
+                run.limits.concurrency_limit,
+            ))),
             queue_pause: CancellationToken::new(),
             dispatch: Arc::new(tokio::sync::Mutex::new(())),
             update: Arc::new(on_update),
@@ -1492,6 +1520,9 @@ impl SourceService {
                     continue;
                 }
             }
+            let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
+                return Ok(());
+            };
             let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
             if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
                 continue;
@@ -1517,7 +1548,6 @@ impl SourceService {
                         base_url: &run.text_base_url,
                         config_revision: run.text_config_revision,
                     },
-                    run.limits.concurrency_limit,
                     control.queue_pause.clone(),
                 )
                 .await;
@@ -1717,12 +1747,15 @@ impl SourceService {
             run.units[index].error = None;
             return self.save_analysis(&mut run, &control.update);
         }
+        let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
+            return Ok(());
+        };
         let permit = tokio::select! {
             _ = control.cancel.cancelled() => return Ok(()),
             _ = control.queue_pause.cancelled() => return Ok(()),
             acquired = self
                 .model_slots
-                .acquire_many(model_slot_weight(run.limits.concurrency_limit)) => acquired
+                .acquire_many(batch_model_slot_weight()) => acquired
                 .map_err(|_| core_error(
                     ErrorCode::AnalysisUnavailable,
                     "模型并发队列已关闭。",
@@ -1904,13 +1937,16 @@ impl SourceService {
         mut run: AnalysisRun,
     ) -> Result<(), AppError> {
         let credential_cancel = self.jev_cancel.lock().await.clone();
+        let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
+            return Ok(());
+        };
         let permit = tokio::select! {
             _ = control.cancel.cancelled() => return Ok(()),
             _ = control.queue_pause.cancelled() => return Ok(()),
             _ = credential_cancel.cancelled() => return Ok(()),
             value = self
                 .model_slots
-                .acquire_many(model_slot_weight(run.limits.concurrency_limit)) => value
+                .acquire_many(batch_model_slot_weight()) => value
                 .map_err(|_| {
                     core_error(
                         ErrorCode::AnalysisUnavailable,
@@ -2169,13 +2205,16 @@ impl SourceService {
             supported.len() as u32
         };
         let credential_cancel = self.jev_cancel.lock().await.clone();
+        let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
+            return Ok(());
+        };
         let permit = tokio::select! {
             _ = control.cancel.cancelled() => return Ok(()),
             _ = control.queue_pause.cancelled() => return Ok(()),
             _ = credential_cancel.cancelled() => return Ok(()),
             value = self
                 .model_slots
-                .acquire_many(model_slot_weight(run.limits.concurrency_limit)) => value
+                .acquire_many(batch_model_slot_weight()) => value
                 .map_err(|_| {
                     core_error(
                         ErrorCode::AnalysisUnavailable,

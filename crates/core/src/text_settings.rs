@@ -208,7 +208,7 @@ impl SourceService {
         let cancel = self.text_validation_cancel.lock().await.clone();
         let _slot = self
             .model_slots
-            .acquire_many(crate::analysis_batch::model_slot_weight(2))
+            .acquire_many(crate::analysis_batch::default_model_slot_weight())
             .await
             .map_err(|_| not_configured())?;
         let output = self.text_complete(&config, None, FIXTURE, cancel).await?;

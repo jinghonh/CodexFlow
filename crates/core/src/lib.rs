@@ -42,7 +42,7 @@ use std::{
 pub use summary::SummaryAnalyzer;
 pub const EVALUATION_CANDIDATE_RULES_VERSION: &str = candidates::CANDIDATE_RULE_VERSION;
 pub const EVALUATION_FACT_RULES_VERSION: &str = facts::RULE_VERSION;
-// Divisible by every accepted analysis concurrency limit from 1 through 10.
+// Shared model-call capacity, expressed in units divisible by fixed batch and default weights.
 pub(crate) const MODEL_CONCURRENCY_SLOTS: u32 = 2_520;
 use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
 use tokio_util::sync::CancellationToken;
@@ -317,7 +317,7 @@ impl SourceService {
         let _slot = tokio::select! {
             biased;
             _ = token.cancelled() => return Err(jev_cancelled()),
-            acquired = self.model_slots.acquire_many(analysis_batch::model_slot_weight(2)) => acquired
+            acquired = self.model_slots.acquire_many(analysis_batch::default_model_slot_weight()) => acquired
                 .map_err(|_| AppError::jev(
                     ErrorCode::AnalysisUnavailable,
                     "模型调用队列不可用。",

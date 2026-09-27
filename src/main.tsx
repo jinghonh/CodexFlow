@@ -143,7 +143,6 @@ export function App() {
     setTimelineVersion((version) => version + 1);
     setProjectDataVersion((version) => version + 1);
   }, []);
-  const refreshGraphForSettings = React.useCallback(() => setGraphVersion((version) => version + 1), []);
   const refreshGraphForDecision = React.useCallback(() => setGraphVersion((version) => version + 1), []);
   const refreshRelationsAndWorkstreams = React.useCallback((revision = "") => {
     if (revision) {
@@ -928,7 +927,7 @@ export function App() {
           {threadLimit < visibleThreads.length && <button className="browse-button" onClick={() => setThreadLimit((limit) => limit + 40)}>显示更多会话（{shownThreads.length} / {visibleThreads.length}）</button>}
         </section>
         {selectedThread && <ThreadHistoryView key={selectedThread.id} threadId={selectedThread.id} updatedAt={selectedThread.updatedAt} connected={connected} settingsRevision={analysisSettingsRevision} locationRequest={evidenceLocation} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />}
-        {!showUnassigned && projectSessions && <ProjectAnalysisView key={`${projectSessions.project.id}:summary`} projectId={projectSessions.project.id} refreshVersion={String(projectDataVersion)} settingsRevision={analysisSettingsRevision} stage="summary" onSettingsApplied={refreshGraphForSettings} />}
+        {!showUnassigned && projectSessions && <ProjectAnalysisView key={`${projectSessions.project.id}:summary`} projectId={projectSessions.project.id} refreshVersion={String(projectDataVersion)} settingsRevision={analysisSettingsRevision} stage="summary" />}
         <p className="disclaimer">会话列表只包含来源元数据。查看回合会按需读取会话正文；项目总结需要在本面板手动启动。</p>
         </>}
         {activePanel === "workstreams" && <>
@@ -939,7 +938,7 @@ export function App() {
             refreshVersion={graphVersion} graphRevision={graphVersion} workstreamRevision={workstreamVersion}
             onSelectThread={setSelectedThreadId} onSelectEvidence={selectEvidence} activeWorkstreamId={workstreamFilter} onFilterWorkstream={setWorkstreamFilter} onChanged={refreshWorkstreams} />
           <ProjectTimelineView key={`${projectSessions.project.id}:timeline`} projectId={projectSessions.project.id} refreshVersion={String(timelineVersion)} connected={connected} onSelectThread={setSelectedThreadId} selectedThreadId={selectedThreadId} visibleThreadIds={projectThreadIds} workstreams={workstreams?.workstreams ?? []} onHistoryLoaded={() => void loadProjects().catch((error) => setListError(errorText(error)))} />
-          <ProjectAnalysisView key={`${projectSessions.project.id}:naming`} projectId={projectSessions.project.id} refreshVersion={String(workstreamVersion)} settingsRevision={analysisSettingsRevision} stage="naming" onNamingResultsChanged={refreshWorkstreams} onSettingsApplied={refreshGraphForSettings} />
+          <ProjectAnalysisView key={`${projectSessions.project.id}:naming`} projectId={projectSessions.project.id} refreshVersion={String(workstreamVersion)} settingsRevision={analysisSettingsRevision} stage="naming" onNamingResultsChanged={refreshWorkstreams} />
         </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>工作流和时间线按项目整理。先选择一个本地项目即可查看。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
         </>}
         {activePanel === "relations" && <>
@@ -951,7 +950,7 @@ export function App() {
               ? <ProjectThreadDetailsView projectId={projectSessions.project.id} thread={selectedThread} attribution={selectedAttribution} refreshVersion={graphVersion} hidden={selectionHidden} onSelectThread={onSelectThread} onSelectEvidence={onSelectEvidence} relationSource={relationSource} relationKind={relationKind} minimumConfidence={minimumConfidence} />
               : <p className="inspector-empty">此会话不在当前项目的可读列表中。</p>}
             onOpenFullHistory={selectedThread ? () => setReviewHistoryOpen(true) : undefined} />
-          <ProjectAnalysisView key={`${projectSessions.project.id}:relations-analysis`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="relations" onRelationResultsChanged={refreshRelationsAndWorkstreams} onSettingsApplied={refreshGraphForSettings} />
+          <ProjectAnalysisView key={`${projectSessions.project.id}:relations-analysis`} projectId={projectSessions.project.id} refreshVersion={String(graphVersion)} settingsRevision={analysisSettingsRevision} stage="relations" onRelationResultsChanged={refreshRelationsAndWorkstreams} />
         </> : <section className="panel empty-panel"><h2>{showUnassigned ? "请选择本地项目" : "尚未选择项目"}</h2><p>关系图按项目生成。先选择一个本地项目即可查看关系和候选会话。</p><button className="primary-button" onClick={() => selectPanel("projects")}>前往本地项目<span>↗</span></button></section>}
         </>}
         {activePanel === "topics" && <GlobalTopicsView />}

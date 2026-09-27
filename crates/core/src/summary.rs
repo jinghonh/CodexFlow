@@ -696,7 +696,7 @@ impl SourceService {
             false,
             LIMIT,
             None,
-            crate::analysis_batch::model_slot_weight(2),
+            crate::analysis_batch::default_model_slot_weight(),
             CancellationToken::new(),
         )
         .await
@@ -707,10 +707,9 @@ impl SourceService {
         thread_id: String,
         character_limit: usize,
         expected: SummaryBatchSnapshot<'_>,
-        concurrency_limit: u8,
         queue_pause: CancellationToken,
     ) -> Result<SummaryRun, AppError> {
-        let permits = crate::analysis_batch::model_slot_weight(concurrency_limit);
+        let permits = crate::analysis_batch::batch_model_slot_weight();
         self.start_summary_inner(
             thread_id,
             true,
