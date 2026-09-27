@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { formatAppError } from "./appError";
 import { loadProjectQuery, useProjectQueryCache } from "./projectQueryCache";
 import { ProgressMeter } from "./ProgressMeter";
+import { AnalysisTimingView, PreparingTimingView } from "./AnalysisTimingView";
 import { projectProgress, projectStateNames } from "./analysisProgress";
 import type { ProjectRun as Run, StageSelection } from "./analysisProgress";
 import { startTrackedProjectAnalysis } from "./analysisStartIntent";
@@ -23,7 +24,12 @@ const stageNames: Record<Stage["stage"], string> = { summary: "会话总结", re
 const panelStageNames: Record<PanelStage, string> = { summary: "会话总结", relations: "候选关系判断", naming: "工作流命名" };
 
 function message(error: unknown): string {
+  if (configurationChanged(error)) return "来源或服务配置已更新，请刷新预览后启动新批次。";
   return formatAppError(error, "分析操作失败。");
+}
+
+function configurationChanged(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ANALYSIS_CONFIG_CHANGED";
 }
 
 function stageSelectionFor(stage: PanelStage): StageSelection {
@@ -62,6 +68,10 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   const [busy, setBusy] = useState(false);
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
+  const [outdatedRunId, setOutdatedRunId] = useState<string | null>(null);
+  const [previewRevision, setPreviewRevision] = useState(0);
+  const runConfigChanged = !!run && (outdatedRunId === run.id || configurationChanged(run.error) ||
+    run.units.some((unit) => unit.state !== "succeeded" && configurationChanged(unit.error)));
   const succeededRelationUnits = run?.units
     .filter((unit) => (unit.stage === "relation" || unit.stage === "evidenceSelection") && unit.state === "succeeded")
     .map((unit) => unit.id).sort().join("|") || "";
@@ -77,7 +87,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   useEffect(() => {
     if (stage === "naming" && namingResultsRevision && terminalRun) onNamingResultsChanged?.(namingResultsRevision);
   }, [stage, namingResultsRevision, terminalRun, onNamingResultsChanged]);
-  const previewKey = JSON.stringify([projectId, refreshVersion, settingsRevision, limits, stageSelection, terminalRun]);
+  const previewKey = JSON.stringify([projectId, refreshVersion, settingsRevision, limits.inputCharacterLimit, stageSelection, terminalRun, previewRevision]);
   const preview = previewState?.key === previewKey ? previewState.value : null;
 
   useEffect(() => {
@@ -125,8 +135,25 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
     try { setRun(command === "start_project_analysis"
       ? await startTrackedProjectAnalysis<Run>(projectId, limits, stageSelection)
       : await invoke<Run>(command, args)); }
-    catch (caught) { setError(message(caught)); }
+    catch (caught) {
+      setError(message(caught));
+      if (configurationChanged(caught) && run) setOutdatedRunId(run.id);
+    }
     finally { setBusy(false); setStarting(false); }
+  }
+
+  async function refreshAfterConfigChange() {
+    if (!run || busy) return;
+    setBusy(true); setError("");
+    try {
+      setOutdatedRunId(run.id);
+      if (["queued", "running", "paused"].includes(run.state)) {
+        setRun(await invoke<Run>("cancel_analysis_run", { runId: run.id }));
+      }
+      setPreviewState(null);
+      setPreviewRevision((revision) => revision + 1);
+    } catch (caught) { setError(message(caught)); }
+    finally { setBusy(false); }
   }
 
   const active = run?.state === "queued" || run?.state === "running" || run?.state === "cancelling";
@@ -161,9 +188,10 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   return <section className="panel analysis-panel" aria-label={`${panelStageNames[stage]}分析`}>
     <h2>{panelStageNames[stage]}</h2>
     {starting && <div className="analysis-progress prominent" role="status"><strong>正在准备{panelStageNames[stage]}</strong>
-      <ProgressMeter progress={{ stage: "读取分析材料", completed: 0, total: null, unit: "项", calls: 0 }} label={`${panelStageNames[stage]}启动进度`} /></div>}
+      <ProgressMeter progress={{ stage: "读取分析材料", completed: 0, total: null, unit: "项", calls: 0 }} label={`${panelStageNames[stage]}启动进度`} /><PreparingTimingView /></div>}
     {!starting && runBelongsHere && run && <div className="analysis-progress prominent" role="status"><strong>{panelStageNames[stage]} · {projectStateNames[run.state]}</strong>
       <ProgressMeter progress={projectProgress(run)} label={`${panelStageNames[stage]}执行进度`} totalMayChange={stage !== "summary"} />
+      <AnalysisTimingView run={run} />
       {run.error && <em>{message(run.error)}</em>}</div>}
     <details className="analysis-settings">
       <summary>运行参数</summary>
@@ -176,15 +204,14 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       </div>
       {!valid && <p className="page-error" role="alert">调用上限和超时须为正整数；本批并发为 1–{maxConcurrencyLimit}，自动重试为 0–{maxRetryLimit}，输入至少 2000 字符。</p>}
       <div className="summary-actions">
-        <button className="browse-button" disabled={!valid || !hasUnappliedLimits || busy} onClick={applyLimits}>应用参数并刷新预览</button>
-        {hasUnappliedLimits && <span className="analysis-note">应用后会重新计算本阶段预览。</span>}
+        <button className="browse-button" disabled={!valid || !hasUnappliedLimits || busy} onClick={applyLimits}>应用</button>
       </div>
       <small className="analysis-note">参数仅用于本阶段新启动的批次；继续已有批次时沿用原有参数，仅更新调用上限。</small>
     </details>
     {textWorkUnavailable && <p className="analysis-note">待处理任务需要文本服务。请先在“设置”配置文本服务。</p>}
     {relationWorkUnavailable && <p className="analysis-note">待处理候选需要 Jev。请先在“设置”配置 Jev。</p>}
-    {run?.state === "paused" && runBelongsHere && <p className="analysis-note">已暂停批次继续时沿用启动时的阶段选择与运行参数。</p>}
-    {run && ["cancelled", "partial", "failed"].includes(run.state) && runBelongsHere && <p className="analysis-note">继续未完成项会沿用已保存阶段与运行参数；新批次会使用当前设置。</p>}
+    {run?.state === "paused" && runBelongsHere && !runConfigChanged && <p className="analysis-note">已暂停批次继续时沿用启动时的阶段选择与运行参数。</p>}
+    {run && ["cancelled", "partial", "failed"].includes(run.state) && runBelongsHere && !runConfigChanged && <p className="analysis-note">继续未完成项会沿用已保存阶段与运行参数；新批次会使用当前设置。</p>}
     {blockingRun && <p className="analysis-note" role="status">此项目的{selectionDescription(run?.stageSelection)}批次{run?.state === "paused" ? "已暂停" : "正在运行"}。请切换到对应阶段继续或取消。</p>}
     {error && <p className="page-error" role="alert">{error}</p>}
     {!preview && !error && <p>正在计算本阶段预览…</p>}
@@ -196,12 +223,14 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
         {stage === "naming" && <><strong>{preview.pendingGroups ?? 0} 组待命名</strong></>}
       </div>
       <div className="analysis-stage-list">{visibleStages.map((item) => {
+        // 后端上界包含首次请求及重试；按返回预览的参数换算，保留别名探测等额外请求。
+        const maximumCalls = item.maximumCalls / (preview.limits.retryLimit + 1) * (limits.retryLimit + 1);
         const status = item.stage === "evidenceSelection" && item.available ? "满足条件时执行"
           : item.pendingItems === 0 ? "无需处理" : item.available ? "可执行" : "尚不可执行";
         return <div className="analysis-stage" key={item.stage}>
           <strong>{stageNames[item.stage]} · {status}</strong>
           <span>{item.service}{item.stage === "relation" && jevServiceUrl ? ` · ${jevServiceUrl}` : ""} / {item.model}</span>
-          <span>待处理 {item.pendingItems}；调用上界 {item.maximumCalls}</span>
+          <span>待处理 {item.pendingItems}；调用上界 {maximumCalls}</span>
           <small>发送：{{ summary: "会话历史、事实与证据", relation: "候选关系材料", evidenceSelection: "候选证据", naming: "成员标题、总结与关系" }[item.stage]}</small>
           <details className="technical-details"><summary>调用详情</summary><p>{item.sendScope}</p><p>{item.note}</p></details>
         </div>;
@@ -212,7 +241,8 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       <button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits, stageSelection })}>{starting ? "正在准备…" : `启动${panelStageNames[stage]}`}</button>
       {runBelongsHere && active && run?.state !== "cancelling" && <button className="browse-button" disabled={busy || !!run?.pauseReason} onClick={() => void operate("pause_analysis_run", { runId: run!.id })}>暂停</button>}
       {runBelongsHere && (active || run?.state === "paused") && <button className="browse-button" disabled={busy || run?.state === "cancelling"} onClick={() => void operate("cancel_analysis_run", { runId: run!.id })}>取消</button>}
-      {runBelongsHere && run && ["paused", "cancelled", "partial", "failed"].includes(run.state) && <button className="browse-button" disabled={busy || !valid} onClick={() => void operate("continue_analysis_run", { runId: run.id, callLimit: draftLimits.callLimit })}>继续未完成项</button>}
+      {runBelongsHere && runConfigChanged && <button className="browse-button" disabled={busy || run?.state === "cancelling"} onClick={() => void refreshAfterConfigChange()}>{active || run?.state === "paused" ? "取消旧批次并刷新预览" : "刷新分析预览"}</button>}
+      {runBelongsHere && run && !runConfigChanged && ["paused", "cancelled", "partial", "failed"].includes(run.state) && <button className="browse-button" disabled={busy || !valid} onClick={() => void operate("continue_analysis_run", { runId: run.id, callLimit: draftLimits.callLimit })}>继续未完成项</button>}
     </div>
     {runBelongsHere && run && <><div className="analysis-notices">{run.pauseReason && <p role="status">{run.pauseReason}</p>}{run.interrupted && <p role="status">上次运行中断，正在恢复。</p>}{run.state === "cancelled" && <p>本地请求已取消，远端仍可能计费。</p>}</div><details className="analysis-run-details"><summary>运行详情</summary><div className="analysis-progress"><strong>分析{projectStateNames[run.state]} · 第 {run.batchNumber} 批</strong>
       <span>运行 {run.id}</span><span>已处理 {run.processed}；成功 {run.succeeded}；失败 {run.failed}；待处理 {run.pending}</span>

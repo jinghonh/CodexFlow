@@ -582,7 +582,23 @@ impl SourceService {
     }
 
     pub fn analysis_run(&self, id: &str) -> Result<Option<AnalysisRun>, AppError> {
-        self.sessions.analysis_run(id)
+        let Some(mut run) = self.sessions.analysis_run(id)? else {
+            return Ok(None);
+        };
+        for unit in &mut run.units {
+            if let Some(summary_id) = &unit.active_summary_run_id {
+                if let Some(request) = self
+                    .sessions
+                    .summary_run(summary_id)?
+                    .and_then(|summary| summary.request_timing)
+                {
+                    let timing = unit.request_timing.get_or_insert_with(Default::default);
+                    timing.add(&request);
+                    timing.active_since_unix_ms = request.active_since_unix_ms;
+                }
+            }
+        }
+        Ok(Some(run))
     }
 
     pub fn latest_analysis_run(&self, project_id: &str) -> Result<Option<AnalysisRun>, AppError> {
@@ -611,6 +627,7 @@ impl SourceService {
                 control.queue_pause.cancel();
                 run.interrupted = true;
                 run.pause_reason = Some("应用退出中断；重开后自动继续未完成项。".into());
+                run.update_timing(self.analysis_now());
                 let _ = self.sessions.save_analysis_run(&run);
                 (control.update)(run);
             }
@@ -627,10 +644,21 @@ impl SourceService {
         run.finished_at_unix_ms = Some(self.analysis_now());
         run.error = Some(error);
         run.pause_reason = None;
+        run.update_timing(self.analysis_now());
         self.sessions.save_analysis_run(&run)
     }
 
     fn save_analysis(&self, run: &mut AnalysisRun, update: &Update) -> Result<(), AppError> {
+        if run.state == AnalysisRunState::Paused {
+            if let Some(control) = self.analysis_active.lock().unwrap().get(&run.project_id) {
+                control.pause.store(true, Ordering::SeqCst);
+                control.queue_pause.cancel();
+            }
+            if run.units.iter().any(|unit| unit.state == AnalysisUnitState::Running) {
+                run.state = AnalysisRunState::Running;
+                run.finished_at_unix_ms = None;
+            }
+        }
         let _guard = self.analysis_update_lock.lock().unwrap();
         if self
             .sessions
@@ -640,6 +668,7 @@ impl SourceService {
         {
             run.state = AnalysisRunState::Cancelling;
         }
+        run.update_timing(self.analysis_now());
         recalculate(run);
         self.sessions.save_analysis_run(run)?;
         update(run.clone());
@@ -665,6 +694,7 @@ impl SourceService {
                 false,
             ));
         }
+        run.update_timing(self.analysis_now());
         recalculate(run);
         if !self
             .sessions
@@ -698,6 +728,7 @@ impl SourceService {
         stage_selection: AnalysisStageSelection,
         on_update: impl Fn(AnalysisRun) + Send + Sync + 'static,
     ) -> Result<AnalysisRun, AppError> {
+        let started_at = self.analysis_now();
         if !stage_selection.any_selected() {
             return Err(core_error(
                 ErrorCode::AnalysisBudgetInvalid,
@@ -794,6 +825,8 @@ impl SourceService {
         let units: Vec<AnalysisUnit> = pending
             .into_iter()
             .map(|(id, input_version)| AnalysisUnit {
+                timing: None,
+                request_timing: None,
                 id,
                 stage: AnalysisStage::Summary,
                 input_version,
@@ -808,6 +841,8 @@ impl SourceService {
             })
             .collect();
         let mut run = AnalysisRun {
+            timing: Some(codexflow_domain::ExecutionTiming::started(started_at)),
+            stage_timings: Vec::new(),
             id,
             project_id: project_id.clone(),
             state: AnalysisRunState::Queued,
@@ -846,7 +881,7 @@ impl SourceService {
             relations_planned: !stage_selection.relations,
             names_planned: !stage_selection.naming,
             relation_only: false,
-            started_at_unix_ms: self.analysis_now(),
+            started_at_unix_ms: started_at,
             finished_at_unix_ms: None,
             interrupted: false,
             error: None,
@@ -873,6 +908,7 @@ impl SourceService {
         limits: AnalysisLimits,
         on_update: impl Fn(AnalysisRun) + Send + Sync + 'static,
     ) -> Result<AnalysisRun, AppError> {
+        let started_at = self.analysis_now();
         validate_limits(&limits)?;
         let preview = self.candidate_preview(&project_id)?;
         let version = preview
@@ -932,6 +968,8 @@ impl SourceService {
             update: Arc::new(on_update),
         };
         let mut run = AnalysisRun {
+            timing: Some(codexflow_domain::ExecutionTiming::started(started_at)),
+            stage_timings: Vec::new(),
             id,
             project_id,
             state: AnalysisRunState::Queued,
@@ -967,6 +1005,8 @@ impl SourceService {
             pending: 1,
             planned_items: 1,
             units: vec![AnalysisUnit {
+                timing: None,
+                request_timing: None,
                 id: candidate_id,
                 stage: AnalysisStage::Relation,
                 input_version: version.clone(),
@@ -982,7 +1022,7 @@ impl SourceService {
             relations_planned: true,
             names_planned: true,
             relation_only: true,
-            started_at_unix_ms: self.analysis_now(),
+            started_at_unix_ms: started_at,
             finished_at_unix_ms: None,
             interrupted: false,
             error: None,
@@ -1021,6 +1061,7 @@ impl SourceService {
                 control.pause.store(true, Ordering::SeqCst);
                 control.queue_pause.cancel();
                 run.pause_reason = Some("正在暂停；等待当前模型调用结束。".into());
+                run.update_timing(self.analysis_now());
                 recalculate(&mut run);
                 self.sessions.save_analysis_run(&run)?;
                 (control.update)(run.clone());
@@ -1062,11 +1103,7 @@ impl SourceService {
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(run);
             }
-            if let Some(summary_id) = run
-                .units
-                .iter()
-                .find_map(|unit| unit.active_summary_run_id.as_deref())
-            {
+            for summary_id in run.units.iter().filter_map(|unit| unit.active_summary_run_id.as_deref()) {
                 self.cancel_summary_run(summary_id)?;
             }
             control.cancel.cancel();
@@ -1076,6 +1113,7 @@ impl SourceService {
         } else if run.state == AnalysisRunState::Paused {
             run.state = AnalysisRunState::Cancelled;
             run.finished_at_unix_ms = Some(self.analysis_now());
+            run.update_timing(self.analysis_now());
             self.sessions.save_analysis_run(&run)?;
         }
         Ok(run)
@@ -1237,10 +1275,11 @@ impl SourceService {
         if let Err(error) = result {
             control.cancel.cancel();
             if let Ok(Some(mut run)) = self.sessions.analysis_run(&control.id) {
-                if let Some(summary_id) = run
+                for summary_id in run
                     .units
                     .iter()
-                    .find_map(|unit| unit.active_summary_run_id.clone())
+                    .filter_map(|unit| unit.active_summary_run_id.clone())
+                    .collect::<Vec<_>>()
                 {
                     let _ = self.cancel_summary_run(&summary_id);
                     let _ = self
@@ -1256,6 +1295,11 @@ impl SourceService {
                             unit.state = AnalysisUnitState::Pending;
                         });
                 }
+                for unit in &mut run.units {
+                    if unit.state == AnalysisUnitState::Running {
+                        unit.state = AnalysisUnitState::Pending;
+                    }
+                }
                 run.state = AnalysisRunState::Failed;
                 run.error = Some(error);
                 run.finished_at_unix_ms = Some(self.analysis_now());
@@ -1264,10 +1308,11 @@ impl SourceService {
         }
         if let Ok(Some(mut run)) = self.sessions.analysis_run(&control.id) {
             if run.state == AnalysisRunState::Cancelling {
-                if let Some(summary_id) = run
+                for summary_id in run
                     .units
                     .iter()
-                    .find_map(|unit| unit.active_summary_run_id.clone())
+                    .filter_map(|unit| unit.active_summary_run_id.clone())
+                    .collect::<Vec<_>>()
                 {
                     let _ = self.cancel_summary_run(&summary_id);
                     let _ = self
@@ -1291,14 +1336,12 @@ impl SourceService {
             .remove(&control.project_id);
     }
 
-    async fn drive_analysis_inner(
-        self: &Arc<Self>,
-        control: &AnalysisControl,
-    ) -> Result<(), AppError> {
+    async fn drive_analysis_inner(self: &Arc<Self>, control: &AnalysisControl) -> Result<(), AppError> {
         loop {
-            let mut run = self.sessions.analysis_run(&control.id)?.ok_or_else(|| {
-                core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false)
-            })?;
+            let mut run = self
+                .sessions
+                .analysis_run(&control.id)?
+                .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
             if control.cancel.is_cancelled() || run.state == AnalysisRunState::Cancelling {
                 run.state = AnalysisRunState::Cancelled;
                 run.finished_at_unix_ms = Some(self.analysis_now());
@@ -1311,9 +1354,16 @@ impl SourceService {
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
             }
+            if run.state == AnalysisRunState::Paused {
+                return Ok(());
+            }
             if control.pause.load(Ordering::SeqCst) {
                 run.state = AnalysisRunState::Paused;
-                run.pause_reason = Some("用户暂停；可继续未完成单元。".into());
+                if run.pause_reason.is_none()
+                    || run.pause_reason.as_deref() == Some("正在暂停；等待当前模型调用结束。")
+                {
+                    run.pause_reason = Some("用户暂停；可继续未完成单元。".into());
+                }
                 run.finished_at_unix_ms = Some(self.analysis_now());
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
@@ -1347,6 +1397,8 @@ impl SourceService {
                             continue;
                         }
                         run.units.push(AnalysisUnit {
+                            timing: None,
+                            request_timing: None,
                             id: pair.id.clone(),
                             stage: AnalysisStage::Relation,
                             input_version: version.clone(),
@@ -1382,12 +1434,13 @@ impl SourceService {
                     if stream.members.is_empty() || manual_names.contains_key(&stream.id) {
                         continue;
                     }
-                    let (version, _) =
-                        self.naming_material(&naming_graph, &stream, naming_config)?;
+                    let (version, _) = self.naming_material(&naming_graph, &stream, naming_config)?;
                     if reusable_name(&stream, &version, naming_config) {
                         continue;
                     }
                     run.units.push(AnalysisUnit {
+                        timing: None,
+                        request_timing: None,
                         id: stream.id,
                         stage: AnalysisStage::Naming,
                         input_version: version,
@@ -1427,31 +1480,135 @@ impl SourceService {
                 self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
             }
+            // 阶段间保留依赖屏障；同一阶段最多同时派发本批允许的任务数。
+            let stage = run.units[index].stage;
             if matches!(
-                run.units[index].stage,
+                stage,
                 AnalysisStage::Relation | AnalysisStage::EvidenceSelection
-            ) {
-                if run.jev_pinned_model.is_none() {
-                    self.probe_jev_alias(control, run).await?;
-                    if self
-                        .sessions
-                        .analysis_run(&control.id)?
-                        .is_some_and(|run| run.state == AnalysisRunState::Paused)
-                    {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                self.run_jev_unit(control, index, run).await?;
-                if self
-                    .sessions
-                    .analysis_run(&control.id)?
-                    .is_some_and(|run| run.state == AnalysisRunState::Paused)
-                {
-                    return Ok(());
-                }
+            ) && run.jev_pinned_model.is_none()
+            {
+                self.probe_jev_alias(control, run).await?;
                 continue;
             }
+            let concurrency = usize::from(run.limits.concurrency_limit);
+            let mut tasks = tokio::task::JoinSet::new();
+            let mut dispatched = std::collections::HashSet::new();
+            let mut failure = None;
+            loop {
+                if failure.is_none()
+                    && !control.cancel.is_cancelled()
+                    && !control.pause.load(Ordering::SeqCst)
+                {
+                    let latest = self.sessions.analysis_run(&control.id).and_then(|run| {
+                        run.ok_or_else(|| {
+                            core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false)
+                        })
+                    });
+                    match latest {
+                        Ok(latest) => {
+                            let capacity = concurrency
+                                .saturating_sub(tasks.len())
+                                .min(latest.limits.call_limit.saturating_sub(latest.batch_calls)
+                                    as usize);
+                            let indices: Vec<_> = latest
+                                .units
+                                .iter()
+                                .enumerate()
+                                .filter(|(index, unit)| {
+                                    !dispatched.contains(index)
+                                        && unit.state == AnalysisUnitState::Pending
+                                        && unit.stage == stage
+                                })
+                                .take(capacity)
+                                .map(|(index, _)| index)
+                                .collect();
+                            for index in indices {
+                                dispatched.insert(index);
+                                let service = Arc::clone(self);
+                                let control = control.clone();
+                                tasks.spawn(async move {
+                                    let result = match stage {
+                                        AnalysisStage::Summary => {
+                                            service.run_summary_unit(&control, index).await
+                                        }
+                                        AnalysisStage::Naming => {
+                                            service.run_naming_unit(&control, index).await
+                                        }
+                                        _ => service.run_jev_unit(&control, index).await,
+                                    };
+                                    (index, result)
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            control.cancel.cancel();
+                            failure = Some(error);
+                        }
+                    }
+                }
+                let Some(result) = tasks.join_next().await else {
+                    break;
+                };
+                let result = match result {
+                    Ok((index, result)) => {
+                        dispatched.remove(&index);
+                        result
+                    }
+                    Err(_) => Err(core_error(
+                        ErrorCode::AnalysisUnavailable,
+                        "分析任务意外中断。",
+                        false,
+                    )),
+                };
+                if let Err(error) = result {
+                    control.cancel.cancel();
+                    if failure.is_none() {
+                        failure = Some(error);
+                    }
+                }
+            }
+            if let Some(error) = failure {
+                return Err(error);
+            }
+        }
+    }
+
+    fn pending_analysis_unit(
+        &self,
+        control: &AnalysisControl,
+        index: usize,
+    ) -> Result<Option<AnalysisRun>, AppError> {
+        let run = self
+            .sessions
+            .analysis_run(&control.id)?
+            .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
+        if control.cancel.is_cancelled()
+            || control.pause.load(Ordering::SeqCst)
+            || matches!(
+                run.state,
+                AnalysisRunState::Paused | AnalysisRunState::Cancelling | AnalysisRunState::Cancelled
+            )
+            || run.batch_calls >= run.limits.call_limit
+            || run.units[index].state != AnalysisUnitState::Pending
+        {
+            return Ok(None);
+        }
+        Ok(Some(run))
+    }
+
+    async fn prepare_analysis_unit(
+        &self,
+        control: &AnalysisControl,
+        index: usize,
+    ) -> Result<Option<(tokio::sync::OwnedMutexGuard<()>, AnalysisRun)>, AppError> {
+        let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        let Some(mut run) = self.pending_analysis_unit(control, index)? else {
+            return Ok(None);
+        };
+        if matches!(
+            run.units[index].stage,
+            AnalysisStage::Summary | AnalysisStage::Naming
+        ) {
             let preferences = self.preferences.lock().await.clone();
             if preferences.text.base_url != run.text_base_url
                 || preferences.text.model != run.codex_model
@@ -1460,235 +1617,244 @@ impl SourceService {
                 || run.jev_rules_version != RELATION_RULES_VERSION
             {
                 run.state = AnalysisRunState::Paused;
-                run.pause_reason = Some("分析配置已变化；旧运行不会混入新配置。".into());
+                run.pause_reason = Some("分析配置已变化；请启动新批次。".into());
                 run.error = Some(core_error(
                     ErrorCode::AnalysisConfigChanged,
                     "请取消旧运行并启动新批次。",
                     false,
                 ));
                 self.save_analysis(&mut run, &control.update)?;
+                return Ok(None);
+            }
+        }
+        run.units[index]
+            .timing
+            .get_or_insert_with(Default::default)
+            .update(self.analysis_now(), true);
+        self.save_analysis(&mut run, &control.update)?;
+        Ok(Some((dispatch, run)))
+    }
+
+    async fn run_summary_unit(
+        self: &Arc<Self>,
+        control: &AnalysisControl,
+        index: usize,
+    ) -> Result<(), AppError> {
+        let Some((dispatch, mut run)) = self.prepare_analysis_unit(control, index).await? else {
+            return Ok(());
+        };
+        let thread_id = run.units[index].id.clone();
+        let current_generation = self.sessions.history_generation(&thread_id)?;
+        let current_thread = self.sessions.thread(&thread_id)?;
+        if current_thread
+            .as_ref()
+            .map(|thread| format!("{}:{}", thread.updated_at, current_generation))
+            != Some(run.units[index].input_version.clone())
+        {
+            run.units[index].state = AnalysisUnitState::Failed;
+            run.units[index].error = Some(core_error(
+                ErrorCode::SourceReadFailed,
+                "来源版本已变化；旧批次不分析新内容。",
+                true,
+            ));
+            self.save_analysis(&mut run, &control.update)?;
+            return Ok(());
+        }
+        let preview = self
+            .summary_preview_limited(&thread_id, run.limits.input_character_limit)
+            .await;
+        match preview {
+            Ok(preview) if preview.cache_current => {
+                run.units[index].state = AnalysisUnitState::Succeeded;
+                run.units[index].actual_model = preview.cached_summary.map(|summary| summary.model);
+                self.save_analysis(&mut run, &control.update)?;
                 return Ok(());
             }
-            if run.units[index].stage == AnalysisStage::Naming {
-                self.run_naming_unit(control, index, run).await?;
-                if self
-                    .sessions
-                    .analysis_run(&control.id)?
-                    .is_some_and(|run| run.state == AnalysisRunState::Paused)
-                {
-                    return Ok(());
-                }
-                continue;
-            }
-            let thread_id = run.units[index].id.clone();
-            let current_generation = self.sessions.history_generation(&thread_id)?;
-            let current_thread = self.sessions.thread(&thread_id)?;
-            if current_thread
-                .as_ref()
-                .map(|thread| format!("{}:{}", thread.updated_at, current_generation))
-                != Some(run.units[index].input_version.clone())
-            {
+            Ok(preview) if preview.content_available && preview.source_current => {}
+            Ok(_) | Err(_) => {
                 run.units[index].state = AnalysisUnitState::Failed;
                 run.units[index].error = Some(core_error(
                     ErrorCode::SourceReadFailed,
-                    "来源版本已变化；旧批次不分析新内容。",
+                    "来源内容不可用或已变化；请重新读取后启动新运行。",
                     true,
                 ));
                 self.save_analysis(&mut run, &control.update)?;
-                continue;
-            }
-            let preview = self
-                .summary_preview_limited(&thread_id, run.limits.input_character_limit)
-                .await;
-            match preview {
-                Ok(preview) if preview.cache_current => {
-                    run.units[index].state = AnalysisUnitState::Succeeded;
-                    run.units[index].actual_model =
-                        preview.cached_summary.map(|summary| summary.model);
-                    self.save_analysis(&mut run, &control.update)?;
-                    continue;
-                }
-                Ok(preview) if preview.content_available && preview.source_current => {}
-                Ok(_) | Err(_) => {
-                    run.units[index].state = AnalysisUnitState::Failed;
-                    run.units[index].error = Some(core_error(
-                        ErrorCode::SourceReadFailed,
-                        "来源内容不可用或已变化；请重新读取后启动新运行。",
-                        true,
-                    ));
-                    self.save_analysis(&mut run, &control.update)?;
-                    continue;
-                }
-            }
-            let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
                 return Ok(());
-            };
-            let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
-            if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
-                continue;
-            }
-            reserve_attempt(&mut run, index, 0)?;
-            self.save_analysis(&mut run, &control.update)?;
-            if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
-                let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
-                current.batch_calls -= 1;
-                current.total_calls -= 1;
-                current.units[index].attempts -= 1;
-                current.units[index].state = AnalysisUnitState::Pending;
-                self.save_analysis(&mut current, &control.update)?;
-                continue;
-            }
-            let started = self
-                .start_summary_for_batch(
-                    thread_id,
-                    run.limits.input_character_limit,
-                    SummaryBatchSnapshot {
-                        input_version: &run.units[index].input_version,
-                        model: &run.codex_model,
-                        base_url: &run.text_base_url,
-                        config_revision: run.text_config_revision,
-                    },
-                    control.queue_pause.clone(),
-                )
-                .await;
-            let summary = match started {
-                Ok(summary) => summary,
-                Err(error) => {
-                    let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
-                    current.batch_calls -= 1;
-                    current.total_calls -= 1;
-                    current.units[index].attempts -= 1;
-                    current.units[index].state = if matches!(
-                        error.code,
-                        ErrorCode::AnalysisConfigChanged
-                            | ErrorCode::AnalysisAuthenticationFailed
-                            | ErrorCode::AnalysisQuotaExceeded
-                    ) {
-                        AnalysisUnitState::Pending
-                    } else {
-                        AnalysisUnitState::Failed
-                    };
-                    current.units[index].error = Some(error.clone());
-                    if !error.retryable {
-                        current.state = AnalysisRunState::Paused;
-                        current.pause_reason = Some(error.message);
-                    }
-                    self.save_analysis(&mut current, &control.update)?;
-                    if current.state == AnalysisRunState::Paused {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            };
-            if summary.reused_cache {
-                let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
-                current.batch_calls -= 1;
-                current.total_calls -= 1;
-                current.units[index].attempts -= 1;
-                current.units[index].state = AnalysisUnitState::Succeeded;
-                current.units[index].actual_model = Some(summary.model);
-                self.save_analysis(&mut current, &control.update)?;
-                continue;
-            }
-            let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
-            current.units[index].active_summary_run_id = Some(summary.id.clone());
-            self.save_analysis(&mut current, &control.update)?;
-            drop(dispatch);
-            if control.cancel.is_cancelled() {
-                let _ = self.cancel_summary_run(&summary.id);
-            }
-            let (completed, timed_out) = self
-                .wait_summary(&summary.id, run.limits.timeout_seconds, &control.cancel)
-                .await?;
-            let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
-            current.units[index].active_summary_run_id = None;
-            if completed.state == SummaryRunState::Complete {
-                current.units[index].state = AnalysisUnitState::Succeeded;
-                current.units[index].actual_model = Some(completed.model);
-                current.units[index].error = None;
-            } else if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
-                current.units[index].state = AnalysisUnitState::Pending;
-            } else {
-                let error = if timed_out {
-                    core_error(
-                        ErrorCode::AnalysisTimeout,
-                        "模型调用超过本次超时，已等待本地取消终态；可重试。",
-                        true,
-                    )
-                } else {
-                    completed.error.unwrap_or_else(|| {
-                        core_error(ErrorCode::AnalysisUnavailable, "模型调用未成功。", true)
-                    })
-                };
-                let temporary = matches!(
-                    error.code,
-                    ErrorCode::ProcessExited
-                        | ErrorCode::AnalysisOverloaded
-                        | ErrorCode::JevRateLimited
-                        | ErrorCode::JevOverloaded
-                        | ErrorCode::JevTimeout
-                ) || (matches!(
-                    error.code,
-                    ErrorCode::AnalysisTimeout
-                        | ErrorCode::AnalysisUnavailable
-                        | ErrorCode::JevConnectionFailed
-                        | ErrorCode::TextConnectionFailed
-                ) && error.retryable);
-                current.units[index].error = Some(error.clone());
-                if matches!(
-                    error.code,
-                    ErrorCode::JevQuotaExceeded
-                        | ErrorCode::JevAuthenticationFailed
-                        | ErrorCode::JevNotConfigured
-                        | ErrorCode::AnalysisModelUnsupported
-                        | ErrorCode::AnalysisAuthenticationFailed
-                        | ErrorCode::AnalysisQuotaExceeded
-                        | ErrorCode::TextNotConfigured
-                        | ErrorCode::TextCredentialFailed
-                ) {
-                    current.units[index].state = AnalysisUnitState::Pending;
-                    current.state = AnalysisRunState::Paused;
-                    current.pause_reason = Some(error.message);
-                } else if temporary
-                    && current.units[index].attempts <= u32::from(run.limits.retry_limit)
-                {
-                    current.units[index].state = AnalysisUnitState::Pending;
-                } else {
-                    current.units[index].state = AnalysisUnitState::Failed;
-                }
-            }
-            self.save_analysis(&mut current, &control.update)?;
-            if current.state == AnalysisRunState::Paused {
-                return Ok(());
-            }
-            if current.units[index].state == AnalysisUnitState::Pending
-                && !control.cancel.is_cancelled()
-                && !control.pause.load(Ordering::SeqCst)
-            {
-                let retry_after_ms = current.units[index]
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.retry_after_ms)
-                    .unwrap_or(0);
-                let delay_ms =
-                    (250 * current.units[index].attempts.min(2) as u64).max(retry_after_ms);
-                tokio::select! {
-                    _ = control.cancel.cancelled() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {},
-                }
             }
         }
+        drop(dispatch);
+        let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
+            return Ok(());
+        };
+        let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        let Some(latest) = self.pending_analysis_unit(control, index)? else {
+            return Ok(());
+        };
+        run = latest;
+        reserve_attempt(&mut run, index, 0)?;
+        self.save_analysis(&mut run, &control.update)?;
+        if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
+            let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
+            current.batch_calls -= 1;
+            current.total_calls -= 1;
+            current.units[index].attempts -= 1;
+            current.units[index].state = AnalysisUnitState::Pending;
+            self.save_analysis(&mut current, &control.update)?;
+            return Ok(());
+        }
+        let started = self
+            .start_summary_for_batch(
+                thread_id,
+                run.limits.input_character_limit,
+                SummaryBatchSnapshot {
+                    input_version: &run.units[index].input_version,
+                    model: &run.codex_model,
+                    base_url: &run.text_base_url,
+                    config_revision: run.text_config_revision,
+                },
+                control.queue_pause.clone(),
+            )
+            .await;
+        let summary = match started {
+            Ok(summary) => summary,
+            Err(error) => {
+                let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
+                current.batch_calls -= 1;
+                current.total_calls -= 1;
+                current.units[index].attempts -= 1;
+                current.units[index].state = if matches!(
+                    error.code,
+                    ErrorCode::AnalysisConfigChanged
+                        | ErrorCode::AnalysisAuthenticationFailed
+                        | ErrorCode::AnalysisQuotaExceeded
+                ) {
+                    AnalysisUnitState::Pending
+                } else {
+                    AnalysisUnitState::Failed
+                };
+                current.units[index].error = Some(error.clone());
+                if !error.retryable {
+                    current.state = AnalysisRunState::Paused;
+                    current.pause_reason = Some(error.message);
+                }
+                self.save_analysis(&mut current, &control.update)?;
+                if current.state == AnalysisRunState::Paused {
+                    return Ok(());
+                }
+                return Ok(());
+            }
+        };
+        if summary.reused_cache {
+            let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
+            current.batch_calls -= 1;
+            current.total_calls -= 1;
+            current.units[index].attempts -= 1;
+            current.units[index].state = AnalysisUnitState::Succeeded;
+            current.units[index].actual_model = Some(summary.model);
+            self.save_analysis(&mut current, &control.update)?;
+            return Ok(());
+        }
+        let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
+        current.units[index].active_summary_run_id = Some(summary.id.clone());
+        self.save_analysis(&mut current, &control.update)?;
+        drop(dispatch);
+        if control.cancel.is_cancelled() {
+            let _ = self.cancel_summary_run(&summary.id);
+        }
+        let (completed, timed_out) = self
+            .wait_summary(&summary.id, run.limits.timeout_seconds, &control.cancel)
+            .await?;
+        let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        let mut current = self.sessions.analysis_run(&control.id)?.unwrap();
+        current.units[index].active_summary_run_id = None;
+        if let Some(timing) = &completed.request_timing {
+            current.units[index]
+                .request_timing
+                .get_or_insert_with(Default::default)
+                .add(timing);
+        }
+        if completed.state == SummaryRunState::Complete {
+            current.units[index].state = AnalysisUnitState::Succeeded;
+            current.units[index].actual_model = Some(completed.model);
+            current.units[index].error = None;
+        } else if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
+            current.units[index].state = AnalysisUnitState::Pending;
+        } else {
+            let error = if timed_out {
+                core_error(
+                    ErrorCode::AnalysisTimeout,
+                    "模型调用超过本次超时，已等待本地取消终态；可重试。",
+                    true,
+                )
+            } else {
+                completed.error.unwrap_or_else(|| {
+                    core_error(ErrorCode::AnalysisUnavailable, "模型调用未成功。", true)
+                })
+            };
+            let temporary = matches!(
+                error.code,
+                ErrorCode::ProcessExited
+                    | ErrorCode::AnalysisOverloaded
+                    | ErrorCode::JevRateLimited
+                    | ErrorCode::JevOverloaded
+                    | ErrorCode::JevTimeout
+            ) || (matches!(
+                error.code,
+                ErrorCode::AnalysisTimeout
+                    | ErrorCode::AnalysisUnavailable
+                    | ErrorCode::JevConnectionFailed
+                    | ErrorCode::TextConnectionFailed
+            ) && error.retryable);
+            current.units[index].error = Some(error.clone());
+            if matches!(
+                error.code,
+                ErrorCode::JevQuotaExceeded
+                    | ErrorCode::JevAuthenticationFailed
+                    | ErrorCode::JevNotConfigured
+                    | ErrorCode::AnalysisModelUnsupported
+                    | ErrorCode::AnalysisAuthenticationFailed
+                    | ErrorCode::AnalysisQuotaExceeded
+                    | ErrorCode::TextNotConfigured
+                    | ErrorCode::TextCredentialFailed
+            ) {
+                current.units[index].state = AnalysisUnitState::Pending;
+                current.state = AnalysisRunState::Paused;
+                current.pause_reason = Some(error.message);
+            } else if temporary && current.units[index].attempts <= u32::from(run.limits.retry_limit) {
+                current.units[index].state = AnalysisUnitState::Pending;
+            } else {
+                current.units[index].state = AnalysisUnitState::Failed;
+            }
+        }
+        self.save_analysis(&mut current, &control.update)?;
+        if current.state == AnalysisRunState::Paused {
+            return Ok(());
+        }
+        drop(dispatch);
+        if current.units[index].state == AnalysisUnitState::Pending
+            && !control.cancel.is_cancelled()
+            && !control.pause.load(Ordering::SeqCst)
+        {
+            let retry_after_ms = current.units[index]
+                .error
+                .as_ref()
+                .and_then(|error| error.retry_after_ms)
+                .unwrap_or(0);
+            let delay_ms = (250 * current.units[index].attempts.min(2) as u64).max(retry_after_ms);
+            tokio::select! {
+                _ = control.cancel.cancelled() => {},
+                _ = tokio::time::sleep(Duration::from_millis(delay_ms)) => {},
+            }
+        }
+        Ok(())
     }
 
-    async fn run_naming_unit(
-        &self,
-        control: &AnalysisControl,
-        index: usize,
-        mut run: AnalysisRun,
-    ) -> Result<(), AppError> {
+    async fn run_naming_unit(&self, control: &AnalysisControl, index: usize) -> Result<(), AppError> {
+        let Some((dispatch, mut run)) = self.prepare_analysis_unit(control, index).await? else {
+            return Ok(());
+        };
         let stream_id = run.units[index].id.clone();
         let groups = self.automatic_workstreams(&run.project_id)?;
-        let group_revision = groups.revision;
         let naming_graph = self.project_graph(&run.project_id)?;
         let naming_config = NamingConfig {
             model: &run.codex_model,
@@ -1747,6 +1913,7 @@ impl SourceService {
             run.units[index].error = None;
             return self.save_analysis(&mut run, &control.update);
         }
+        drop(dispatch);
         let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
             return Ok(());
         };
@@ -1763,10 +1930,15 @@ impl SourceService {
                 ))?,
         };
         let dispatch = control.dispatch.lock().await;
-        if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
+        let Some(latest) = self.pending_analysis_unit(control, index)? else {
             return Ok(());
-        }
+        };
+        run = latest;
         reserve_attempt(&mut run, index, 0)?;
+        run.units[index]
+            .request_timing
+            .get_or_insert_with(Default::default)
+            .update(self.analysis_now(), true);
         self.save_analysis(&mut run, &control.update)?;
         drop(dispatch);
         let call_cancel = control.cancel.child_token();
@@ -1790,6 +1962,7 @@ impl SourceService {
                 call_cancel,
             )
             .await;
+        let request_finished = self.analysis_now();
         timeout.abort();
         let result = if timed_out.load(Ordering::SeqCst) && !control.cancel.is_cancelled() {
             Err(core_error(
@@ -1801,10 +1974,14 @@ impl SourceService {
             result
         };
         drop(permit);
+        let _dispatch = control.dispatch.lock().await;
         let mut current = self
             .sessions
             .analysis_run(&control.id)?
             .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
+        if let Some(timing) = &mut current.units[index].request_timing {
+            timing.update(request_finished, false);
+        }
         if control.cancel.is_cancelled() || current.state == AnalysisRunState::Cancelling {
             current.units[index].state = AnalysisUnitState::Pending;
             return self.save_analysis(&mut current, &control.update);
@@ -1844,7 +2021,11 @@ impl SourceService {
                     .iter()
                     .find(|item| item.id == stream_id)
                     .is_some_and(|item| item.members == stream.members)
-                    && latest.revision == group_revision
+                    && !self
+                        .sessions
+                        .workstream_corrections(&run.project_id)?
+                        .names
+                        .contains_key(&stream_id)
                     && live_text.base_url == run.text_base_url
                     && live_text.model == run.codex_model
                     && live_preferences.text_revision == run.text_config_revision;
@@ -1865,6 +2046,7 @@ impl SourceService {
                     current.units[index].error = None;
                     let saved = {
                         let _guard = self.analysis_update_lock.lock().unwrap();
+                        current.update_timing(self.analysis_now());
                         recalculate(&mut current);
                         let saved = !control.cancel.is_cancelled()
                             && self.sessions.save_analysis_with_workstream_name(
@@ -1874,7 +2056,7 @@ impl SourceService {
                                 &name,
                                 &version,
                                 &model,
-                                group_revision,
+                                latest.revision,
                                 &source_versions,
                             )?;
                         if saved {
@@ -2107,12 +2289,10 @@ impl SourceService {
         Ok(())
     }
 
-    async fn run_jev_unit(
-        &self,
-        control: &AnalysisControl,
-        index: usize,
-        mut run: AnalysisRun,
-    ) -> Result<(), AppError> {
+    async fn run_jev_unit(&self, control: &AnalysisControl, index: usize) -> Result<(), AppError> {
+        let Some((dispatch, mut run)) = self.prepare_analysis_unit(control, index).await? else {
+            return Ok(());
+        };
         let preview = self.candidate_preview(&run.project_id)?;
         let Some(candidate) = preview
             .candidates
@@ -2140,9 +2320,10 @@ impl SourceService {
         }
         let mut expected_sources = Vec::with_capacity(2);
         for thread_id in [&candidate.left_thread_id, &candidate.right_thread_id] {
-            let thread = self.sessions.thread(thread_id)?.ok_or_else(|| {
-                core_error(ErrorCode::SourceReadFailed, "候选来源会话已消失。", true)
-            })?;
+            let thread = self
+                .sessions
+                .thread(thread_id)?
+                .ok_or_else(|| core_error(ErrorCode::SourceReadFailed, "候选来源会话已消失。", true))?;
             expected_sources.push((
                 thread_id.clone(),
                 thread.updated_at,
@@ -2205,6 +2386,7 @@ impl SourceService {
             supported.len() as u32
         };
         let credential_cancel = self.jev_cancel.lock().await.clone();
+        drop(dispatch);
         let Some(_batch_permit) = acquire_batch_model_slot(control).await else {
             return Ok(());
         };
@@ -2228,6 +2410,11 @@ impl SourceService {
             _ = credential_cancel.cancelled() => return Ok(()),
             value = self.jev_gate.read() => value,
         };
+        let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
+        let Some(latest) = self.pending_analysis_unit(control, index)? else {
+            return Ok(());
+        };
+        run = latest;
         let (credential, model) = match self.jev_request_settings().await {
             Ok(settings) => settings,
             Err(error) => {
@@ -2251,10 +2438,6 @@ impl SourceService {
                 false,
             ));
             self.save_analysis(&mut run, &control.update)?;
-            return Ok(());
-        }
-        let dispatch = Arc::clone(&control.dispatch).lock_owned().await;
-        if control.cancel.is_cancelled() || control.pause.load(Ordering::SeqCst) {
             return Ok(());
         }
         let model = run.jev_pinned_model.clone().ok_or_else(|| {
@@ -2281,6 +2464,10 @@ impl SourceService {
         }
         run.units[index].requested_model = model.clone();
         reserve_attempt(&mut run, index, questions)?;
+        run.units[index]
+            .request_timing
+            .get_or_insert_with(Default::default)
+            .update(self.analysis_now(), true);
         self.save_analysis(&mut run, &control.update)?;
         drop(dispatch);
         let response = if phase == AnalysisStage::Relation {
@@ -2296,12 +2483,16 @@ impl SourceService {
                 value = analyzer.select_evidence(&credential, &model, candidate, &supported) => value.map(JevUnitResult::Evidence),
             }
         };
+        let request_finished = self.analysis_now();
         drop(permit);
         let _dispatch = Arc::clone(&control.dispatch).lock_owned().await;
         let mut current = self
             .sessions
             .analysis_run(&control.id)?
             .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
+        if let Some(timing) = &mut current.units[index].request_timing {
+            timing.update(request_finished, false);
+        }
         if control.cancel.is_cancelled() || current.state == AnalysisRunState::Cancelling {
             current.units[index].state = AnalysisUnitState::Pending;
             self.save_analysis(&mut current, &control.update)?;
@@ -2402,9 +2593,7 @@ impl SourceService {
                 if current.units[index]
                     .relation_classification
                     .as_ref()
-                    .is_some_and(|classification| {
-                        classification.actual_model != selection.actual_model
-                    })
+                    .is_some_and(|classification| classification.actual_model != selection.actual_model)
                 {
                     current.units[index].state = AnalysisUnitState::Pending;
                     current.units[index].error = Some(core_error(
@@ -2478,12 +2667,7 @@ impl SourceService {
             }
         }
         if let Some(result) = outcome {
-            if !self.save_analysis_outcome(
-                &mut current,
-                &result,
-                &expected_sources,
-                &control.update,
-            )? {
+            if !self.save_analysis_outcome(&mut current, &result, &expected_sources, &control.update)? {
                 current.units[index].state = AnalysisUnitState::Pending;
                 current.state = AnalysisRunState::Paused;
                 current.pause_reason = Some("来源版本或运行状态已变化；迟到结果未保存。".into());
@@ -2493,6 +2677,7 @@ impl SourceService {
             self.save_analysis(&mut current, &control.update)?;
         }
         drop(gate);
+        drop(_dispatch);
         if current.units[index].state == AnalysisUnitState::Pending
             && current.state != AnalysisRunState::Paused
             && current.units[index].error.is_some()
@@ -2774,6 +2959,164 @@ mod tests {
             )
             .unwrap();
         service
+    }
+
+    #[tokio::test]
+    async fn stale_candidate_history_reuses_current_preview_and_revalidates_new_results() {
+        let root = root("stale-candidate-cache");
+        let service = service(&root, "ok", 2).await;
+        let mut preview = service.candidate_preview("project-test").unwrap();
+        let candidate = preview.candidates[0].clone();
+        let current_version = preview.candidate_versions[&candidate.id].clone();
+        let mut removed = candidate.clone();
+        removed.id = "removed-candidate".into();
+        preview.stale_candidates = vec![candidate.clone(), removed]
+            .into_iter()
+            .map(|candidate| codexflow_domain::StaleCandidate {
+                candidate,
+                input_version: "old".into(),
+                reason: "旧来源".into(),
+            })
+            .collect();
+        service
+            .sessions
+            .replace_automatic_candidates(&preview, &[])
+            .unwrap();
+        let builds = service.candidate_rebuilds.load(Ordering::Relaxed);
+        let cached = service.candidate_preview("project-test").unwrap();
+        assert_eq!(cached.stale_candidates.len(), 2);
+        assert_eq!(
+            service.candidate_rebuilds.load(Ordering::Relaxed),
+            builds,
+            "保留过期候选不应强制重建当前候选集"
+        );
+        let mut outcome = InferredPairOutcome {
+            candidate_id: candidate.id.clone(),
+            project_id: "project-test".into(),
+            left_thread_id: candidate.left_thread_id.clone(),
+            right_thread_id: candidate.right_thread_id.clone(),
+            input_version: "old".into(),
+            status: "none".into(),
+            unknown_count: 0,
+            decisions: vec![],
+            jev_identity: None,
+            relations: vec![],
+        };
+        service
+            .sessions
+            .save_inferred_pair_outcome(&outcome)
+            .unwrap();
+        assert_eq!(
+            service
+                .candidate_preview("project-test")
+                .unwrap()
+                .stale_candidates
+                .len(),
+            2
+        );
+        outcome.input_version = current_version;
+        service
+            .sessions
+            .save_inferred_pair_outcome(&outcome)
+            .unwrap();
+        let refreshed = service.candidate_preview("project-test").unwrap();
+        assert_eq!(refreshed.stale_candidates.len(), 1);
+        assert_eq!(
+            refreshed.stale_candidates[0].candidate.id,
+            "removed-candidate"
+        );
+        assert_eq!(service.candidate_rebuilds.load(Ordering::Relaxed), builds);
+        let mut updated = thread(&candidate.left_thread_id);
+        updated.updated_at += 1;
+        service.sessions.save_collection(&[updated], &[]).unwrap();
+        let changed = service.candidate_preview("project-test").unwrap();
+        assert_ne!(changed.input_version, preview.input_version);
+        assert!(service.candidate_rebuilds.load(Ordering::Relaxed) > builds);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn timing_run() -> AnalysisRun {
+        serde_json::from_value(serde_json::json!({
+            "id": "timing-run", "projectId": "project", "state": "queued", "inputVersion": "v1",
+            "textModel": "text", "jevBaseUrl": "https://example.test", "jevModel": "jev", "jevConfigRevision": 0,
+            "limits": AnalysisLimits::default(), "batchNumber": 1, "batchCalls": 0, "totalCalls": 0,
+            "totalQuestions": 0, "processed": 0, "succeeded": 0, "failed": 0, "pending": 3,
+            "startedAtUnixMs": 100, "interrupted": false,
+            "relationsPlanned": true, "namesPlanned": true,
+            "timing": {"elapsedMs": 0, "activeSinceUnixMs": null, "incomplete": false},
+            "units": (["summary", "relation", "naming"].map(|stage| serde_json::json!({
+                "id": stage, "stage": stage, "inputVersion": "v1", "state": "pending", "attempts": 0,
+                "requestedModel": "model"
+            })))
+        })).unwrap()
+    }
+
+    #[test]
+    fn timing_tracks_stages_tasks_pause_and_retry_without_counting_paused_time() {
+        let mut run = timing_run();
+        run.update_timing(100);
+        run.units[0].timing = Some(Default::default());
+        run.units[0].timing.as_mut().unwrap().update(200, true);
+        run.units[0].state = AnalysisUnitState::Running;
+        run.update_timing(300);
+        run.units[0].state = AnalysisUnitState::Pending; // 自动重试的等待仍属于该任务。
+        run.update_timing(500);
+        run.units[0].state = AnalysisUnitState::Succeeded;
+        run.update_timing(700);
+        run.units[1].timing = Some(Default::default());
+        run.units[1].timing.as_mut().unwrap().update(700, true);
+        run.state = AnalysisRunState::Paused;
+        run.update_timing(900);
+        assert_eq!(run.timing.as_ref().unwrap().elapsed_ms, 800);
+        assert_eq!(run.units[0].timing.as_ref().unwrap().elapsed_ms, 500);
+        assert_eq!(run.units[1].timing.as_ref().unwrap().elapsed_ms, 200);
+        run.state = AnalysisRunState::Running;
+        run.update_timing(10_000);
+        run.units[1].timing.as_mut().unwrap().update(10_000, true);
+        run.units[1].state = AnalysisUnitState::Succeeded;
+        run.update_timing(10_300);
+        run.units[2].state = AnalysisUnitState::Succeeded;
+        run.state = AnalysisRunState::Complete;
+        run.update_timing(10_500);
+        assert_eq!(run.timing.as_ref().unwrap().elapsed_ms, 1300);
+        assert_eq!(run.units[1].timing.as_ref().unwrap().elapsed_ms, 500);
+        assert_eq!(
+            run.stage_timings
+                .iter()
+                .map(|item| item.timing.elapsed_ms)
+                .collect::<Vec<_>>(),
+            vec![600, 500, 200]
+        );
+        assert!(run
+            .stage_timings
+            .iter()
+            .all(|item| item.timing.active_since_unix_ms.is_none()));
+    }
+
+    #[test]
+    fn timing_survives_storage_and_recovery_without_including_offline_time() {
+        let root = root("timing-recovery");
+        let store = codexflow_store::SessionStore::new(root.clone()).unwrap();
+        let mut run = timing_run();
+        run.update_timing(100);
+        run.update_timing(700);
+        store.save_analysis_run(&run).unwrap();
+        drop(store);
+        let store = codexflow_store::SessionStore::new(root.clone()).unwrap();
+        let recovered = store.analysis_run(&run.id).unwrap().unwrap();
+        let timing = recovered.timing.unwrap();
+        assert_eq!(timing.elapsed_ms, 600);
+        assert!(timing.incomplete);
+        assert!(timing.active_since_unix_ms.is_none());
+        assert_eq!(recovered.stage_timings[0].timing.elapsed_ms, 600);
+        let mut old = serde_json::to_value(&run).unwrap();
+        old.as_object_mut().unwrap().remove("timing");
+        old.as_object_mut().unwrap().remove("stageTimings");
+        let old: AnalysisRun = serde_json::from_value(old).unwrap();
+        assert!(old.timing.is_none());
+        assert!(old.units.iter().all(|unit| unit.timing.is_none()));
+        drop(store);
+        let _ = fs::remove_dir_all(root);
     }
 
     async fn wait_state(service: &SourceService, id: &str, state: AnalysisRunState) -> AnalysisRun {
@@ -3654,6 +3997,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timing_records_jev_request_and_task_through_completion() {
+        let root = root("timing-jev");
+        let mut service = service(&root, "ok", 2).await;
+        Arc::get_mut(&mut service).unwrap().analysis_clock = Arc::new(|| now_ms() as i64);
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_jev_post(&mut stream);
+            std::thread::sleep(Duration::from_millis(150));
+            let answers: serde_json::Map<String, serde_json::Value> = request["questions"]
+                .as_object().unwrap().iter().map(|(key, question)| {
+                    let criteria = question["criteria"].as_object().unwrap();
+                    let chosen = if criteria.contains_key("REJECTS") { "REJECTS" } else { "UNKNOWN" };
+                    let probabilities: serde_json::Map<String, serde_json::Value> = criteria.keys()
+                        .map(|choice| (choice.clone(), serde_json::json!(if choice == chosen { 1.0 } else { 0.0 }))).collect();
+                    (key.clone(), serde_json::json!({"type":"choice", "choice":chosen, "confidence":1.0, "probabilities":probabilities}))
+                }).collect();
+            write_jev_json(
+                &mut stream,
+                200,
+                serde_json::json!({"model":"jev-1.13.0", "answers":answers,
+                "usage":{"input_tokens":20,"output_tokens":5}}),
+            );
+        });
+        service
+            .save_jev(address, "jev-1.13.0".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let candidate = service
+            .candidate_preview("project-test")
+            .unwrap()
+            .candidates
+            .remove(0);
+        let run = service
+            .start_relation_evaluation(
+                "project-test".into(),
+                candidate.id,
+                AnalysisLimits {
+                    retry_limit: 0,
+                    ..Default::default()
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &run.id, AnalysisRunState::Complete).await;
+        let unit = &complete.units[0];
+        let request = unit.request_timing.as_ref().unwrap();
+        let task = unit.timing.as_ref().unwrap();
+        assert!(request.elapsed_ms >= 100);
+        assert!(task.elapsed_ms >= request.elapsed_ms);
+        assert!(complete.timing.as_ref().unwrap().elapsed_ms >= task.elapsed_ms);
+        assert!(request.active_since_unix_ms.is_none());
+        assert!(task.active_since_unix_ms.is_none());
+        assert_eq!(complete.total_calls, 1);
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
     async fn relation_evaluation_resumes_two_stage_jev_without_codex_calls() {
         let root = root("relation-evaluation");
         let service = service(&root, "ok", 2).await;
@@ -3740,6 +4144,9 @@ mod tests {
         let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
         assert_eq!(complete.total_calls, 2);
         assert!(complete.units[0].relation_evidence_selection.is_some());
+        assert!(complete.units[0].timing.as_ref().unwrap().active_since_unix_ms.is_none());
+        assert!(complete.units[0].request_timing.as_ref().unwrap().active_since_unix_ms.is_none());
+        assert!(complete.timing.as_ref().unwrap().active_since_unix_ms.is_none());
         assert!(complete
             .units
             .iter()
@@ -5293,6 +5700,543 @@ mod tests {
         (address, handle)
     }
 
+    fn concurrent_test_server(
+        count: usize,
+        expected_overlap: usize,
+        response: impl Fn(serde_json::Value) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    ) -> (
+        String,
+        std::thread::JoinHandle<usize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let response = Arc::new(response);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let signal = received.clone();
+        let handle = std::thread::spawn(move || {
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut workers = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (active, peak, response) = (active.clone(), peak.clone(), response.clone());
+                let signal = signal.clone();
+                workers.push(std::thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 8192];
+                    let request = loop {
+                        let read = stream.read(&mut buffer).unwrap();
+                        assert!(read > 0);
+                        bytes.extend_from_slice(&buffer[..read]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                            let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                            if bytes.len() >= end + 4 + length {
+                                break serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                            }
+                        }
+                    };
+                    signal.fetch_add(1, Ordering::SeqCst);
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(current, Ordering::SeqCst);
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while peak.load(Ordering::SeqCst) < expected_overlap && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    let (status, body) = response(request);
+                    let body = body.to_string();
+                    let _ = write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    active.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            peak.load(Ordering::SeqCst)
+        });
+        (address, handle, received)
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_limit_controls_simultaneous_summary_requests() {
+        for limit in [1, 3] {
+            let root = root(&format!("parallel-summary-{limit}"));
+            let service = service(&root, "ok", 3).await;
+            let summary = serde_json::json!({"goal":"合成目标","activity":"执行","outcome":"完成",
+                "decisions":"无","issues":"无","evidenceIds":["item:turn-1:item-1"]})
+            .to_string();
+            let (address, server, _) =
+                concurrent_test_server(3, limit as usize, move |_| (200, text_response(&summary)));
+            service
+                .save_text(
+                    address,
+                    "requested-model".into(),
+                    Some("synthetic-key".into()),
+                )
+                .await
+                .unwrap();
+            let started = service
+                .start_project_analysis_with_selection(
+                    "project-test".into(),
+                    AnalysisLimits {
+                        call_limit: 3,
+                        concurrency_limit: limit,
+                        retry_limit: 0,
+                        ..Default::default()
+                    },
+                    AnalysisStageSelection {
+                        summary: true,
+                        relations: false,
+                        naming: false,
+                    },
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+            let peak = server.join().unwrap();
+            assert_eq!(complete.total_calls, 3);
+            assert_eq!(complete.succeeded, 3);
+            assert_eq!(peak, limit as usize, "本批并发上限应作用于实际 HTTP 请求");
+            assert!(complete.units.iter().all(|unit| unit.attempts == 1));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_parallel_jev_keeps_all_results_and_budget() {
+        let root = root("parallel-jev");
+        let service = service(&root, "ok", 3).await;
+        let (address, server, _) = concurrent_test_server(3, 3, |request| {
+            let answers: serde_json::Map<String, serde_json::Value> = request["questions"].as_object().unwrap()
+                .iter().map(|(key, question)| {
+                    let criteria = question["criteria"].as_object().unwrap();
+                    let chosen = if criteria.contains_key("REJECTS") { "REJECTS" } else { "UNKNOWN" };
+                    let probabilities: serde_json::Map<String, serde_json::Value> = criteria.keys()
+                        .map(|key| (key.clone(), serde_json::json!(if key == chosen { 1.0 } else { 0.0 }))).collect();
+                    (key.clone(), serde_json::json!({"type":"choice","choice":chosen,"confidence":1.0,"probabilities":probabilities}))
+                }).collect();
+            (
+                200,
+                serde_json::json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":20,"output_tokens":5}}),
+            )
+        });
+        service
+            .save_jev(address, "jev-1.13.0".into(), Some("synthetic-key".into()))
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis_with_selection(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 3,
+                    concurrency_limit: 3,
+                    retry_limit: 0,
+                    ..Default::default()
+                },
+                AnalysisStageSelection {
+                    summary: false,
+                    relations: true,
+                    naming: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(server.join().unwrap(), 3);
+        assert_eq!((complete.total_calls, complete.succeeded), (3, 3));
+        assert_eq!(complete.input_tokens, Some(60));
+        assert_eq!(
+            service
+                .sessions
+                .inferred_pair_outcomes("project-test")
+                .unwrap()
+                .len(),
+            3
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_parallel_names_do_not_invalidate_each_other() {
+        let root = root("parallel-names");
+        let service = service(&root, "ok", 6).await;
+        let sessions = service.project_sessions("project-test").unwrap();
+        let relations: Vec<_> = (0..3)
+            .map(|i| codexflow_domain::ObservedRelation {
+                id: format!("pair-{i}"),
+                project_id: "project-test".into(),
+                from_thread_id: format!("thread-{}", i * 2),
+                to_thread_id: format!("thread-{}", i * 2 + 1),
+                kind: codexflow_domain::ObservedRelationKind::ForkedFrom,
+                source: "observed".into(),
+                source_field: "forkedFromId".into(),
+                confidence: 1.0,
+                parent_endpoint: codexflow_domain::ParentEndpoint::InProject,
+            })
+            .collect();
+        service
+            .sessions
+            .save_projects_and_attributions(
+                &[sessions.project],
+                &sessions
+                    .threads
+                    .into_iter()
+                    .map(|item| item.attribution)
+                    .collect::<Vec<_>>(),
+                Some(&relations),
+            )
+            .unwrap();
+        let (address, server, _) =
+            concurrent_test_server(3, 3, |_| (200, text_response(r#"{"name":"并发工作流"}"#)));
+        service
+            .save_text(
+                address,
+                "requested-model".into(),
+                Some("synthetic-key".into()),
+            )
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis_with_selection(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 3,
+                    concurrency_limit: 3,
+                    retry_limit: 0,
+                    ..Default::default()
+                },
+                AnalysisStageSelection {
+                    summary: false,
+                    relations: false,
+                    naming: true,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(server.join().unwrap(), 3);
+        assert_eq!((complete.total_calls, complete.succeeded), (3, 3));
+        assert_eq!(
+            service
+                .project_workstreams("project-test")
+                .unwrap()
+                .workstreams
+                .iter()
+                .filter(|stream| stream.name == "并发工作流")
+                .count(),
+            3
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_does_not_exceed_budget_and_continues_remaining_work() {
+        let root = root("parallel-budget");
+        let service = service(&root, "ok", 3).await;
+        let summary = serde_json::json!({"goal":"合成目标","activity":"执行","outcome":"完成",
+            "decisions":"无","issues":"无","evidenceIds":["item:turn-1:item-1"]})
+        .to_string();
+        let (address, server, _) =
+            concurrent_test_server(3, 2, move |_| (200, text_response(&summary)));
+        service
+            .save_text(
+                address,
+                "requested-model".into(),
+                Some("synthetic-key".into()),
+            )
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis_with_selection(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 2,
+                    concurrency_limit: 3,
+                    retry_limit: 0,
+                    ..Default::default()
+                },
+                AnalysisStageSelection {
+                    summary: true,
+                    relations: false,
+                    naming: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(
+            (paused.total_calls, paused.succeeded, paused.pending),
+            (2, 2, 1)
+        );
+        service
+            .continue_analysis_run(&started.id, 1, |_| {})
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(
+            (
+                complete.total_calls,
+                complete.batch_calls,
+                complete.succeeded
+            ),
+            (3, 1, 3)
+        );
+        assert_eq!(server.join().unwrap(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_retries_keep_exact_call_accounting() {
+        let root = root("parallel-retry");
+        let service = service(&root, "ok", 3).await;
+        let summary = serde_json::json!({"goal":"合成目标","activity":"执行","outcome":"完成",
+            "decisions":"无","issues":"无","evidenceIds":["item:turn-1:item-1"]})
+        .to_string();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let (address, server, _) = concurrent_test_server(4, 3, move |_| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                (503, serde_json::json!({}))
+            } else {
+                (200, text_response(&summary))
+            }
+        });
+        service
+            .save_text(
+                address,
+                "requested-model".into(),
+                Some("synthetic-key".into()),
+            )
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis_with_selection(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 4,
+                    concurrency_limit: 3,
+                    retry_limit: 1,
+                    ..Default::default()
+                },
+                AnalysisStageSelection {
+                    summary: true,
+                    relations: false,
+                    naming: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(server.join().unwrap(), 3);
+        assert_eq!((complete.total_calls, complete.succeeded), (4, 3));
+        assert_eq!(
+            complete.units.iter().map(|unit| unit.attempts).sum::<u32>(),
+            4
+        );
+        assert_eq!(
+            complete
+                .units
+                .iter()
+                .filter(|unit| unit.attempts == 2)
+                .count(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_authentication_pause_keeps_other_in_flight_results() {
+        let root = root("parallel-authentication");
+        let service = service(&root, "ok", 4).await;
+        let summary = serde_json::json!({"goal":"合成目标","activity":"执行","outcome":"完成",
+            "decisions":"无","issues":"无","evidenceIds":["item:turn-1:item-1"]})
+        .to_string();
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let (address, server, received) = concurrent_test_server(3, 3, move |_| {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                (401, serde_json::json!({}))
+            } else {
+                std::thread::sleep(Duration::from_millis(300));
+                (200, text_response(&summary))
+            }
+        });
+        service
+            .save_text(
+                address,
+                "requested-model".into(),
+                Some("synthetic-key".into()),
+            )
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis_with_selection(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 5,
+                    concurrency_limit: 3,
+                    retry_limit: 0,
+                    ..Default::default()
+                },
+                AnalysisStageSelection {
+                    summary: true,
+                    relations: false,
+                    naming: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        let paused = wait_state(&service, &started.id, AnalysisRunState::Paused).await;
+        assert_eq!(server.join().unwrap(), 3);
+        assert_eq!(
+            (paused.total_calls, paused.succeeded, paused.pending),
+            (3, 2, 2)
+        );
+        assert_eq!(received.load(Ordering::SeqCst), 3);
+        assert!(paused
+            .units
+            .iter()
+            .all(|unit| unit.state != AnalysisUnitState::Running));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_refills_free_slots_before_slow_tasks_finish() {
+        let root = root("parallel-refill");
+        let service = service(&root, "ok", 3).await;
+        let summary = serde_json::json!({"goal":"合成目标","activity":"执行","outcome":"完成",
+            "decisions":"无","issues":"无","evidenceIds":["item:turn-1:item-1"]})
+        .to_string();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refilled = Arc::new(AtomicBool::new(false));
+        let observed = refilled.clone();
+        let (address, server, _) = concurrent_test_server(3, 2, move |_| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while calls.load(Ordering::SeqCst) < 3 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                observed.store(calls.load(Ordering::SeqCst) == 3, Ordering::SeqCst);
+            }
+            (200, text_response(&summary))
+        });
+        service
+            .save_text(
+                address,
+                "requested-model".into(),
+                Some("synthetic-key".into()),
+            )
+            .await
+            .unwrap();
+        let started = service
+            .start_project_analysis_with_selection(
+                "project-test".into(),
+                AnalysisLimits {
+                    call_limit: 3,
+                    concurrency_limit: 2,
+                    retry_limit: 0,
+                    ..Default::default()
+                },
+                AnalysisStageSelection {
+                    summary: true,
+                    relations: false,
+                    naming: false,
+                },
+                |_| {},
+            )
+            .await
+            .unwrap();
+        wait_state(&service, &started.id, AnalysisRunState::Complete).await;
+        assert_eq!(server.join().unwrap(), 2);
+        assert!(
+            refilled.load(Ordering::SeqCst),
+            "空闲并发槽应立即补入下一任务"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_pause_and_cancel_stop_new_dispatches() {
+        for cancel in [false, true] {
+            let root = root(&format!("parallel-stop-{cancel}"));
+            let service = service(&root, "ok", 4).await;
+            let summary = serde_json::json!({"goal":"合成目标","activity":"执行","outcome":"完成",
+                "decisions":"无","issues":"无","evidenceIds":["item:turn-1:item-1"]})
+            .to_string();
+            // 只允许两个请求进入，用等待第三个请求的超时提供稳定的暂停/取消窗口。
+            let (address, server, received) =
+                concurrent_test_server(2, 3, move |_| (200, text_response(&summary)));
+            service
+                .save_text(
+                    address,
+                    "requested-model".into(),
+                    Some("synthetic-key".into()),
+                )
+                .await
+                .unwrap();
+            let started = service
+                .start_project_analysis_with_selection(
+                    "project-test".into(),
+                    AnalysisLimits {
+                        call_limit: 4,
+                        concurrency_limit: 2,
+                        retry_limit: 0,
+                        ..Default::default()
+                    },
+                    AnalysisStageSelection {
+                        summary: true,
+                        relations: false,
+                        naming: false,
+                    },
+                    |_| {},
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                while received.load(Ordering::SeqCst) < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                service.cancel_analysis_run(&started.id).await.unwrap();
+            } else {
+                service.pause_analysis_run(&started.id).unwrap();
+            }
+            let stopped = wait_state(
+                &service,
+                &started.id,
+                if cancel {
+                    AnalysisRunState::Cancelled
+                } else {
+                    AnalysisRunState::Paused
+                },
+            )
+            .await;
+            assert_eq!(stopped.total_calls, 2);
+            if !cancel {
+                assert!(stopped.pause_reason.as_deref().unwrap().contains("用户暂停"));
+            }
+            assert_eq!(stopped.succeeded, if cancel { 0 } else { 2 });
+            assert!(stopped
+                .units
+                .iter()
+                .all(|unit| unit.active_summary_run_id.is_none()
+                    && unit.state != AnalysisUnitState::Running));
+            assert_eq!(server.join().unwrap(), 2);
+            assert_eq!(received.load(Ordering::SeqCst), 2);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
     #[tokio::test]
     async fn text_summaries_and_name_share_budget_after_members_are_fixed() {
         let root = root("text-budget-name");
@@ -5351,6 +6295,11 @@ mod tests {
             .unwrap();
         let complete = wait_state(&service, &started.id, AnalysisRunState::Complete).await;
         assert_eq!(complete.total_calls, 3);
+        assert!(complete.timing.as_ref().unwrap().active_since_unix_ms.is_none());
+        assert!(complete.units.iter().all(|unit| unit.timing.as_ref().is_some_and(|timing| timing.active_since_unix_ms.is_none())));
+        assert!(complete.units.iter().all(|unit| unit.request_timing.as_ref().is_some_and(|timing| timing.active_since_unix_ms.is_none())));
+        assert!(complete.stage_timings.iter().any(|item| item.stage == AnalysisStage::Summary));
+        assert!(complete.stage_timings.iter().any(|item| item.stage == AnalysisStage::Naming));
         let view = service.project_workstreams("project-test").unwrap();
         let stream = &view.workstreams[0];
         assert_eq!(stream.name, "合成工作流");

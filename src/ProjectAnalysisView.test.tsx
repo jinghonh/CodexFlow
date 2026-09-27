@@ -3,6 +3,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import { ProjectAnalysisView } from "./ProjectAnalysisView";
+import { ProjectQueryCacheProvider } from "./projectQueryCache";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => {}) }));
@@ -20,6 +21,59 @@ const preview = { projectId: "project", inputVersion: "v1", cachedSummaries: 1, 
 const run = { id: "analysis-1", projectId: "project", state: "running", pauseReason: null,
   batchNumber: 1, batchCalls: 1, totalCalls: 1, totalQuestions: 0, inputTokens: null, outputTokens: null,
   processed: 0, succeeded: 0, failed: 0, pending: 2, interrupted: false, error: null, limits, units: [] };
+
+test("配置变化后取消旧批次并刷新预览，由用户启动当前配置的新批次", async () => {
+  let refreshed = false;
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") return { ...preview, stages: preview.stages.map((item) =>
+      item.stage === "summary" && refreshed ? { ...item, model: "current-model" } : item) };
+    if (command === "get_latest_analysis_run") return { ...run, state: "paused" };
+    if (command === "continue_analysis_run") throw {
+      code: "ANALYSIS_CONFIG_CHANGED", message: "来源或分析服务配置已变化；请取消旧运行并启动新批次。",
+      retryable: false, cachePreserved: true, nextStep: "刷新分析预览并使用当前配置重新运行。",
+    };
+    if (command === "cancel_analysis_run") { refreshed = true; return { ...run, state: "cancelled" }; }
+    if (command === "start_project_analysis") return { ...run, id: "analysis-2" };
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ProjectQueryCacheProvider><ProjectAnalysisView projectId="project" refreshVersion="1" /></ProjectQueryCacheProvider>);
+  fireEvent.click(await screen.findByRole("button", { name: "继续未完成项" }));
+  await screen.findByRole("alert");
+  expect(screen.queryByRole("button", { name: "继续未完成项" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "取消旧批次并刷新预览" }));
+  await screen.findByText(/current-model/);
+  expect(screen.queryByRole("button", { name: "继续未完成项" })).toBeNull();
+  expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("start_project_analysis", expect.anything());
+  const start = screen.getByRole("button", { name: "启动会话总结" });
+  await waitFor(() => expect(start.hasAttribute("disabled")).toBe(false));
+  fireEvent.click(start);
+  await waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith("start_project_analysis", expect.objectContaining({ projectId: "project" })));
+});
+
+test("已保存的配置变化错误直接提供恢复入口，取消失败时保留旧运行并允许重试", async () => {
+  let attempts = 0;
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") return preview;
+    if (command === "get_latest_analysis_run") return { ...run, state: "paused", error: {
+      code: "ANALYSIS_CONFIG_CHANGED", message: "请取消旧运行并启动新批次。", retryable: false, cachePreserved: true,
+    } };
+    if (command === "cancel_analysis_run") {
+      attempts += 1;
+      if (attempts === 1) throw { message: "暂时无法取消，请重试。" };
+      return { ...run, state: "cancelled" };
+    }
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ProjectAnalysisView projectId="project" refreshVersion="1" />);
+  fireEvent.click(await screen.findByRole("button", { name: "取消旧批次并刷新预览" }));
+  await screen.findByText("暂时无法取消，请重试。");
+  expect(screen.getByRole("button", { name: "启动会话总结" }).hasAttribute("disabled")).toBe(true);
+  expect(screen.queryByRole("button", { name: "继续未完成项" })).toBeNull();
+  fireEvent.click(screen.getByRole("button", { name: "取消旧批次并刷新预览" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "启动会话总结" }).hasAttribute("disabled")).toBe(false));
+  expect(attempts).toBe(2);
+  expect(vi.mocked(invoke)).not.toHaveBeenCalledWith("start_project_analysis", expect.anything());
+});
 
 test("已保存的关系分析结果通知项目图刷新", async () => {
   const onRelationResultsChanged = vi.fn();
@@ -70,11 +124,85 @@ test("配置错误保留预览并允许修正预算后启动", async () => {
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "0" } });
   expect(screen.getByRole("button", { name: "启动会话总结" }).hasAttribute("disabled")).toBe(true);
   fireEvent.change(screen.getByLabelText("本批调用上限"), { target: { value: "5" } });
-  fireEvent.click(screen.getByRole("button", { name: "应用参数并刷新预览" }));
+  fireEvent.click(screen.getByRole("button", { name: "应用" }));
   await screen.findByText("2 条待总结");
   fireEvent.click(screen.getByRole("button", { name: "启动会话总结" }));
   expect(await screen.findByText("来源配置已变化")).toBeTruthy();
   expect(screen.getByText("2 条待总结")).toBeTruthy();
+});
+
+test("应用预算、并发和超时不重读预览，新批次使用应用后的参数", async () => {
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") return preview;
+    if (command === "get_latest_analysis_run") return null;
+    if (command === "start_project_analysis") return run;
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ProjectAnalysisView projectId="project" refreshVersion="1" />);
+  await screen.findByText("2 条待总结");
+  for (const [label, value] of [["本批调用上限", "5"], ["本批并发上限", "4"], ["单次超时", "90"]]) {
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+    expect(screen.getByRole("button", { name: "启动会话总结" }).hasAttribute("disabled")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "应用" }));
+    expect(screen.getByText("2 条待总结")).toBeTruthy();
+    expect(screen.queryByText("正在计算本阶段预览…")).toBeNull();
+  }
+  expect(screen.getByText("5 次")).toBeTruthy();
+  expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "get_analysis_preview")).toHaveLength(1);
+  fireEvent.click(screen.getByRole("button", { name: "启动会话总结" }));
+  await waitFor(() => expect(vi.mocked(invoke)).toHaveBeenCalledWith("start_project_analysis", expect.objectContaining({
+    limits: { ...limits, callLimit: 5, concurrencyLimit: 4, timeoutSeconds: 90 },
+  })));
+});
+
+test.each([
+  { panel: "summary", stage: "summary", calls: 6 },
+  { panel: "relations", stage: "relation", calls: 9 },
+  { panel: "naming", stage: "naming", calls: 3 },
+] as const)("$panel 修改重试次数只换算调用上界，保留额外探测调用", async ({ panel, stage, calls }) => {
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") return { ...preview, stages: preview.stages
+      .filter((item) => item.stage === stage).map((item) => ({ ...item, pendingItems: 2, maximumCalls: calls })) };
+    if (command === "get_latest_analysis_run") return null;
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ProjectAnalysisView projectId="project" refreshVersion="1" stage={panel} />);
+  await screen.findByText(`待处理 2；调用上界 ${calls}`);
+  for (const retries of [0, 5, 2]) {
+    fireEvent.change(screen.getByLabelText("自动重试次数"), { target: { value: String(retries) } });
+    fireEvent.click(screen.getByRole("button", { name: "应用" }));
+    expect(screen.getByText(`待处理 2；调用上界 ${calls / 3 * (retries + 1)}`)).toBeTruthy();
+  }
+  expect(vi.mocked(invoke).mock.calls.filter(([command]) => command === "get_analysis_preview")).toHaveLength(1);
+});
+
+test("输入范围变化重新检查缓存，等待期间修改重试次数仍按最新参数展示", async () => {
+  let resolvePreview: ((value: typeof preview) => void) | undefined;
+  const nextPreview = new Promise<typeof preview>((resolve) => { resolvePreview = resolve; });
+  let reads = 0;
+  vi.mocked(invoke).mockImplementation(async (command) => {
+    if (command === "get_analysis_preview") return ++reads === 1 ? preview : nextPreview;
+    if (command === "get_latest_analysis_run") return null;
+    throw new Error(`Unexpected command ${command}`);
+  });
+  render(<ProjectAnalysisView projectId="project" refreshVersion="1" />);
+  await screen.findByText("2 条待总结");
+  fireEvent.change(screen.getByLabelText("单次输入字符上限"), { target: { value: "8000" } });
+  fireEvent.click(screen.getByRole("button", { name: "应用" }));
+  expect(screen.queryByText("2 条待总结")).toBeNull();
+  expect(screen.getByRole("button", { name: "启动会话总结" }).hasAttribute("disabled")).toBe(true);
+  fireEvent.change(screen.getByLabelText("自动重试次数"), { target: { value: "0" } });
+  fireEvent.click(screen.getByRole("button", { name: "应用" }));
+  resolvePreview?.({ ...preview, cachedSummaries: 0, limits: { ...limits, inputCharacterLimit: 8000 },
+    stages: preview.stages.map((item) => item.stage === "summary" ? { ...item, pendingItems: 3, maximumCalls: 9 } : item) });
+  await screen.findByText("3 条待总结");
+  expect(screen.getByText("0 条有效缓存")).toBeTruthy();
+  expect(screen.getByText("待处理 3；调用上界 3")).toBeTruthy();
+  expect(screen.getByRole("button", { name: "启动会话总结" }).hasAttribute("disabled")).toBe(false);
+  expect(reads).toBe(2);
+  expect(vi.mocked(invoke)).toHaveBeenCalledWith("get_analysis_preview", expect.objectContaining({
+    limits: { ...limits, inputCharacterLimit: 8000 },
+  }));
 });
 
 test("暂停运行的继续请求出错后仍可重试", async () => {

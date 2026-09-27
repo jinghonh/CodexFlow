@@ -1,5 +1,8 @@
 use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 
+mod analysis_timing;
+pub use analysis_timing::{ExecutionTiming, StageTiming};
+
 mod timeline;
 pub use timeline::{
     build_project_timeline, LastActivityBasis, ProjectTimeline, TimelineQuality, TimelineThread,
@@ -385,6 +388,10 @@ pub enum AnalysisUnitState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisUnit {
+    #[serde(default)]
+    pub timing: Option<ExecutionTiming>,
+    #[serde(default)]
+    pub request_timing: Option<ExecutionTiming>,
     pub id: String,
     pub stage: AnalysisStage,
     pub input_version: String,
@@ -403,6 +410,10 @@ pub struct AnalysisUnit {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AnalysisRun {
+    #[serde(default)]
+    pub timing: Option<ExecutionTiming>,
+    #[serde(default)]
+    pub stage_timings: Vec<StageTiming>,
     pub id: String,
     pub project_id: String,
     pub state: AnalysisRunState,
@@ -893,6 +904,10 @@ pub enum SummaryRunState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SummaryRun {
+    #[serde(default)]
+    pub timing: Option<ExecutionTiming>,
+    #[serde(default)]
+    pub request_timing: Option<ExecutionTiming>,
     pub id: String,
     pub thread_id: String,
     #[serde(default)]

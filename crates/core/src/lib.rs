@@ -81,6 +81,8 @@ pub struct SourceService {
     model_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     analysis_auth_home: Option<PathBuf>,
+    #[cfg(test)]
+    candidate_rebuilds: AtomicU64,
 }
 
 struct State {
@@ -179,6 +181,8 @@ impl SourceService {
             )),
             #[cfg(test)]
             analysis_auth_home: None,
+            #[cfg(test)]
+            candidate_rebuilds: AtomicU64::new(0),
         };
         service.reconcile_projects()?;
         Ok(service)
@@ -1164,6 +1168,7 @@ impl SourceService {
         for item in &readable.threads {
             self.ensure_facts(&item.thread.id)?;
         }
+
         let expected: Vec<_> = readable
             .threads
             .iter()
@@ -1241,14 +1246,34 @@ impl SourceService {
                 .map_err(|_| AppError::store("序列化会话总结版本失败。"))?,
         );
         let input_version = format!("{:x}", hasher.finalize());
-        if let Some(saved) = self.sessions.cached_automatic_candidate_view_if_current(
+
+        if let Some(mut saved) = self.sessions.cached_automatic_candidate_view_if_current(
             &sessions.project.id,
             &input_version,
             &expected,
             facts::RULE_VERSION,
         )? {
+            // 过期候选是历史记录，不会使当前输入的候选缓存失效。
+            // 新判断可能消除过期项；只更新这部分，不重建整个项目的候选集。
+            if !saved.0.stale_candidates.is_empty() {
+                let analyzed: std::collections::HashSet<_> = self
+                    .sessions
+                    .inferred_pair_outcomes(&sessions.project.id)?
+                    .into_iter()
+                    .filter(|outcome| {
+                        saved.0.candidate_versions.get(&outcome.candidate_id)
+                            == Some(&outcome.input_version)
+                    })
+                    .map(|outcome| outcome.candidate_id)
+                    .collect();
+                saved.0.stale_candidates.retain(|entry| {
+                    !analyzed.contains(&entry.candidate.id)
+                });
+            }
+
             return Ok(saved);
         }
+
         let material = self
             .sessions
             .project_material(&sessions.project.id, &expected, facts::RULE_VERSION)?
@@ -1261,13 +1286,18 @@ impl SourceService {
             })?;
         // Incomplete histories still contribute metadata cues; only source facts
         // and excerpt pointers remain limited to the complete readable snapshot.
+
+        #[cfg(test)]
+        self.candidate_rebuilds.fetch_add(1, Ordering::Relaxed);
         let mut result = candidates::build(sessions, material);
+
         let local_ids: std::collections::HashSet<_> = sessions
             .threads
             .iter()
             .map(|item| item.thread.id.clone())
             .collect();
         let global_topics = self.global_topic_view()?;
+
         let mut semantic_pairs: std::collections::BTreeMap<(String, String), f64> =
             std::collections::BTreeMap::new();
         for item in &global_topics.threads {
@@ -1384,6 +1414,7 @@ impl SourceService {
             *weak_degree.entry(left).or_default() += 1;
             *weak_degree.entry(right).or_default() += 1;
         }
+
         let mut summaries = std::collections::HashMap::new();
         for item in &sessions.threads {
             let Some(summary) = self.sessions.summary(&item.thread.id)? else {
@@ -1442,6 +1473,7 @@ impl SourceService {
                 inferred::candidate_version_at(candidate, &candidate_expected)?,
             );
         }
+
         let analyzed: std::collections::HashSet<_> = self
             .sessions
             .inferred_pair_outcomes(&sessions.project.id)?
@@ -1487,6 +1519,7 @@ impl SourceService {
             }
             result.0.stale_candidates = stale.into_values().collect();
         }
+
         if !self.sessions.replace_automatic_candidates_if_current(
             &result.0,
             &result.1,
@@ -1499,6 +1532,7 @@ impl SourceService {
                 true,
             ));
         }
+
         Ok(result)
     }
 
@@ -4078,6 +4112,8 @@ mod tests {
         service
             .sessions
             .save_summary_run(&SummaryRun {
+                timing: Some(Default::default()),
+                request_timing: None,
                 id: "summary-interrupted".into(),
                 thread_id: "a".into(),
                 project_id: Some(project_id.clone()),
@@ -4098,6 +4134,8 @@ mod tests {
         service
             .sessions
             .save_analysis_run(&AnalysisRun {
+                timing: Some(Default::default()),
+                stage_timings: Vec::new(),
                 id: "analysis-interrupted".into(),
                 project_id: project_id.clone(),
                 state: AnalysisRunState::Running,
@@ -4132,6 +4170,8 @@ mod tests {
                     .into_iter()
                     .enumerate()
                     .map(|(index, state)| AnalysisUnit {
+                        timing: None,
+                        request_timing: None,
                         id: format!("unit-{index}"),
                         stage: AnalysisStage::Summary,
                         input_version: "synthetic-v1".into(),

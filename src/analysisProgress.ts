@@ -1,5 +1,8 @@
 export type StageSelection = { summary: boolean; relations: boolean; naming: boolean };
+export type ExecutionTiming = { elapsedMs: number; activeSinceUnixMs: number | null; incomplete: boolean };
 export type ProjectRun = {
+  timing?: ExecutionTiming | null;
+  stageTimings?: { stage: "summary" | "relation" | "evidenceSelection" | "naming"; timing: ExecutionTiming }[];
   id: string; projectId: string;
   state: "queued" | "running" | "cancelling" | "cancelled" | "paused" | "complete" | "partial" | "failed";
   stageSelection?: StageSelection; pauseReason: string | null;
@@ -8,13 +11,15 @@ export type ProjectRun = {
   inputTokens: number | null; outputTokens: number | null;
   processed: number; succeeded: number; failed: number; pending: number; plannedItems?: number;
   interrupted: boolean; error: { message: string } | null;
-  limits: { callLimit: number };
+  limits: { callLimit: number; concurrencyLimit?: number };
   startedAtUnixMs: number; finishedAtUnixMs: number | null;
   units: { id: string; stage: "summary" | "relation" | "evidenceSelection" | "naming";
+    timing?: ExecutionTiming | null; requestTiming?: ExecutionTiming | null;
     state: string; attempts: number; actualModel: string | null; error: { message: string } | null }[];
 };
 
 export type SummaryRun = {
+  timing?: ExecutionTiming | null; requestTiming?: ExecutionTiming | null;
   id: string; threadId: string; projectId?: string | null;
   state: "running" | "cancelling" | "complete" | "failed" | "cancelled";
   model: string; temporaryThreadId: string | null; turnId: string | null; reusedCache: boolean;

@@ -557,6 +557,11 @@ mod tests {
         let completed = finished(&service, &run.id).await;
         assert_eq!(completed.state, SummaryRunState::Complete);
         assert_eq!(completed.model_calls, 1);
+        let timing = completed.timing.as_ref().expect("总结计时");
+        let request = completed.request_timing.as_ref().expect("服务调用计时");
+        assert!(timing.elapsed_ms >= request.elapsed_ms);
+        assert!(timing.active_since_unix_ms.is_none());
+        assert!(request.active_since_unix_ms.is_none());
         let cached = service.summary_preview("thread-1").await.unwrap();
         assert!(cached.cache_current);
         assert_eq!(

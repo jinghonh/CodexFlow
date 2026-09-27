@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatAppError } from "./appError";
 import { ProgressMeter } from "./ProgressMeter";
+import { PreparingTimingView, SummaryTimingView } from "./AnalysisTimingView";
 import { summaryProgress } from "./analysisProgress";
 import type { SummaryRun as Run } from "./analysisProgress";
 import { startTrackedThreadSummary } from "./analysisStartIntent";
@@ -158,9 +159,10 @@ export function ThreadSummaryView({ threadId, revision, onLocate }: {
       {summary && <em>{preview.cacheCurrent ? "总结有效" : `总结过期：${preview.staleReason ?? "分析输入已变化"}`}</em>}
     </div>}
     {busy && <div className="analysis-progress prominent" role="status"><strong>正在准备单条会话总结</strong>
-      <ProgressMeter progress={{ stage: "读取分析材料", completed: 0, total: null, unit: "项", calls: 0 }} label="单条会话总结启动进度" /></div>}
+      <ProgressMeter progress={{ stage: "读取分析材料", completed: 0, total: null, unit: "项", calls: 0 }} label="单条会话总结启动进度" /><PreparingTimingView /></div>}
     {!busy && run && <div className="analysis-progress prominent" role="status"><strong>单条会话总结 · {run.state === "running" ? "执行中" : run.state === "cancelling" ? "取消中" : run.state === "complete" ? "完成" : run.state === "cancelled" ? "已取消" : "失败"}</strong>
       <ProgressMeter progress={summaryProgress(run)} label="单条会话总结进度" />
+      <SummaryTimingView run={run} />
       {run.error && <em>{errorText(run.error)}</em>}</div>}
     {run && <p className="history-lookup-message" role="status">{run.state === "running" ? "分析中" : run.state === "cancelling" ? "取消中" : run.state === "complete" ? run.reusedCache ? "已复用有效缓存" : "总结已保存" : run.state === "cancelled" ? "已取消，旧总结保留" : "分析失败，旧总结保留"}{run.error ? `：${errorText(run.error)}` : ""}</p>}
     {error && <p className="page-error" role="alert">{error}</p>}

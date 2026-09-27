@@ -730,6 +730,7 @@ impl SourceService {
         permits: u32,
         queue_pause: CancellationToken,
     ) -> Result<SummaryRun, AppError> {
+        let started_at = now_ms() as i64;
         if !from_batch {
             if let Some(project_id) = self.sessions.thread_project_id(&thread_id)? {
                 if self
@@ -835,6 +836,8 @@ impl SourceService {
             .as_ref()
             .is_some_and(|summary| reusable_summary(summary, &prepared));
         let run = SummaryRun {
+            timing: Some(codexflow_domain::ExecutionTiming::started(started_at)),
+            request_timing: None,
             id: id.clone(),
             thread_id: thread_id.clone(),
             project_id: self.sessions.thread_project_id(&thread_id)?,
@@ -848,7 +851,7 @@ impl SourceService {
                 .filter(|_| reused)
                 .map(|summary| summary.model.clone())
                 .unwrap_or_else(|| prepared.preview.model.clone()),
-            started_at_unix_ms: now_ms() as i64,
+            started_at_unix_ms: started_at,
             finished_at_unix_ms: reused.then(|| now_ms() as i64),
             temporary_thread_id: None,
             turn_id: None,
@@ -913,6 +916,8 @@ impl SourceService {
                             .summary_run(&run_id)?
                             .ok_or_else(|| AppError::store("找不到总结运行。"))?;
                         current.model_calls = current.model_calls.saturating_add(1);
+                        current.request_timing.get_or_insert_with(Default::default)
+                            .update(now_ms() as i64, true);
                         self.sessions.save_summary_run(&current)
                     })();
                     if let Err(error) = recorded {
@@ -943,6 +948,7 @@ impl SourceService {
             }
             Err(error) => Err(error),
         };
+        let request_finished = now_ms() as i64;
         let _text_commit_gate = self.text_gate.read().await;
         let current_preferences = self.preferences.lock().await.clone();
         let current_text_config = current_preferences.text;
@@ -1025,6 +1031,11 @@ impl SourceService {
             run.temporary_thread_id = current.temporary_thread_id;
             run.turn_id = current.turn_id;
             run.model_calls = current.model_calls;
+            run.timing = current.timing;
+            run.request_timing = current.request_timing;
+            if let Some(timing) = &mut run.request_timing {
+                timing.update(request_finished, false);
+            }
             if current.interrupted && run.state != SummaryRunState::Complete {
                 run.interrupted = true;
                 run.state = SummaryRunState::Failed;
@@ -1172,6 +1183,8 @@ mod tests {
                 .prepare_summary("thread-h", &TextConfig::default(), LIMIT)
                 .unwrap();
             let run = SummaryRun {
+                timing: Some(Default::default()),
+                request_timing: None,
                 id: format!("gate-{index}"),
                 thread_id: "thread-h".into(),
                 project_id: None,

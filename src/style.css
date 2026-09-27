@@ -800,3 +800,11 @@ button, input, select { font-family: inherit; }
   .history-heading { flex-wrap: wrap; gap: 8px; }
   .jev-fields { grid-template-columns: 1fr; }
 }
+.analysis-timing { display: grid; gap: 6px; font-variant-numeric: tabular-nums; }
+.analysis-stage-times { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 8px 0; }
+.analysis-timing-table { max-height: 300px; overflow: auto; margin: 8px 0; }
+.analysis-timing table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.analysis-timing th, .analysis-timing td { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.analysis-timing td:first-child { max-width: 240px; }
+.analysis-timing td small { display: block; overflow: hidden; text-overflow: ellipsis; max-width: 240px; opacity: .65; }
+.analysis-timing > details > small { display: block; margin-top: 8px; }

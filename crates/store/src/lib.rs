@@ -1237,6 +1237,7 @@ impl SessionStore {
                 run.state,
                 AnalysisRunState::Queued | AnalysisRunState::Running | AnalysisRunState::Cancelling
             ) {
+                run.interrupt_timing();
                 let user_cancelled = run.state == AnalysisRunState::Cancelling && !run.interrupted;
                 run.state = if user_cancelled {
                     AnalysisRunState::Cancelled
@@ -1553,8 +1554,18 @@ impl SessionStore {
     }
 
     pub fn save_summary_run(&self, run: &SummaryRun) -> Result<(), AppError> {
+        let mut run = run.clone();
+        let active = !run.interrupted
+            && matches!(run.state, SummaryRunState::Running | SummaryRunState::Cancelling);
+        let now = now_ms() as i64;
+        if let Some(timing) = &mut run.timing {
+            timing.update(now, active);
+        }
+        if let Some(timing) = &mut run.request_timing {
+            timing.update(now, active && timing.active_since_unix_ms.is_some());
+        }
         let json =
-            serde_json::to_string(run).map_err(|_| AppError::store("序列化总结运行失败。"))?;
+            serde_json::to_string(&run).map_err(|_| AppError::store("序列化总结运行失败。"))?;
         self.connection()?
             .execute(
                 "INSERT INTO summary_runs(id,thread_id,started_at,run_json) VALUES (?1,?2,?3,?4)
@@ -1632,6 +1643,12 @@ impl SessionStore {
                 run.state,
                 SummaryRunState::Running | SummaryRunState::Cancelling
             ) {
+                if let Some(timing) = &mut run.timing {
+                    timing.interrupt();
+                }
+                if let Some(timing) = &mut run.request_timing {
+                    timing.interrupt();
+                }
                 run.from_batch |= batch_run_ids.contains(&run.id);
                 run.state = if run.cancel_requested {
                     SummaryRunState::Cancelled
@@ -2900,7 +2917,7 @@ impl SessionStore {
         };
         let preview: CandidatePreview =
             serde_json::from_str(&preview_json).map_err(|_| AppError::store("候选缓存损坏。"))?;
-        if preview.input_version != input_version || !preview.stale_candidates.is_empty() {
+        if preview.input_version != input_version {
             return Ok(None);
         }
         let relations = serde_json::from_str(&relations_json)
@@ -4108,6 +4125,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("codexflow-summary-recovery-{nonce}"));
         let store = SessionStore::new(dir.clone()).unwrap();
         let run = SummaryRun {
+            timing: Some(Default::default()),
+            request_timing: None,
             id: "summary-run".into(),
             thread_id: "thread-h".into(),
             project_id: None,
@@ -4136,6 +4155,10 @@ mod tests {
         assert!(recovered.interrupted);
         assert!(recovered.finished_at_unix_ms.is_some());
         assert!(recovered.error.is_some());
+        let timing = recovered.timing.as_ref().unwrap();
+        assert!(timing.incomplete);
+        assert!(timing.active_since_unix_ms.is_none());
+        assert_eq!(timing.elapsed_ms, 0);
         let cancelled = reopened
             .summary_run("summary-user-cancelled")
             .unwrap()
