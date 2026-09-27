@@ -55,7 +55,7 @@ impl AppError {
             ErrorCode::TextConnectionFailed | ErrorCode::TextProtocolInvalid => {
                 "检查文本服务地址、协议和网络后重试。"
             }
-            ErrorCode::EmbeddingCredentialFailed => "解锁钥匙串并允许应用访问，然后重试。",
+            ErrorCode::EmbeddingCredentialFailed => "检查系统凭据库状态并重试。",
             ErrorCode::EmbeddingNotConfigured => "填写嵌入服务地址、模型和当前地址的 API Key。",
             ErrorCode::EmbeddingInvalidAddress => "填写有效的 HTTPS 嵌入服务地址并重新保存。",
             ErrorCode::EmbeddingConnectionFailed | ErrorCode::EmbeddingProtocolInvalid => {

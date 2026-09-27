@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 fn credential_error() -> AppError {
     AppError::embedding(
         ErrorCode::EmbeddingCredentialFailed,
-        "无法访问 macOS 钥匙串。请解锁并允许应用访问后重试。",
+        "无法访问系统凭据库。请检查凭据库状态后重试。",
         true,
     )
 }

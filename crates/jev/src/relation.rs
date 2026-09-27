@@ -720,7 +720,14 @@ mod tests {
                     .keys()
                     .map(String::as_str)
                     .collect();
-                (key.clone(), chosen(key, &options))
+                let answer = chosen(key, &options);
+                let selected = answer["choice"].as_str().unwrap_or_default();
+                let answer = if options.contains(&selected) {
+                    answer
+                } else {
+                    choice(options[0], &options)
+                };
+                (key.clone(), answer)
             })
             .collect();
         json!({"model":"jev-1.13.0","answers":answers,"usage":{"input_tokens":24,"output_tokens":8}})
@@ -745,8 +752,12 @@ mod tests {
             .classify(&credential(url), "jev-latest", &candidate())
             .await
             .unwrap();
-        assert_eq!(classification.choices.len(), 16);
-        for &(kind, _) in KINDS {
+        let expected_choices = KINDS
+            .iter()
+            .map(|(kind, _, _)| if kind.directed() { 2 } else { 1 })
+            .sum::<usize>();
+        assert_eq!(classification.choices.len(), expected_choices);
+        for &(kind, _, _) in KINDS {
             let ab = format!("{}_ab", kind.as_str().to_lowercase());
             assert!(classification.choices.iter().any(|item| item.key == ab
                 && item.from_thread_id == "thread-a"

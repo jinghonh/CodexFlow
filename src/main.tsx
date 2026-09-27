@@ -620,7 +620,7 @@ export function App() {
   }
 
   async function deleteEmbedding() {
-    if (!window.confirm("删除钥匙串中的嵌入服务 API Key？已有本地向量会保留。")) return;
+    if (!window.confirm(`删除${credentialStoreName}中的嵌入服务 API Key？已有本地向量会保留。`)) return;
     embeddingEpoch.current += 1; setEmbeddingBusy(true); setEmbeddingError("");
     try {
       setEmbeddingStatus(await invoke<EmbeddingStatus>("delete_embedding_credential"));
@@ -863,14 +863,14 @@ export function App() {
           <div className="jev-fields">
             <label htmlFor="embedding-url">服务根地址<input id="embedding-url" spellCheck={false} value={embeddingBaseUrl} onChange={(event) => setEmbeddingBaseUrl(event.target.value)} placeholder="https://example.com/v1" /></label>
             <label htmlFor="embedding-model">模型 ID<input id="embedding-model" spellCheck={false} value={embeddingModel} onChange={(event) => setEmbeddingModel(event.target.value)} placeholder="嵌入模型名称" /></label>
-            <label htmlFor="embedding-key">API Key<input id="embedding-key" type="password" autoComplete="off" spellCheck={false} value={embeddingKey} onChange={(event) => setEmbeddingKey(event.target.value)} placeholder={embeddingStatus?.credentialError ? "钥匙串不可用；请先解锁" : embeddingStatus?.credentialConfigured ? "已保存；留空保留现有密钥" : "填写后存入 macOS 钥匙串"} /></label>
+            <label htmlFor="embedding-key">API Key<input id="embedding-key" type="password" autoComplete="off" spellCheck={false} value={embeddingKey} onChange={(event) => setEmbeddingKey(event.target.value)} placeholder={embeddingStatus?.credentialError ? `${credentialStoreName}暂时不可用` : embeddingStatus?.credentialConfigured ? "已保存；留空保留现有密钥" : `填写后存入${credentialStoreName}`} /></label>
           </div>
-          <p className="jev-key-state">钥匙串：{embeddingStatus?.credentialError ? "暂时无法读取" : embeddingStatus?.credentialConfigured ? "当前地址已配置密钥" : "当前地址未配置密钥"}。更换地址必须填写新密钥。{embeddingUnsaved ? "请先保存修改。" : ""}</p>
+          <p className="jev-key-state">{credentialStoreName}：{embeddingStatus?.credentialError ? "暂时无法读取" : embeddingStatus?.credentialConfigured ? "当前地址已配置密钥" : "当前地址未配置密钥"}。更换地址必须填写新密钥。{embeddingUnsaved ? "请先保存修改。" : ""}</p>
           {embeddingStatus?.credentialError && <p className="page-error" role="alert">{errorText(embeddingStatus.credentialError)}</p>}
           {embeddingError && <p className="page-error" role="alert">{embeddingError}</p>}
           <div className="jev-actions">
             <button className="primary-button" disabled={embeddingBusy || embeddingValidating} onClick={() => void saveEmbedding()}>保存设置</button>
-            {embeddingStatus?.credentialError && <button className="browse-button" disabled={embeddingBusy || embeddingValidating} onClick={() => void invoke<EmbeddingStatus>("get_embedding_status").then(setEmbeddingStatus).catch((error) => setEmbeddingError(errorText(error)))}>重查钥匙串</button>}
+            {embeddingStatus?.credentialError && <button className="browse-button" disabled={embeddingBusy || embeddingValidating} onClick={() => void invoke<EmbeddingStatus>("get_embedding_status").then(setEmbeddingStatus).catch((error) => setEmbeddingError(errorText(error)))}>重查系统凭据库</button>}
             <button className="browse-button" disabled={embeddingBusy || embeddingValidating || embeddingUnsaved || !embeddingStatus?.credentialConfigured} onClick={() => void validateEmbedding()}>验证固定合成向量</button>
             {embeddingValidating && <button className="plain-button" onClick={() => void cancelEmbedding()}>取消请求</button>}
             <button className="plain-button" disabled={embeddingBusy || embeddingValidating || !embeddingStatus?.credentialConfigured} onClick={() => void deleteEmbedding()}>删除密钥</button>
