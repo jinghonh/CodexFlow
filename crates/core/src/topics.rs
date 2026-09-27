@@ -1,12 +1,20 @@
 use super::SourceService;
 use codexflow_domain::{
-    AppError, ErrorCode, GlobalTopicThread, GlobalTopicView, JevTopicClassification, LocalProject,
-    SemanticIndexResult, SemanticNeighbor, SemanticVector, ThreadMetadata, ThreadSummary,
+    AnalysisRunState, AppError, ErrorCode, GlobalTopicThread, GlobalTopicView,
+    JevTopicClassification, LocalProject, SemanticIndexResult, SemanticIndexRun,
+    SemanticIndexStage, SemanticNeighbor, SemanticVector, ThreadMetadata, ThreadSummary,
     ThreadTopicAssignment, TopicLabel,
 };
 use codexflow_jev::JevRelationAnalyzer;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 use tokio_util::sync::CancellationToken;
 
 const TOPIC_ASSIGNMENT_THRESHOLD: f64 = 0.45;
@@ -14,6 +22,7 @@ const EMBEDDING_BATCH_SIZE: usize = 32;
 const NEIGHBOR_LIMIT: usize = 10;
 const GLOBAL_RELATION_CALL_LIMIT: usize = 100;
 const GLOBAL_RELATION_SCOPE: &str = "__codexflow_global_relations__";
+static NEXT_SEMANTIC_RUN: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 struct SummaryRecord {
@@ -845,7 +854,200 @@ impl SourceService {
         self.global_topic_view()
     }
 
+    pub fn semantic_index_run(&self, id: &str) -> Result<Option<SemanticIndexRun>, AppError> {
+        self.sessions.semantic_index_run(id)
+    }
+
+    pub fn semantic_index_runs(&self) -> Result<Vec<SemanticIndexRun>, AppError> {
+        self.sessions.semantic_index_runs()
+    }
+
+    fn update_semantic_run(
+        &self,
+        id: Option<&str>,
+        update: impl FnOnce(&mut SemanticIndexRun),
+    ) -> Result<(), AppError> {
+        if let Some(id) = id {
+            let _guard = self.semantic_update_lock.lock().unwrap();
+            let mut run = self
+                .sessions
+                .semantic_index_run(id)?
+                .ok_or_else(|| AppError::store("找不到语义分析运行。"))?;
+            update(&mut run);
+            self.sessions.save_semantic_index_run(&run)?;
+        }
+        Ok(())
+    }
+
+    pub async fn start_semantic_index_run(self: &Arc<Self>) -> Result<SemanticIndexRun, AppError> {
+        let mut active = self.semantic_run_active.lock().await;
+        if active.is_some() {
+            return Err(AppError::embedding(
+                ErrorCode::AnalysisAlreadyRunning,
+                "全局主题分析已在运行。",
+                true,
+            ));
+        }
+        let id = format!(
+            "semantic-{}-{}",
+            super::now_ms(),
+            NEXT_SEMANTIC_RUN.fetch_add(1, Ordering::Relaxed)
+        );
+        let run = SemanticIndexRun {
+            id: id.clone(),
+            state: AnalysisRunState::Queued,
+            stage: SemanticIndexStage::Preparing,
+            embedding_completed: 0,
+            embedding_total: 0,
+            assignment_completed: 0,
+            assignment_total: 0,
+            relation_completed: 0,
+            relation_total: 0,
+            total_calls: 0,
+            result: None,
+            error: None,
+            started_at_unix_ms: super::now_ms() as i64,
+            finished_at_unix_ms: None,
+            interrupted: false,
+        };
+        self.sessions.save_semantic_index_run(&run)?;
+        let cancel = {
+            let mut token = self.semantic_index_cancel.lock().await;
+            token.cancel();
+            *token = CancellationToken::new();
+            token.clone()
+        };
+        *active = Some(id.clone());
+        drop(active);
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            service.drive_semantic_index_run(id, cancel).await;
+        });
+        Ok(run)
+    }
+
+    pub async fn resume_semantic_index_run(
+        self: &Arc<Self>,
+        id: &str,
+    ) -> Result<SemanticIndexRun, AppError> {
+        let mut active = self.semantic_run_active.lock().await;
+        if active.is_some() {
+            return Err(AppError::embedding(
+                ErrorCode::AnalysisAlreadyRunning,
+                "全局主题分析已在运行。",
+                true,
+            ));
+        }
+        let mut run = self
+            .sessions
+            .semantic_index_run(id)?
+            .ok_or_else(|| AppError::store("找不到语义分析运行。"))?;
+        if run.state != AnalysisRunState::Paused || !run.interrupted {
+            return Err(AppError::embedding(
+                ErrorCode::AnalysisUnavailable,
+                "此运行无需自动继续。",
+                false,
+            ));
+        }
+        run.state = AnalysisRunState::Queued;
+        run.stage = SemanticIndexStage::Preparing;
+        run.interrupted = false;
+        run.error = None;
+        run.finished_at_unix_ms = None;
+        self.sessions.save_semantic_index_run(&run)?;
+        let cancel = {
+            let mut token = self.semantic_index_cancel.lock().await;
+            token.cancel();
+            *token = CancellationToken::new();
+            token.clone()
+        };
+        *active = Some(id.to_owned());
+        drop(active);
+        let service = Arc::clone(self);
+        let id = id.to_owned();
+        tokio::spawn(async move {
+            service.drive_semantic_index_run(id, cancel).await;
+        });
+        Ok(run)
+    }
+
+    async fn drive_semantic_index_run(self: Arc<Self>, id: String, cancel: CancellationToken) {
+        let _ = self.update_semantic_run(Some(&id), |run| {
+            if run.state != AnalysisRunState::Cancelling {
+                run.state = AnalysisRunState::Running;
+            }
+        });
+        let result = if cancel.is_cancelled() {
+            Err(AppError::embedding(
+                ErrorCode::EmbeddingCancelled,
+                "全局主题处理已取消。",
+                false,
+            ))
+        } else {
+            self.rebuild_global_semantic_index_inner(cancel.clone(), Some(&id))
+                .await
+        };
+        let _ = self.update_semantic_run(Some(&id), |run| {
+            run.finished_at_unix_ms = Some(super::now_ms() as i64);
+            if cancel.is_cancelled() && run.interrupted {
+                run.state = AnalysisRunState::Paused;
+                run.error = None;
+            } else if cancel.is_cancelled() {
+                run.state = AnalysisRunState::Cancelled;
+                run.error = Some(result.err().unwrap_or_else(|| {
+                    AppError::embedding(
+                        ErrorCode::EmbeddingCancelled,
+                        "全局主题处理已取消；已保存结果保留。",
+                        false,
+                    )
+                }));
+            } else {
+                match result {
+                    Ok(value) => {
+                        run.state = if value.pending_topic_assignments > 0
+                            || value.pending_cross_project_pairs > 0
+                        {
+                            AnalysisRunState::Partial
+                        } else {
+                            AnalysisRunState::Complete
+                        };
+                        run.result = Some(value);
+                    }
+                    Err(error) => {
+                        run.state = AnalysisRunState::Failed;
+                        run.error = Some(error);
+                    }
+                }
+            }
+        });
+        *self.semantic_run_active.lock().await = None;
+    }
+
+    pub async fn interrupt_semantic_run_for_shutdown(&self) {
+        if let Some(id) = self.semantic_run_active.lock().await.clone() {
+            let _ = self.update_semantic_run(Some(&id), |run| {
+                if run.state != AnalysisRunState::Cancelling {
+                    run.interrupted = true;
+                }
+            });
+            self.semantic_index_cancel.lock().await.cancel();
+        }
+    }
+
+    pub fn mark_semantic_recovery_failed(&self, id: &str, error: AppError) -> Result<(), AppError> {
+        self.update_semantic_run(Some(id), |run| {
+            run.interrupted = false;
+            run.state = AnalysisRunState::Failed;
+            run.finished_at_unix_ms = Some(super::now_ms() as i64);
+            run.error = Some(error);
+        })
+    }
+
     pub async fn cancel_semantic_index(&self) {
+        if let Some(id) = self.semantic_run_active.lock().await.clone() {
+            let _ =
+                self.update_semantic_run(Some(&id), |run| run.state = AnalysisRunState::Cancelling);
+        }
         self.semantic_index_cancel.lock().await.cancel();
     }
 
@@ -856,6 +1058,14 @@ impl SourceService {
             *token = CancellationToken::new();
             token.clone()
         };
+        self.rebuild_global_semantic_index_inner(cancel, None).await
+    }
+
+    async fn rebuild_global_semantic_index_inner(
+        &self,
+        cancel: CancellationToken,
+        run_id: Option<&str>,
+    ) -> Result<SemanticIndexResult, AppError> {
         let config = self.embedding_config().await;
         let embedding_revision = self.preferences.lock().await.embedding_revision;
         if config.base_url.is_empty() || config.model.is_empty() {
@@ -906,6 +1116,11 @@ impl SourceService {
         }
         let mut indexed = 0u64;
         let mut actual_model: Option<String> = cached_actual_model.map(str::to_owned);
+        self.update_semantic_run(run_id, |run| {
+            run.stage = SemanticIndexStage::Embedding;
+            run.embedding_total = records.len() as u64;
+            run.embedding_completed = reused;
+        })?;
         for batch in pending.chunks(EMBEDDING_BATCH_SIZE) {
             if cancel.is_cancelled() {
                 return Err(AppError::embedding(
@@ -921,6 +1136,7 @@ impl SourceService {
             let output = self
                 .embedding_complete(&config, Some(embedding_revision), &texts, cancel.clone())
                 .await?;
+            self.update_semantic_run(run_id, |run| run.total_calls += 1)?;
             if actual_model
                 .as_ref()
                 .is_some_and(|model| model != &output.actual_model)
@@ -948,13 +1164,24 @@ impl SourceService {
                     indexed += 1;
                 }
             }
+            self.update_semantic_run(run_id, |run| run.embedding_completed = reused + indexed)?;
         }
         let labels = self.sessions.topic_labels()?;
         let mut topic_assignments = 0u64;
+        let mut processed_assignments = 0u64;
         let mut pending_topic_assignments = 0u64;
         let mut resolved_jev_model: Option<String> = None;
         let mut alias_probe_used = false;
         let mut topic_calls_used = 0usize;
+        self.update_semantic_run(run_id, |run| {
+            run.stage = SemanticIndexStage::TopicAssignment;
+            run.assignment_total = if labels.is_empty() {
+                0
+            } else {
+                records.len() as u64
+            };
+            run.assignment_completed = 0;
+        })?;
         if !labels.is_empty() && !records.is_empty() {
             let (credential, requested_model) = self.jev_request_settings().await?;
             let jev_revision = self.preferences.lock().await.jev_revision;
@@ -968,6 +1195,7 @@ impl SourceService {
                     )),
                     value = self.test_jev_inference() => value?,
                 };
+                self.update_semantic_run(run_id, |run| run.total_calls += 1)?;
                 alias_probe_used = true;
                 if !super::analysis_batch::pinned_jev_model(&probe.actual_model) {
                     return Err(AppError::jev(
@@ -1012,6 +1240,9 @@ impl SourceService {
                 })
                 .collect::<Vec<_>>();
             let pending_count = pending_records.len() as u64;
+            self.update_semantic_run(run_id, |run| {
+                run.assignment_completed = run.assignment_total.saturating_sub(pending_count);
+            })?;
             pending_records
                 .truncate(GLOBAL_RELATION_CALL_LIMIT.saturating_sub(usize::from(alias_probe_used)));
             topic_calls_used = pending_records.len();
@@ -1081,6 +1312,12 @@ impl SourceService {
                 if self.sessions.save_topic_assignment(&assignment, true)? {
                     topic_assignments += 1;
                 }
+                processed_assignments += 1;
+                self.update_semantic_run(run_id, |run| {
+                    run.assignment_completed =
+                        run.assignment_total.saturating_sub(pending_count) + processed_assignments;
+                    run.total_calls += 1;
+                })?;
                 drop(_jev_guard);
             }
         }
@@ -1115,6 +1352,11 @@ impl SourceService {
             &config.model,
             (super::now_ms() / 1000) as i64,
         )?;
+        self.update_semantic_run(run_id, |run| {
+            run.stage = SemanticIndexStage::CrossProjectRelation;
+            run.relation_total = global_candidates.len() as u64;
+            run.relation_completed = 0;
+        })?;
         let (
             cross_project_relations,
             total_cross_project_candidates,
@@ -1140,6 +1382,7 @@ impl SourceService {
                     )),
                     value = self.test_jev_inference() => value?,
                 };
+                self.update_semantic_run(run_id, |run| run.total_calls += 1)?;
                 if !super::analysis_batch::pinned_jev_model(&probe.actual_model) {
                     return Err(AppError::jev(
                         ErrorCode::JevProtocolInvalid,
@@ -1178,6 +1421,9 @@ impl SourceService {
                 })
                 .collect::<Vec<_>>();
             let pending_count = pending_global.len() as u64;
+            self.update_semantic_run(run_id, |run| {
+                run.relation_completed = run.relation_total.saturating_sub(pending_count);
+            })?;
             pending_global.truncate(
                 GLOBAL_RELATION_CALL_LIMIT
                     .saturating_sub(usize::from(alias_probe_used))
@@ -1255,6 +1501,10 @@ impl SourceService {
                 });
                 cross_project_relations += outcome.relations.len() as u64;
                 self.sessions.save_inferred_pair_outcome(&outcome)?;
+                self.update_semantic_run(run_id, |run| {
+                    run.relation_completed += 1;
+                    run.total_calls += 1;
+                })?;
                 drop(_jev_guard);
             }
             if self.preferences.lock().await.jev_revision != jev_revision {
@@ -1322,5 +1572,38 @@ fn topic_assignment(
         service_base_url: service_base_url.into(),
         requested_model: requested_model.into(),
         assigned_at_unix_ms: super::now_ms() as i64,
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn semantic_run_is_visible_before_configuration_failure() {
+        let dir = std::env::temp_dir().join(format!(
+            "codexflow-semantic-progress-{}",
+            super::super::now_ms()
+        ));
+        let service = Arc::new(SourceService::new(dir.clone()).unwrap());
+        let started = service.start_semantic_index_run().await.unwrap();
+        assert_eq!(started.state, AnalysisRunState::Queued);
+        assert_eq!(started.stage, SemanticIndexStage::Preparing);
+        let failed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = service.semantic_index_run(&started.id).unwrap().unwrap();
+                if current.state == AnalysisRunState::Failed {
+                    break current;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            failed.error.unwrap().code,
+            ErrorCode::EmbeddingNotConfigured
+        ));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

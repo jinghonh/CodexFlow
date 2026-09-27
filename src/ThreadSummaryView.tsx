@@ -2,6 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatAppError } from "./appError";
+import { ProgressMeter } from "./ProgressMeter";
+import { summaryProgress } from "./analysisProgress";
+import type { SummaryRun as Run } from "./analysisProgress";
+import { startTrackedThreadSummary } from "./analysisStartIntent";
 
 type Summary = { content: { goal: string; activity: string; outcome: string; decisions: string; issues: string };
   evidenceIds: string[]; model: string; requestedModel?: string | null; serviceBaseUrl?: string | null; createdAtUnixMs: number; sourceUpdatedAt: number; inputDigest?: string };
@@ -10,9 +14,6 @@ type Preview = { model: string; serviceBaseUrl?: string | null; characterLimit: 
   turnsComplete: boolean; itemsComplete: boolean; sourceCurrent: boolean; contentAvailable: boolean;
   readError?: string | null;
   cachedSummary: Summary | null; cacheCurrent: boolean; staleReason?: string | null; analysisBlockedReason: string | null };
-type Run = { id: string; state: "running" | "cancelling" | "complete" | "failed" | "cancelled";
-  model: string; temporaryThreadId: string | null; turnId: string | null; reusedCache: boolean;
-  error: { message: string } | null };
 type Location = { turnId: string; turnOffset: number; offset: number };
 type SummaryEvidenceCheck = { id: string; state: "valid" | "missingThread" | "missingTurn" | "missingItem" |
   "missingFact" | "wrongHierarchy" | "excerptMissing" | "staleVersion"; message: string;
@@ -85,10 +86,20 @@ export function ThreadSummaryView({ threadId, revision, onLocate }: {
     return () => { active = false; window.clearInterval(timer); };
   }, [run?.id, run?.state, threadId]);
 
+  useEffect(() => {
+    let active = true;
+    const timer = window.setInterval(() => {
+      invoke<Run | null>("get_latest_summary_run", { threadId })
+        .then((latest) => { if (active && latest && latest.id !== run?.id) setRun(latest); })
+        .catch(() => {});
+    }, 2000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [threadId, run?.id]);
+
   async function generate() {
     setBusy(true); setError("");
     try {
-      const nextRun = await invoke<Run>("start_thread_summary", { threadId });
+      const nextRun = await startTrackedThreadSummary<Run>(threadId);
       setRun(nextRun);
       if (nextRun.state !== "running" && nextRun.state !== "cancelling")
         setPreview(await invoke<Preview>("get_summary_preview", { threadId }));
@@ -146,6 +157,11 @@ export function ThreadSummaryView({ threadId, revision, onLocate }: {
       {preview.analysisBlockedReason && <em role="alert">{preview.analysisBlockedReason}</em>}
       {summary && <em>{preview.cacheCurrent ? "总结有效" : `总结过期：${preview.staleReason ?? "分析输入已变化"}`}</em>}
     </div>}
+    {busy && <div className="analysis-progress prominent" role="status"><strong>正在准备单条会话总结</strong>
+      <ProgressMeter progress={{ stage: "读取分析材料", completed: 0, total: null, unit: "项", calls: 0 }} label="单条会话总结启动进度" /></div>}
+    {!busy && run && <div className="analysis-progress prominent" role="status"><strong>单条会话总结 · {run.state === "running" ? "执行中" : run.state === "cancelling" ? "取消中" : run.state === "complete" ? "完成" : run.state === "cancelled" ? "已取消" : "失败"}</strong>
+      <ProgressMeter progress={summaryProgress(run)} label="单条会话总结进度" />
+      {run.error && <em>{errorText(run.error)}</em>}</div>}
     {run && <p className="history-lookup-message" role="status">{run.state === "running" ? "分析中" : run.state === "cancelling" ? "取消中，等待回合终态或专用进程退出" : run.state === "complete" ? run.reusedCache ? "已复用有效缓存" : "总结已保存" : run.state === "cancelled" ? "已取消，旧总结保留" : "分析失败，旧总结保留"}{run.error ? `：${errorText(run.error)}` : ""}</p>}
     {error && <p className="page-error" role="alert">{error}</p>}
     {summary ? <div className="summary-fields">{(Object.keys(labels) as (keyof typeof labels)[]).map((key) =>

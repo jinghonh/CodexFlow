@@ -605,6 +605,27 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 }
 
 .topic-index-panel, .topic-label-panel, .topic-thread-panel { margin-top: 18px; }
+
+.analysis-progress.prominent { margin: 14px 0; border-left: 3px solid var(--green); background: color-mix(in srgb, var(--green-soft) 35%, var(--paper)); }
+.model-progress { display: grid; gap: 7px; min-width: 0; font-size: 11px; color: var(--ink); }
+.model-progress-track { position: relative; width: 100%; height: 7px; overflow: hidden; border-radius: 999px; background: var(--green-soft); }
+.model-progress-track > span { display: block; height: 100%; border-radius: inherit; background: var(--green); transition: width .25s ease; }
+.model-progress-track.indeterminate > span { width: 32%; animation: index-progress-slide 1.4s ease-in-out infinite; }
+.model-runs-toggle { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); color: var(--ink); cursor: pointer; font: inherit; }
+.model-runs-toggle strong { display: inline-grid; place-items: center; min-width: 17px; height: 17px; padding: 0 3px; border-radius: 9px; background: var(--green); color: white; font-size: 10px; }
+.model-runs-backdrop { position: fixed; inset: 0; z-index: 50; background: #10231b77; display: flex; justify-content: flex-end; }
+.model-runs-panel { width: min(500px, 100vw); height: 100%; overflow: auto; box-sizing: border-box; padding: 26px; background: var(--paper); box-shadow: -20px 0 50px #0002; color: var(--ink); }
+.model-runs-heading, .model-run-heading, .model-run-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.model-runs-heading { margin-bottom: 20px; }
+.model-runs-heading h2 { margin: 4px 0 0; }
+.model-runs-list { display: grid; gap: 12px; }
+.model-run-card { display: grid; gap: 10px; padding: 15px; border: 1px solid var(--line); border-radius: 9px; background: var(--page); }
+.model-run-card small { color: var(--muted); overflow-wrap: anywhere; }
+.model-run-card p { margin: 0; font-size: 11px; }
+.model-run-heading span { color: var(--green); font-size: 11px; }
+.model-run-error { color: var(--danger); }
+.model-run-actions { justify-content: flex-start; }
+@media (prefers-reduced-motion: reduce) { .model-progress-track.indeterminate > span { animation: none; } }
 .topic-index-heading, .topic-thread-heading { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; }
 .topic-index-heading h2, .topic-thread-heading h2, .topic-label-panel h2 { margin: 4px 0 8px; }
 .topic-index-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }

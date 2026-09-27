@@ -141,6 +141,7 @@ fn validate_limits(limits: &AnalysisLimits) -> Result<(), AppError> {
 }
 
 fn recalculate(run: &mut AnalysisRun) {
+    run.planned_items = run.planned_items.max(run.units.len() as u32);
     run.succeeded = run
         .units
         .iter()
@@ -569,6 +570,47 @@ impl SourceService {
         self.sessions.latest_analysis_run(project_id)
     }
 
+    pub fn analysis_runs(&self) -> Result<Vec<AnalysisRun>, AppError> {
+        self.sessions.analysis_runs()
+    }
+
+    pub fn interrupt_analysis_runs_for_shutdown(&self) {
+        let controls: Vec<_> = self
+            .analysis_active
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        for control in controls {
+            let _guard = self.analysis_update_lock.lock().unwrap();
+            if let Ok(Some(mut run)) = self.sessions.analysis_run(&control.id) {
+                if run.state == AnalysisRunState::Cancelling {
+                    continue;
+                }
+                control.pause.store(true, Ordering::SeqCst);
+                control.queue_pause.cancel();
+                run.interrupted = true;
+                run.pause_reason = Some("应用退出中断；重开后自动继续未完成项。".into());
+                let _ = self.sessions.save_analysis_run(&run);
+                (control.update)(run);
+            }
+        }
+    }
+
+    pub fn mark_analysis_recovery_failed(&self, id: &str, error: AppError) -> Result<(), AppError> {
+        let mut run = self
+            .sessions
+            .analysis_run(id)?
+            .ok_or_else(|| core_error(ErrorCode::AnalysisNotFound, "找不到分析运行。", false))?;
+        run.interrupted = false;
+        run.state = AnalysisRunState::Failed;
+        run.finished_at_unix_ms = Some(self.analysis_now());
+        run.error = Some(error);
+        run.pause_reason = None;
+        self.sessions.save_analysis_run(&run)
+    }
+
     fn save_analysis(&self, run: &mut AnalysisRun, update: &Update) -> Result<(), AppError> {
         let _guard = self.analysis_update_lock.lock().unwrap();
         if self
@@ -647,7 +689,13 @@ impl SourceService {
         let (preview, pending) = self
             .analysis_material(&project_id, limits.clone(), stage_selection)
             .await?;
-        let pending_naming = preview.stages[3].maximum_calls > 0;
+        let pending_naming = preview.stages[2].maximum_calls > 0;
+        let planned_items = preview
+            .stages
+            .iter()
+            .map(|stage| stage.pending_items)
+            .sum::<u64>()
+            .min(u64::from(u32::MAX)) as u32;
         if stage_selection.relations
             && preview.stages[1].pending_items > 0
             && !preview.stages[1].available
@@ -771,6 +819,7 @@ impl SourceService {
             succeeded: 0,
             failed: 0,
             pending: units.len() as u32,
+            planned_items,
             units,
             relations_planned: !stage_selection.relations,
             names_planned: !stage_selection.naming,
@@ -891,6 +940,7 @@ impl SourceService {
             succeeded: 0,
             failed: 0,
             pending: 1,
+            planned_items: 1,
             units: vec![AnalysisUnit {
                 id: candidate_id,
                 stage: AnalysisStage::Relation,
@@ -3336,7 +3386,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!preview.jev_configured);
-        assert_eq!(preview.stages[3].pending_items, 1);
+        assert_eq!(preview.stages[2].pending_items, 1);
         let started = service
             .start_project_analysis("project-test".into(), AnalysisLimits::default(), |_| {})
             .await
@@ -3386,7 +3436,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(changed_limit.stages[3].pending_items, 1);
+        assert_eq!(changed_limit.stages[2].pending_items, 1);
         let stream = service
             .project_workstreams("project-test")
             .unwrap()
@@ -5242,7 +5292,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(preview.stages[0].pending_items, 2);
-        assert_eq!(preview.stages[3].pending_items, 1);
+        assert_eq!(preview.stages[2].pending_items, 1);
         assert!(preview.stages[0].service.contains(&address));
         let started = service
             .start_project_analysis_with_selection("project-test".into(), limits, stages, |_| {})
@@ -5404,7 +5454,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(preview.stages[3].pending_items, 0);
+        assert_eq!(preview.stages[2].pending_items, 0);
         let started = service
             .start_project_analysis_with_selection(
                 "project-test".into(),

@@ -8,6 +8,7 @@ import { ProjectAnalysisView } from "./ProjectAnalysisView";
 import { ProjectTimelineView } from "./ProjectTimelineView";
 import { ProjectWorkstreamsView } from "./ProjectWorkstreamsView";
 import { GlobalTopicsView } from "./GlobalTopicsView";
+import { ModelRunsPanel } from "./ModelRunsPanel";
 import { ThreadHistoryView } from "./ThreadHistoryView";
 import { formatAppError } from "./appError";
 import { ProjectThreadDetailsView } from "./ProjectThreadDetailsView";
@@ -749,6 +750,14 @@ export function App() {
   });
   const activePanelInfo = workspacePanels.find((panel) => panel.id === activePanel)!;
 
+  async function openModelRun(entry: { kind: "project" | "summary" | "semantic"; name: string; projectId?: string; threadId?: string }) {
+    if (entry.projectId && entry.projectId !== projectCatalog?.selectedProjectId)
+      await chooseExistingProject(entry.projectId);
+    if (entry.kind === "semantic") selectPanel("topics");
+    else if (entry.kind === "summary") { selectPanel("sessions"); if (entry.threadId) setSelectedThreadId(entry.threadId); }
+    else selectPanel(entry.name === "候选关系判断" ? "relations" : entry.name === "工作流命名" ? "workstreams" : "sessions");
+  }
+
   return <div className="app-shell">
     <aside className="sidebar">
       <div className="brand"><span className="brand-mark">C<span>F</span></span><div><strong>CodexFlow</strong><small>本地工作过程</small></div></div>
@@ -768,7 +777,7 @@ export function App() {
     </aside>
 
     <main className="content">
-      <header className="topbar"><span>工作空间 / {activePanelInfo.title}</span><div className="topbar-right"><span className="topbar-pulse" />本地桌面应用</div></header>
+      <header className="topbar"><span>工作空间 / {activePanelInfo.title}</span><div className="topbar-right"><ModelRunsPanel onOpen={(entry) => void openModelRun(entry)} /><span className="topbar-pulse" />本地桌面应用</div></header>
       <div className="page-body">
         {activePanel === "connections" && <>
         <div className="eyebrow">准备 / 来源设置 <span /></div>

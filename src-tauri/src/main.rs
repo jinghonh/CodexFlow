@@ -1,12 +1,13 @@
 use codexflow_core::{ProjectThreadQuery, ProjectThreadQueryResult, SourceService};
 use codexflow_domain::{
-    AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisStageSelection, AppError,
-    CandidatePreview, DisplayTheme, EmbeddingStatus, EmbeddingValidation, EvidenceCheck,
-    EvidencePage, FactPage, GlobalTopicView, HistoryCoverage, HistoryItemLocation, HistoryItemPage,
-    HistoryTurnPage, IndexRun, JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog,
-    ProjectGraph, ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview,
-    SemanticIndexResult, SessionList, SourceStatus, SummaryEvidenceCheck, SummaryPreview,
-    SummaryRun, TextStatus, TextValidation, UserRelationDecision,
+    AnalysisLimits, AnalysisPreview, AnalysisRun, AnalysisRunState, AnalysisStage,
+    AnalysisStageSelection, AnalysisUnitState, AppError, CandidatePreview, DisplayTheme,
+    EmbeddingStatus, EmbeddingValidation, EvidenceCheck, EvidencePage, FactPage, GlobalTopicView,
+    HistoryCoverage, HistoryItemLocation, HistoryItemPage, HistoryTurnPage, IndexRun,
+    JevConnectionResult, JevInferenceResult, JevStatus, ProjectCatalog, ProjectGraph,
+    ProjectSessions, ProjectTimeline, ProjectWorkstreams, RelationReview, SemanticIndexResult,
+    SemanticIndexRun, SemanticIndexStage, SessionList, SourceStatus, SummaryEvidenceCheck,
+    SummaryPreview, SummaryRun, SummaryRunState, TextStatus, TextValidation, UserRelationDecision,
 };
 use serde::Serialize;
 use std::sync::Arc;
@@ -274,6 +275,253 @@ async fn rebuild_global_semantic_index(
     state: tauri::State<'_, AppState>,
 ) -> Result<SemanticIndexResult, AppError> {
     service(&state)?.rebuild_global_semantic_index().await
+}
+
+#[tauri::command]
+async fn start_semantic_index_run(
+    state: tauri::State<'_, AppState>,
+) -> Result<SemanticIndexRun, AppError> {
+    service(&state)?.clone().start_semantic_index_run().await
+}
+
+#[tauri::command]
+fn get_semantic_index_run(
+    state: tauri::State<'_, AppState>,
+    run_id: String,
+) -> Result<Option<SemanticIndexRun>, AppError> {
+    service(&state)?.semantic_index_run(&run_id)
+}
+
+#[tauri::command]
+fn get_latest_semantic_index_run(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<SemanticIndexRun>, AppError> {
+    Ok(service(&state)?.semantic_index_runs()?.into_iter().next())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelRunsSnapshot {
+    runs: Vec<ModelRunSummary>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelRunSummary {
+    id: String,
+    kind: &'static str,
+    name: &'static str,
+    state: AnalysisRunState,
+    stage: &'static str,
+    project_id: Option<String>,
+    thread_id: Option<String>,
+    completed: u64,
+    total: Option<u64>,
+    unit: &'static str,
+    calls: u64,
+    started_at_unix_ms: i64,
+    error: Option<String>,
+    result: String,
+    stage_selection: Option<AnalysisStageSelection>,
+}
+
+fn project_run_summary(run: AnalysisRun) -> ModelRunSummary {
+    let selection = run.stage_selection;
+    let (name, stage, unit, work_stage) =
+        if selection.relations && !selection.summary && !selection.naming {
+            (
+                "候选关系判断",
+                if run.units.is_empty() && run.state != AnalysisRunState::Complete {
+                    "准备候选会话对"
+                } else {
+                    "候选关系判断"
+                },
+                "对",
+                Some(AnalysisStage::Relation),
+            )
+        } else if selection.naming && !selection.summary && !selection.relations {
+            (
+                "工作流命名",
+                "工作流命名",
+                "组",
+                Some(AnalysisStage::Naming),
+            )
+        } else if selection.summary && !selection.relations && !selection.naming {
+            (
+                "项目会话总结",
+                "会话总结",
+                "条",
+                Some(AnalysisStage::Summary),
+            )
+        } else {
+            let stage = match run
+                .units
+                .iter()
+                .find(|unit| unit.state == AnalysisUnitState::Running)
+                .map(|unit| unit.stage)
+            {
+                Some(AnalysisStage::Relation | AnalysisStage::EvidenceSelection) => "候选关系判断",
+                Some(AnalysisStage::Naming) => "工作流命名",
+                _ => "会话总结",
+            };
+            ("项目分析", stage, "项", None)
+        };
+    let units: Vec<_> = run
+        .units
+        .iter()
+        .filter(|unit| {
+            work_stage.map_or(true, |stage| {
+                unit.stage == stage
+                    || (stage == AnalysisStage::Relation
+                        && unit.stage == AnalysisStage::EvidenceSelection)
+            })
+        })
+        .collect();
+    let completed = units
+        .iter()
+        .filter(|unit| {
+            matches!(
+                unit.state,
+                AnalysisUnitState::Succeeded | AnalysisUnitState::Failed
+            )
+        })
+        .count() as u64;
+    let total = u64::from(run.planned_items).max(units.len() as u64);
+    ModelRunSummary {
+        id: run.id,
+        kind: "project",
+        name,
+        state: run.state,
+        stage,
+        project_id: Some(run.project_id),
+        thread_id: None,
+        completed,
+        total: (total > 0 || run.state == AnalysisRunState::Complete).then_some(total),
+        unit,
+        calls: u64::from(run.total_calls),
+        started_at_unix_ms: run.started_at_unix_ms,
+        error: run.error.map(|error| error.message).or(run.pause_reason),
+        result: format!(
+            "成功 {} · 失败 {} · 待处理 {}",
+            run.succeeded, run.failed, run.pending
+        ),
+        stage_selection: Some(selection),
+    }
+}
+
+fn summary_run_summary(run: SummaryRun) -> ModelRunSummary {
+    let state = match run.state {
+        SummaryRunState::Running => AnalysisRunState::Running,
+        SummaryRunState::Cancelling => AnalysisRunState::Cancelling,
+        SummaryRunState::Complete => AnalysisRunState::Complete,
+        SummaryRunState::Failed => AnalysisRunState::Failed,
+        SummaryRunState::Cancelled => AnalysisRunState::Cancelled,
+    };
+    ModelRunSummary {
+        id: run.id,
+        kind: "summary",
+        name: "单条会话总结",
+        state,
+        stage: "生成会话总结",
+        project_id: run.project_id,
+        thread_id: Some(run.thread_id),
+        completed: u64::from(matches!(
+            run.state,
+            SummaryRunState::Complete | SummaryRunState::Failed
+        )),
+        total: Some(1),
+        unit: "条",
+        calls: u64::from(run.model_calls),
+        started_at_unix_ms: run.started_at_unix_ms,
+        error: run.error.map(|error| error.message),
+        result: if run.state == SummaryRunState::Complete {
+            if run.reused_cache {
+                "已复用有效总结"
+            } else {
+                "总结已保存"
+            }
+        } else if run.state == SummaryRunState::Failed {
+            "旧总结仍保留"
+        } else {
+            ""
+        }
+        .into(),
+        stage_selection: None,
+    }
+}
+
+fn semantic_run_summary(run: SemanticIndexRun) -> ModelRunSummary {
+    let (stage, completed, total, unit) = match run.stage {
+        SemanticIndexStage::Preparing => ("准备全局主题分析", 0, None, "项"),
+        SemanticIndexStage::Embedding => (
+            "生成语义向量",
+            run.embedding_completed,
+            Some(run.embedding_total),
+            "条",
+        ),
+        SemanticIndexStage::TopicAssignment => (
+            "分配主题",
+            run.assignment_completed,
+            Some(run.assignment_total),
+            "条",
+        ),
+        SemanticIndexStage::CrossProjectRelation => (
+            "判断跨项目候选关系",
+            run.relation_completed,
+            Some(run.relation_total),
+            "对",
+        ),
+    };
+    ModelRunSummary {
+        id: run.id,
+        kind: "semantic",
+        name: "全局主题处理",
+        state: run.state,
+        stage,
+        project_id: None,
+        thread_id: None,
+        completed,
+        total,
+        unit,
+        calls: run.total_calls,
+        started_at_unix_ms: run.started_at_unix_ms,
+        error: run.error.map(|error| error.message),
+        result: run
+            .result
+            .map(|result| {
+                format!(
+                    "新增向量 {} · 主题归属 {} · 跨项目关系 {}",
+                    result.indexed, result.topic_assignments, result.cross_project_relations
+                )
+            })
+            .unwrap_or_default(),
+        stage_selection: None,
+    }
+}
+
+#[tauri::command]
+fn get_model_runs(state: tauri::State<'_, AppState>) -> Result<ModelRunsSnapshot, AppError> {
+    let service = service(&state)?;
+    let mut runs: Vec<ModelRunSummary> = service
+        .analysis_runs()?
+        .into_iter()
+        .map(project_run_summary)
+        .collect();
+    runs.extend(
+        service
+            .summary_runs()?
+            .into_iter()
+            .filter(|run| !run.from_batch)
+            .map(summary_run_summary),
+    );
+    runs.extend(
+        service
+            .semantic_index_runs()?
+            .into_iter()
+            .map(semantic_run_summary),
+    );
+    runs.sort_by(|left, right| right.started_at_unix_ms.cmp(&left.started_at_unix_ms));
+    Ok(ModelRunsSnapshot { runs })
 }
 
 #[tauri::command]
@@ -672,9 +920,67 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
-            app.manage(AppState {
-                service: SourceService::new(data_dir).map(Arc::new),
-            });
+            let service = SourceService::new(data_dir).map(Arc::new);
+            if let Ok(recovery) = &service {
+                let recovery = Arc::clone(recovery);
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Ok(runs) = recovery.analysis_runs() {
+                        for run in runs.into_iter().filter(|run| {
+                            run.interrupted
+                                && run.state == codexflow_domain::AnalysisRunState::Paused
+                        }) {
+                            let app = handle.clone();
+                            if let Err(error) = recovery
+                                .continue_analysis_run(
+                                    &run.id,
+                                    run.limits.call_limit,
+                                    move |updated| {
+                                        let _ = app.emit("analysis-run", updated);
+                                    },
+                                )
+                                .await
+                            {
+                                let _ = recovery.mark_analysis_recovery_failed(&run.id, error);
+                            }
+                        }
+                    }
+                    if let Ok(runs) = recovery.summary_runs() {
+                        for run in runs.into_iter().filter(|run| {
+                            !run.from_batch
+                                && run.interrupted
+                                && run.state == codexflow_domain::SummaryRunState::Failed
+                        }) {
+                            if recovery
+                                .latest_summary_run(&run.thread_id)
+                                .ok()
+                                .flatten()
+                                .as_ref()
+                                .map(|latest| latest.id.as_str())
+                                != Some(run.id.as_str())
+                            {
+                                continue;
+                            }
+                            if let Err(error) =
+                                recovery.start_thread_summary(run.thread_id.clone()).await
+                            {
+                                let _ = recovery.mark_summary_recovery_failed(&run.id, error);
+                            }
+                        }
+                    }
+                    if let Ok(runs) = recovery.semantic_index_runs() {
+                        for run in runs.into_iter().filter(|run| {
+                            run.interrupted
+                                && run.state == codexflow_domain::AnalysisRunState::Paused
+                        }) {
+                            if let Err(error) = recovery.resume_semantic_index_run(&run.id).await {
+                                let _ = recovery.mark_semantic_recovery_failed(&run.id, error);
+                            }
+                        }
+                    }
+                });
+            }
+            app.manage(AppState { service });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -706,6 +1012,10 @@ fn main() {
             delete_topic_label,
             set_thread_topic,
             rebuild_global_semantic_index,
+            start_semantic_index_run,
+            get_semantic_index_run,
+            get_latest_semantic_index_run,
+            get_model_runs,
             cancel_semantic_index,
             get_session_list,
             load_thread_history,

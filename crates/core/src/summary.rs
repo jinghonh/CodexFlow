@@ -487,6 +487,38 @@ impl SourceService {
         self.sessions.summary_run(id)
     }
 
+    pub fn summary_runs(&self) -> Result<Vec<SummaryRun>, AppError> {
+        self.sessions.summary_runs()
+    }
+
+    pub fn interrupt_summary_runs_for_shutdown(&self) {
+        let active: Vec<_> = self
+            .summary_active
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in active {
+            if let Ok(Some(mut run)) = self.sessions.summary_run(&id) {
+                if run.cancel_requested {
+                    continue;
+                }
+                run.interrupted = true;
+                let _ = self.sessions.save_summary_run(&run);
+            }
+        }
+    }
+
+    pub fn mark_summary_recovery_failed(&self, id: &str, error: AppError) -> Result<(), AppError> {
+        let mut run = self.sessions.summary_run(id)?.ok_or_else(|| {
+            AppError::codex(ErrorCode::AnalysisNotFound, "找不到总结运行。", false)
+        })?;
+        run.interrupted = false;
+        run.error = Some(error);
+        self.sessions.save_summary_run(&run)
+    }
+
     pub fn inspect_summary_evidence(
         &self,
         thread_id: &str,
@@ -646,6 +678,7 @@ impl SourceService {
         if let Some((active_id, token)) = active.get(&run.thread_id) {
             if active_id == id && run.state == SummaryRunState::Running {
                 run.state = SummaryRunState::Cancelling;
+                run.cancel_requested = true;
                 self.sessions.save_summary_run(&run)?;
                 token.cancel();
             }
@@ -805,6 +838,7 @@ impl SourceService {
         let run = SummaryRun {
             id: id.clone(),
             thread_id: thread_id.clone(),
+            project_id: self.sessions.thread_project_id(&thread_id)?,
             state: if reused {
                 SummaryRunState::Complete
             } else {
@@ -820,6 +854,10 @@ impl SourceService {
             temporary_thread_id: None,
             turn_id: None,
             reused_cache: reused,
+            model_calls: 0,
+            from_batch,
+            cancel_requested: false,
+            interrupted: false,
             error: None,
         };
         self.sessions.save_summary_run(&run)?;
@@ -870,23 +908,38 @@ impl SourceService {
                         false,
                     ))
                 } else {
-                    analyzer
-                        .summarize(prepared.prompt, token.clone(), move |event| {
-                            let Some(mut current) = service.sessions.summary_run(&run_id)? else {
-                                return Ok(());
-                            };
-                            match event {
-                                AnalysisEvent::Thread(id) => current.temporary_thread_id = Some(id),
-                                AnalysisEvent::Turn(id) => current.turn_id = Some(id),
-                                AnalysisEvent::Model(model) => current.model = model,
-                                AnalysisEvent::Cancelling => {
-                                    current.state = SummaryRunState::Cancelling
+                    let recorded = (|| -> Result<(), AppError> {
+                        let mut current = self
+                            .sessions
+                            .summary_run(&run_id)?
+                            .ok_or_else(|| AppError::store("找不到总结运行。"))?;
+                        current.model_calls = current.model_calls.saturating_add(1);
+                        self.sessions.save_summary_run(&current)
+                    })();
+                    if let Err(error) = recorded {
+                        Err(error)
+                    } else {
+                        analyzer
+                            .summarize(prepared.prompt, token.clone(), move |event| {
+                                let Some(mut current) = service.sessions.summary_run(&run_id)?
+                                else {
+                                    return Ok(());
+                                };
+                                match event {
+                                    AnalysisEvent::Thread(id) => {
+                                        current.temporary_thread_id = Some(id)
+                                    }
+                                    AnalysisEvent::Turn(id) => current.turn_id = Some(id),
+                                    AnalysisEvent::Model(model) => current.model = model,
+                                    AnalysisEvent::Cancelling => {
+                                        current.state = SummaryRunState::Cancelling
+                                    }
+                                    AnalysisEvent::Terminal(_) => {}
                                 }
-                                AnalysisEvent::Terminal(_) => {}
-                            }
-                            service.sessions.save_summary_run(&current)
-                        })
-                        .await
+                                service.sessions.save_summary_run(&current)
+                            })
+                            .await
+                    }
                 }
             }
             Err(error) => Err(error),
@@ -972,6 +1025,16 @@ impl SourceService {
         if let Ok(Some(current)) = self.sessions.summary_run(&run.id) {
             run.temporary_thread_id = current.temporary_thread_id;
             run.turn_id = current.turn_id;
+            run.model_calls = current.model_calls;
+            if current.interrupted && run.state != SummaryRunState::Complete {
+                run.interrupted = true;
+                run.state = SummaryRunState::Failed;
+                run.error = Some(AppError::codex(
+                    ErrorCode::AnalysisUnavailable,
+                    "应用退出中断了总结；重开后将自动重试。",
+                    true,
+                ));
+            }
             if run.state != SummaryRunState::Complete {
                 run.model = current.model;
             }
@@ -1112,6 +1175,7 @@ mod tests {
             let run = SummaryRun {
                 id: format!("gate-{index}"),
                 thread_id: "thread-h".into(),
+                project_id: None,
                 state: SummaryRunState::Running,
                 model: "受控模型".into(),
                 started_at_unix_ms: 1,
@@ -1119,6 +1183,10 @@ mod tests {
                 temporary_thread_id: None,
                 turn_id: None,
                 reused_cache: false,
+                model_calls: 0,
+                from_batch: false,
+                cancel_requested: false,
+                interrupted: false,
                 error: None,
             };
             service.sessions.save_summary_run(&run).unwrap();

@@ -3,13 +3,14 @@ use codexflow_domain::{
     DerivedRelation, EvidencePage, FactPage, HistoryCoverage, HistoryItem, HistoryItemLocation,
     HistoryItemPage, HistorySnapshot, HistoryTurn, HistoryTurnPage, IndexRun, IndexRunState,
     InferredPairOutcome, InferredRelation, ListScopeStatus, LocalProject, ObservedRelation,
-    Preferences, ProjectCatalog, ProjectSessions, RelationReview, SemanticVector, SessionList,
-    SourceEvidence, SourceFact, SummaryRun, SummaryRunState, ThreadAttribution, ThreadMetadata,
-    ThreadSummary, ThreadTopicAssignment, TopicLabel, UserRelationDecision, Workstream,
+    Preferences, ProjectCatalog, ProjectSessions, RelationReview, SemanticIndexRun, SemanticVector,
+    SessionList, SourceEvidence, SourceFact, SummaryRun, SummaryRunState, ThreadAttribution,
+    ThreadMetadata, ThreadSummary, ThreadTopicAssignment, TopicLabel, UserRelationDecision,
+    Workstream,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -20,7 +21,7 @@ pub struct PreferenceStore {
     legacy_path: PathBuf,
 }
 
-const SESSION_SCHEMA_VERSION: i64 = 16;
+const SESSION_SCHEMA_VERSION: i64 = 17;
 
 pub struct SessionStore {
     path: PathBuf,
@@ -241,6 +242,7 @@ impl SessionStore {
             store.recover_interrupted_runs()?;
             store.recover_interrupted_summary_runs()?;
             store.recover_interrupted_analysis_runs()?;
+            store.recover_interrupted_semantic_runs()?;
             return Ok(store);
         }
         let mut migration = connection
@@ -605,12 +607,26 @@ impl SessionStore {
                 )
                 .map_err(|_| AppError::migration("迁移语义索引与主题数据库失败，原数据已保留。"))?;
         }
+        if version < 17 {
+            migration
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS semantic_index_runs (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        started_at INTEGER NOT NULL,
+                        run_json TEXT NOT NULL
+                    );
+                    CREATE INDEX IF NOT EXISTS semantic_index_runs_started ON semantic_index_runs(started_at DESC);
+                    PRAGMA user_version = 17;",
+                )
+                .map_err(|_| AppError::migration("迁移语义分析运行数据库失败，原数据已保留。"))?;
+        }
         migration
             .commit()
             .map_err(|_| AppError::migration("提交会话数据库升级失败，原数据已保留。"))?;
         store.recover_interrupted_runs()?;
         store.recover_interrupted_summary_runs()?;
         store.recover_interrupted_analysis_runs()?;
+        store.recover_interrupted_semantic_runs()?;
         Ok(store)
     }
 
@@ -1189,6 +1205,21 @@ impl SessionStore {
         .transpose()
     }
 
+    pub fn analysis_runs(&self) -> Result<Vec<AnalysisRun>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT run_json FROM analysis_runs ORDER BY started_at DESC,id DESC")
+            .map_err(|_| AppError::store("读取分析运行列表失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询分析运行列表失败。"))?;
+        rows.map(|row| {
+            let json = row.map_err(|_| AppError::store("读取分析运行列表失败。"))?;
+            serde_json::from_str(&json).map_err(|_| AppError::store("分析运行状态损坏。"))
+        })
+        .collect()
+    }
+
     fn recover_interrupted_analysis_runs(&self) -> Result<(), AppError> {
         let connection = self.connection()?;
         let mut query = connection
@@ -1206,9 +1237,15 @@ impl SessionStore {
                 run.state,
                 AnalysisRunState::Queued | AnalysisRunState::Running | AnalysisRunState::Cancelling
             ) {
-                run.state = AnalysisRunState::Paused;
-                run.pause_reason = Some("上次运行因应用退出而中断，可继续未完成单元。".into());
-                run.interrupted = true;
+                let user_cancelled = run.state == AnalysisRunState::Cancelling && !run.interrupted;
+                run.state = if user_cancelled {
+                    AnalysisRunState::Cancelled
+                } else {
+                    AnalysisRunState::Paused
+                };
+                run.pause_reason = (!user_cancelled)
+                    .then(|| "上次运行因应用退出而中断，可继续未完成单元。".into());
+                run.interrupted = !user_cancelled;
                 run.finished_at_unix_ms = Some(now_ms() as i64);
                 for unit in &mut run.units {
                     if unit.state == AnalysisUnitState::Running {
@@ -1554,7 +1591,31 @@ impl SessionStore {
         .transpose()
     }
 
+    pub fn summary_runs(&self) -> Result<Vec<SummaryRun>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT run_json FROM summary_runs ORDER BY started_at DESC,id DESC")
+            .map_err(|_| AppError::store("读取总结运行列表失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询总结运行列表失败。"))?;
+        rows.map(|row| {
+            let json = row.map_err(|_| AppError::store("读取总结运行列表失败。"))?;
+            serde_json::from_str(&json).map_err(|_| AppError::store("总结运行状态损坏。"))
+        })
+        .collect()
+    }
+
     fn recover_interrupted_summary_runs(&self) -> Result<(), AppError> {
+        let batch_run_ids: HashSet<String> = self
+            .analysis_runs()?
+            .into_iter()
+            .flat_map(|run| {
+                run.units
+                    .into_iter()
+                    .filter_map(|unit| unit.active_summary_run_id)
+            })
+            .collect();
         let connection = self.connection()?;
         let mut query = connection
             .prepare("SELECT run_json FROM summary_runs")
@@ -1571,13 +1632,21 @@ impl SessionStore {
                 run.state,
                 SummaryRunState::Running | SummaryRunState::Cancelling
             ) {
-                run.state = SummaryRunState::Failed;
+                run.from_batch |= batch_run_ids.contains(&run.id);
+                run.state = if run.cancel_requested {
+                    SummaryRunState::Cancelled
+                } else {
+                    SummaryRunState::Failed
+                };
+                run.interrupted = !run.cancel_requested;
                 run.finished_at_unix_ms = Some(now_ms() as i64);
-                run.error = Some(AppError::codex(
-                    codexflow_domain::ErrorCode::AnalysisUnavailable,
-                    "上次总结运行因应用退出而中断；旧总结已保留。",
-                    true,
-                ));
+                run.error = (!run.cancel_requested).then(|| {
+                    AppError::codex(
+                        codexflow_domain::ErrorCode::AnalysisUnavailable,
+                        "上次总结运行因应用退出而中断；旧总结已保留。",
+                        true,
+                    )
+                });
                 interrupted.push(run);
             }
         }
@@ -1585,6 +1654,70 @@ impl SessionStore {
         drop(connection);
         for run in interrupted {
             self.save_summary_run(&run)?;
+        }
+        Ok(())
+    }
+
+    pub fn save_semantic_index_run(&self, run: &SemanticIndexRun) -> Result<(), AppError> {
+        let json =
+            serde_json::to_string(run).map_err(|_| AppError::store("序列化语义分析运行失败。"))?;
+        self.connection()?
+            .execute(
+                "INSERT INTO semantic_index_runs(id,started_at,run_json) VALUES (?1,?2,?3)
+             ON CONFLICT(id) DO UPDATE SET run_json=excluded.run_json",
+                params![run.id, run.started_at_unix_ms, json],
+            )
+            .map_err(|_| AppError::store("保存语义分析运行失败。"))?;
+        Ok(())
+    }
+
+    pub fn semantic_index_run(&self, id: &str) -> Result<Option<SemanticIndexRun>, AppError> {
+        let json: Option<String> = self
+            .connection()?
+            .query_row(
+                "SELECT run_json FROM semantic_index_runs WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| AppError::store("读取语义分析运行失败。"))?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::store("语义分析运行状态损坏。"))
+        })
+        .transpose()
+    }
+
+    pub fn semantic_index_runs(&self) -> Result<Vec<SemanticIndexRun>, AppError> {
+        let connection = self.connection()?;
+        let mut query = connection
+            .prepare("SELECT run_json FROM semantic_index_runs ORDER BY started_at DESC,id DESC")
+            .map_err(|_| AppError::store("读取语义分析运行列表失败。"))?;
+        let rows = query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| AppError::store("查询语义分析运行列表失败。"))?;
+        rows.map(|row| {
+            let json = row.map_err(|_| AppError::store("读取语义分析运行列表失败。"))?;
+            serde_json::from_str(&json).map_err(|_| AppError::store("语义分析运行状态损坏。"))
+        })
+        .collect()
+    }
+
+    fn recover_interrupted_semantic_runs(&self) -> Result<(), AppError> {
+        for mut run in self.semantic_index_runs()? {
+            if matches!(
+                run.state,
+                AnalysisRunState::Queued | AnalysisRunState::Running | AnalysisRunState::Cancelling
+            ) {
+                let user_cancelled = run.state == AnalysisRunState::Cancelling && !run.interrupted;
+                run.state = if user_cancelled {
+                    AnalysisRunState::Cancelled
+                } else {
+                    AnalysisRunState::Paused
+                };
+                run.interrupted = !user_cancelled;
+                run.finished_at_unix_ms = Some(now_ms() as i64);
+                self.save_semantic_index_run(&run)?;
+            }
         }
         Ok(())
     }
@@ -3718,7 +3851,7 @@ mod tests {
         let path = dir.join("sessions.sqlite3");
         let connection = Connection::open(&path).unwrap();
         connection
-            .execute_batch("PRAGMA user_version = 16;")
+            .execute_batch("PRAGMA user_version = 18;")
             .unwrap();
         drop(connection);
         let error = SessionStore::new(dir.clone())
@@ -3737,7 +3870,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 16);
+        assert_eq!(version, SESSION_SCHEMA_VERSION + 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -3922,12 +4055,13 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 15);
+            assert_eq!(version, SESSION_SCHEMA_VERSION);
             for table in [
                 "automatic_candidate_views",
                 "thread_summaries",
                 "summary_runs",
                 "analysis_runs",
+                "semantic_index_runs",
                 "inferred_pair_outcomes",
                 "relation_reviews",
             ] {
@@ -3976,6 +4110,7 @@ mod tests {
         let run = SummaryRun {
             id: "summary-run".into(),
             thread_id: "thread-h".into(),
+            project_id: None,
             state: SummaryRunState::Cancelling,
             model: "model".into(),
             started_at_unix_ms: 1,
@@ -3983,15 +4118,86 @@ mod tests {
             temporary_thread_id: Some("temporary".into()),
             turn_id: Some("turn".into()),
             reused_cache: false,
+            model_calls: 0,
+            from_batch: false,
+            cancel_requested: false,
+            interrupted: false,
             error: None,
         };
         store.save_summary_run(&run).unwrap();
+        let mut user_cancelled = run.clone();
+        user_cancelled.id = "summary-user-cancelled".into();
+        user_cancelled.cancel_requested = true;
+        store.save_summary_run(&user_cancelled).unwrap();
         drop(store);
         let reopened = SessionStore::new(dir.clone()).unwrap();
         let recovered = reopened.summary_run("summary-run").unwrap().unwrap();
         assert_eq!(recovered.state, SummaryRunState::Failed);
+        assert!(recovered.interrupted);
         assert!(recovered.finished_at_unix_ms.is_some());
         assert!(recovered.error.is_some());
+        let cancelled = reopened
+            .summary_run("summary-user-cancelled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, SummaryRunState::Cancelled);
+        assert!(!cancelled.interrupted);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn semantic_progress_survives_restart_and_user_cancellation_stays_cancelled() {
+        use codexflow_domain::SemanticIndexStage;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("codexflow-semantic-run-{nonce}"));
+        let store = SessionStore::new(dir.clone()).unwrap();
+        let mut running = SemanticIndexRun {
+            id: "semantic-running".into(),
+            state: AnalysisRunState::Running,
+            stage: SemanticIndexStage::TopicAssignment,
+            embedding_completed: 8,
+            embedding_total: 8,
+            assignment_completed: 3,
+            assignment_total: 8,
+            relation_completed: 0,
+            relation_total: 0,
+            total_calls: 4,
+            result: None,
+            error: None,
+            started_at_unix_ms: 1,
+            finished_at_unix_ms: None,
+            interrupted: false,
+        };
+        store.save_semantic_index_run(&running).unwrap();
+        running.id = "semantic-cancelled".into();
+        running.state = AnalysisRunState::Cancelling;
+        store.save_semantic_index_run(&running).unwrap();
+        drop(store);
+
+        let reopened = SessionStore::new(dir.clone()).unwrap();
+        let resumed = reopened
+            .semantic_index_run("semantic-running")
+            .unwrap()
+            .unwrap();
+        assert_eq!(resumed.state, AnalysisRunState::Paused);
+        assert!(resumed.interrupted);
+        assert_eq!(
+            (
+                resumed.embedding_completed,
+                resumed.assignment_completed,
+                resumed.total_calls
+            ),
+            (8, 3, 4)
+        );
+        let cancelled = reopened
+            .semantic_index_run("semantic-cancelled")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.state, AnalysisRunState::Cancelled);
+        assert!(!cancelled.interrupted);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -4304,7 +4510,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, SESSION_SCHEMA_VERSION);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -4365,7 +4571,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, SESSION_SCHEMA_VERSION);
         let mut second = item.clone();
         second.turn_id = "turn-new".into();
         connection.execute(
@@ -4526,7 +4732,7 @@ mod tests {
                 .query_row("SELECT COUNT(*) FROM threads", [], |row| row.get(0))
                 .unwrap(),
         );
-        assert_eq!((version, count), (15, 1));
+        assert_eq!((version, count), (SESSION_SCHEMA_VERSION, 1));
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -4559,7 +4765,7 @@ mod tests {
         let version: i64 = connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 15);
+        assert_eq!(version, SESSION_SCHEMA_VERSION);
         assert!(store.latest_index_run().unwrap().is_none());
         let _ = fs::remove_dir_all(dir);
     }
@@ -4662,7 +4868,7 @@ mod tests {
             let version: i64 = connection
                 .query_row("PRAGMA user_version", [], |row| row.get(0))
                 .unwrap();
-            assert_eq!(version, 15);
+            assert_eq!(version, SESSION_SCHEMA_VERSION);
             let tables: i64 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('index_runs', 'observed_relations')",

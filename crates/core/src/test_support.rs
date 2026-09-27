@@ -36,9 +36,8 @@ pub(crate) fn fake_codex_binary(script: &Path) -> PathBuf {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        script
+        fs::set_permissions(script, fs::Permissions::from_mode(0o700)).unwrap();
+        script.to_path_buf()
     }
 
     #[cfg(windows)]

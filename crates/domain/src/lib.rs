@@ -440,6 +440,8 @@ pub struct AnalysisRun {
     pub succeeded: u32,
     pub failed: u32,
     pub pending: u32,
+    #[serde(default)]
+    pub planned_items: u32,
     pub units: Vec<AnalysisUnit>,
     #[serde(default)]
     pub relations_planned: bool,
@@ -800,6 +802,35 @@ pub struct SemanticIndexResult {
     pub pending_cross_project_pairs: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SemanticIndexStage {
+    Preparing,
+    Embedding,
+    TopicAssignment,
+    CrossProjectRelation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SemanticIndexRun {
+    pub id: String,
+    pub state: AnalysisRunState,
+    pub stage: SemanticIndexStage,
+    pub embedding_completed: u64,
+    pub embedding_total: u64,
+    pub assignment_completed: u64,
+    pub assignment_total: u64,
+    pub relation_completed: u64,
+    pub relation_total: u64,
+    pub total_calls: u64,
+    pub result: Option<SemanticIndexResult>,
+    pub error: Option<AppError>,
+    pub started_at_unix_ms: i64,
+    pub finished_at_unix_ms: Option<i64>,
+    pub interrupted: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadSummaryEvidence {
@@ -864,6 +895,8 @@ pub enum SummaryRunState {
 pub struct SummaryRun {
     pub id: String,
     pub thread_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub state: SummaryRunState,
     pub model: String,
     pub started_at_unix_ms: i64,
@@ -871,6 +904,14 @@ pub struct SummaryRun {
     pub temporary_thread_id: Option<String>,
     pub turn_id: Option<String>,
     pub reused_cache: bool,
+    #[serde(default)]
+    pub model_calls: u32,
+    #[serde(default)]
+    pub from_batch: bool,
+    #[serde(default)]
+    pub cancel_requested: bool,
+    #[serde(default)]
+    pub interrupted: bool,
     pub error: Option<AppError>,
 }
 

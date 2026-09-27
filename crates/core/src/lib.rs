@@ -69,6 +69,8 @@ pub struct SourceService {
     embedding_cancel: Mutex<CancellationToken>,
     embedding_validation_cancel: Mutex<CancellationToken>,
     semantic_index_cancel: Mutex<CancellationToken>,
+    semantic_run_active: Mutex<Option<String>>,
+    semantic_update_lock: std::sync::Mutex<()>,
     refresh_active: std::sync::Mutex<Option<(String, CancellationToken)>>,
     summary_active:
         std::sync::Mutex<std::collections::HashMap<String, (String, CancellationToken)>>,
@@ -165,6 +167,8 @@ impl SourceService {
             embedding_cancel: Mutex::new(CancellationToken::new()),
             embedding_validation_cancel: Mutex::new(CancellationToken::new()),
             semantic_index_cancel: Mutex::new(CancellationToken::new()),
+            semantic_run_active: Mutex::new(None),
+            semantic_update_lock: std::sync::Mutex::new(()),
             refresh_active: std::sync::Mutex::new(None),
             summary_active: std::sync::Mutex::new(std::collections::HashMap::new()),
             analysis_active: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -435,16 +439,9 @@ impl SourceService {
     }
 
     pub async fn shutdown(&self) {
-        let runs: Vec<_> = self
-            .analysis_active
-            .lock()
-            .unwrap()
-            .values()
-            .map(|control| control.id.clone())
-            .collect();
-        for id in runs {
-            let _ = self.cancel_analysis_run(&id).await;
-        }
+        self.interrupt_analysis_runs_for_shutdown();
+        self.interrupt_summary_runs_for_shutdown();
+        self.interrupt_semantic_run_for_shutdown().await;
         self.cancel_jev().await;
         for (_, token) in self.summary_active.lock().unwrap().values() {
             token.cancel();
@@ -4083,6 +4080,7 @@ mod tests {
             .save_summary_run(&SummaryRun {
                 id: "summary-interrupted".into(),
                 thread_id: "a".into(),
+                project_id: Some(project_id.clone()),
                 state: SummaryRunState::Running,
                 model: "synthetic-model".into(),
                 started_at_unix_ms: 6,
@@ -4090,6 +4088,10 @@ mod tests {
                 temporary_thread_id: None,
                 turn_id: None,
                 reused_cache: false,
+                model_calls: 0,
+                from_batch: false,
+                cancel_requested: false,
+                interrupted: false,
                 error: None,
             })
             .unwrap();
@@ -4125,6 +4127,7 @@ mod tests {
                 succeeded: 1,
                 failed: 0,
                 pending: 1,
+                planned_items: 2,
                 units: [AnalysisUnitState::Succeeded, AnalysisUnitState::Running]
                     .into_iter()
                     .enumerate()

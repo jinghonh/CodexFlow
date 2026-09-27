@@ -3,30 +3,24 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { formatAppError } from "./appError";
 import { loadProjectQuery, useProjectQueryCache } from "./projectQueryCache";
+import { ProgressMeter } from "./ProgressMeter";
+import { projectProgress, projectStateNames } from "./analysisProgress";
+import type { ProjectRun as Run, StageSelection } from "./analysisProgress";
+import { startTrackedProjectAnalysis } from "./analysisStartIntent";
 
 type Limits = { callLimit: number; concurrencyLimit: number; timeoutSeconds: number; retryLimit: number; inputCharacterLimit: number };
-type StageSelection = { summary: boolean; relations: boolean; naming: boolean };
 type PanelStage = "summary" | "relations" | "naming";
 type Stage = { stage: "summary" | "relation" | "evidenceSelection" | "naming"; service: string; model: string;
   sendScope: string; pendingItems: number; maximumCalls: number; available: boolean; note: string };
 type Preview = { projectId: string; inputVersion: string; stages: Stage[]; cachedSummaries: number;
   unavailableSummaries: number; maximumCandidates: number; evidenceSelectionCallLimit: number;
   pendingGroups: number | null; limits: Limits; jevConfigured: boolean };
-type Run = { id: string; projectId: string; state: "queued" | "running" | "cancelling" | "cancelled" | "paused" | "complete" | "partial" | "failed";
-  pauseReason: string | null; batchNumber: number; batchCalls: number; totalCalls: number; totalQuestions: number;
-  stageSelection?: StageSelection;
-  jevPinnedModel?: string | null; jevProbeAttempts?: number;
-  inputTokens: number | null; outputTokens: number | null; processed: number; succeeded: number; failed: number; pending: number;
-  interrupted: boolean; error: { message: string } | null; limits: Limits;
-  units: { id: string; stage: Stage["stage"]; state: string; attempts: number; actualModel: string | null; error: { message: string } | null }[] };
 
 const maxConcurrencyLimit = 10;
 const maxRetryLimit = 5;
 const initialLimits: Limits = { callLimit: 100, concurrencyLimit: 2, timeoutSeconds: 180, retryLimit: 2, inputCharacterLimit: 40000 };
 const stageNames: Record<Stage["stage"], string> = { summary: "会话总结", relation: "候选关系判断", evidenceSelection: "证据选择", naming: "工作流命名" };
 const panelStageNames: Record<PanelStage, string> = { summary: "会话总结", relations: "候选关系判断", naming: "工作流命名" };
-const stateNames: Record<Run["state"], string> = { queued: "待执行", running: "执行中", cancelling: "取消中", cancelled: "已取消",
-  paused: "已暂停", complete: "完成", partial: "部分完成", failed: "失败" };
 
 function message(error: unknown): string {
   return formatAppError(error, "分析操作失败。");
@@ -66,6 +60,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   const [run, setRun] = useState<Run | null>(null);
   const [runLoaded, setRunLoaded] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [starting, setStarting] = useState(false);
   const [error, setError] = useState("");
   const succeededRelationUnits = run?.units
     .filter((unit) => (unit.stage === "relation" || unit.stage === "evidenceSelection") && unit.state === "succeeded")
@@ -126,10 +121,12 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
   }, [run?.id, run?.state]);
 
   async function operate(command: string, args: Record<string, unknown>) {
-    setBusy(true); setError("");
-    try { setRun(await invoke<Run>(command, args)); }
+    setBusy(true); setStarting(command === "start_project_analysis"); setError("");
+    try { setRun(command === "start_project_analysis"
+      ? await startTrackedProjectAnalysis<Run>(projectId, limits, stageSelection)
+      : await invoke<Run>(command, args)); }
     catch (caught) { setError(message(caught)); }
-    finally { setBusy(false); }
+    finally { setBusy(false); setStarting(false); }
   }
 
   const active = run?.state === "queued" || run?.state === "running" || run?.state === "cancelling";
@@ -170,6 +167,11 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       : stage === "relations"
         ? "判断待处理的关系候选；符合条件时自动选择证据。结果会进入关系图。同一项目一次只运行一个分析批次。"
         : "为已有关系分组生成工作流名称。请在关系判断完成后运行；同一项目一次只运行一个分析批次。"}</p>
+    {starting && <div className="analysis-progress prominent" role="status"><strong>正在准备{panelStageNames[stage]}</strong>
+      <ProgressMeter progress={{ stage: "读取分析材料", completed: 0, total: null, unit: "项", calls: 0 }} label={`${panelStageNames[stage]}启动进度`} /></div>}
+    {!starting && runBelongsHere && run && <div className="analysis-progress prominent" role="status"><strong>{panelStageNames[stage]} · {projectStateNames[run.state]}</strong>
+      <ProgressMeter progress={projectProgress(run)} label={`${panelStageNames[stage]}执行进度`} totalMayChange={stage !== "summary"} />
+      {run.error && <em>{message(run.error)}</em>}</div>}
     <details className="analysis-settings">
       <summary>运行参数</summary>
       <div className="analysis-limits">
@@ -213,12 +215,12 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       {stage === "naming" && preview.pendingGroups === null && <p className="analysis-note">当前待命名分组尚未计算。完成关系判断后重新载入此面板。</p>}
     </>}
     <div className="summary-actions">
-      <button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits, stageSelection })}>启动{panelStageNames[stage]}</button>
+      <button className="primary-button" disabled={!valid || !canStart} onClick={() => void operate("start_project_analysis", { projectId, limits, stageSelection })}>{starting ? "正在准备…" : `启动${panelStageNames[stage]}`}</button>
       {runBelongsHere && active && run?.state !== "cancelling" && <button className="browse-button" disabled={busy || !!run?.pauseReason} onClick={() => void operate("pause_analysis_run", { runId: run!.id })}>暂停</button>}
       {runBelongsHere && (active || run?.state === "paused") && <button className="browse-button" disabled={busy || run?.state === "cancelling"} onClick={() => void operate("cancel_analysis_run", { runId: run!.id })}>取消</button>}
       {runBelongsHere && run && ["paused", "cancelled", "partial", "failed"].includes(run.state) && <button className="browse-button" disabled={busy || !valid} onClick={() => void operate("continue_analysis_run", { runId: run.id, callLimit: draftLimits.callLimit })}>继续未完成项</button>}
     </div>
-    {runBelongsHere && run && <div className="analysis-progress" role="status"><strong>分析{stateNames[run.state]} · 第 {run.batchNumber} 批</strong>
+    {runBelongsHere && run && <div className="analysis-progress" role="status"><strong>分析{projectStateNames[run.state]} · 第 {run.batchNumber} 批</strong>
       <span>运行 {run.id}</span><span>已处理 {run.processed}；成功 {run.succeeded}；失败 {run.failed}；待处理 {run.pending}</span>
       <span>本次选择：{selectionDescription(run.stageSelection)}</span>
       <span>本批 {run.batchCalls} / {run.limits.callLimit} 次；累计 {run.totalCalls} 次调用，{run.totalQuestions} 道题</span>
@@ -226,7 +228,7 @@ export function ProjectAnalysisView({ projectId, refreshVersion, settingsRevisio
       {run.jevPinnedModel && <span>Jev 本批固定版本：{run.jevPinnedModel}{run.jevProbeAttempts ? `（合成探测 ${run.jevProbeAttempts} 次）` : "（固定版本无需探测）"}</span>}
       {(run.inputTokens !== null || run.outputTokens !== null) && <span>服务回报用量：输入 {run.inputTokens ?? "未知"}，输出 {run.outputTokens ?? "未知"} 令牌</span>}
       <small>此批次固定启动时的模型、超时、重试和输入上限；继续时仅使用上方新的调用上限。</small>
-      {run.interrupted && <em>应用退出中断后已恢复状态，可继续未完成单元。</em>}
+      {run.interrupted && <em>应用退出中断后已恢复状态，正在自动继续或等待恢复结果。</em>}
       {run.pauseReason && <em>{run.pauseReason}</em>}
       {run.error && <em>{message(run.error)}</em>}
       {run.units.filter((unit) => unit.state === "failed").slice(0, 5).map((unit) => <small key={unit.id}>{unit.id}：{unit.error ? message(unit.error) : "分析失败"}</small>)}

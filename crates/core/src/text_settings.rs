@@ -554,10 +554,9 @@ mod tests {
             .start_thread_summary("thread-1".into())
             .await
             .unwrap();
-        assert_eq!(
-            finished(&service, &run.id).await.state,
-            SummaryRunState::Complete
-        );
+        let completed = finished(&service, &run.id).await;
+        assert_eq!(completed.state, SummaryRunState::Complete);
+        assert_eq!(completed.model_calls, 1);
         let cached = service.summary_preview("thread-1").await.unwrap();
         assert!(cached.cache_current);
         assert_eq!(
