@@ -22,14 +22,15 @@ vi.mock("@xyflow/react", () => ({
   Background: () => null,
   Controls: () => null,
   ReactFlow: ({ nodes, edges, onNodeClick, onEdgeClick, onPaneClick, fitView, onlyRenderVisibleElements }: {
-    nodes: { id: string; data: { referenceOnly: boolean } }[];
-    edges: { id: string; source: string; target: string; label: string; style: { strokeDasharray?: string } }[];
+    nodes: { id: string; className?: string; selected?: boolean; data: { referenceOnly: boolean } }[];
+    edges: { id: string; className?: string; source: string; target: string; label: string; markerEnd?: { color: string }; style: { stroke?: string; strokeWidth?: number; strokeDasharray?: string } }[];
     onNodeClick: (event: MouseEvent, node: { id: string }) => void;
     onEdgeClick: (event: MouseEvent, edge: { id: string }) => void;
     onPaneClick: () => void; fitView: boolean; onlyRenderVisibleElements: boolean;
   }) => <div data-fit-view={fitView} data-viewport-rendering={onlyRenderVisibleElements}>
-    {nodes.map((node) => <button key={node.id} onClick={(event) => onNodeClick(event.nativeEvent, node)}>{node.id}{node.data.referenceOnly ? "（引用）" : ""}</button>)}
+    {nodes.map((node) => <button key={node.id} className={node.className} aria-pressed={node.selected} onClick={(event) => onNodeClick(event.nativeEvent, node)}>{node.id}{node.data.referenceOnly ? "（引用）" : ""}</button>)}
     {edges.map((edge) => <button key={edge.id} data-source={edge.source} data-target={edge.target}
+      className={edge.className} data-edge-id={edge.id} data-color={edge.style.stroke} data-width={edge.style.strokeWidth} data-marker={edge.markerEnd?.color}
       data-dashed={Boolean(edge.style.strokeDasharray)} onClick={(event) => onEdgeClick(event.nativeEvent, edge)}>{edge.label}</button>)}
     <button onClick={onPaneClick}>画布空白</button>
   </div>,
@@ -164,7 +165,7 @@ test("固定项目图展示来源方向、双关系和选择详情", async () =>
   fireEvent.click(screen.getByRole("button", { name: "missing（引用）" }));
   expect(screen.getByRole("heading", { name: "仅有引用的端点" })).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "画布空白" }));
-  expect(screen.getByText("选择节点或关系以查看来源详情。")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "仅有引用的端点" })).toBeTruthy();
 });
 
 test("布局器失败时仍显示全部结构关系", async () => {
@@ -374,4 +375,116 @@ test("关系来源与类型过滤仅更新可见边，不调用裁决接口", as
   await waitFor(() => expect(screen.queryByRole("button", { name: "观察 · 派生 · 1.0" })).toBeNull());
   expect(screen.getByRole("button", { name: "规则 · 共同文件" })).toBeTruthy();
   expect(vi.mocked(invoke).mock.calls.every(([command]) => command === "get_project_graph")).toBe(true);
+});
+
+function focusGraph() {
+  const observed = (id: string, from: string, to: string) => ({ id, projectId: "project", fromThreadId: from, toThreadId: to,
+    kind: "FORKED_FROM", source: "observed", sourceField: "forkedFromId", confidence: 1, parentEndpoint: "inProject" });
+  return { project: { id: "project", name: "项目" },
+    nodes: ["a", "b", "c", "d", "e", "alone"].map((id) => ({ id, title: id, referenceOnly: false })),
+    relations: [observed("ab", "a", "b"), observed("bc", "b", "c"), observed("ca", "c", "a"), observed("de", "d", "e")],
+    diagnostics: [],
+  };
+}
+
+const nodeButton = (id: string) => screen.getByRole("button", { name: id });
+const edgeButton = (id: string) => document.querySelector(`[data-edge-id="${id}"]`) as HTMLElement;
+
+test("双向追踪完整连通区域与环，切换孤立节点，取消高亮保留详情", async () => {
+  vi.mocked(invoke).mockResolvedValue(focusGraph());
+  const onSelectThread = vi.fn();
+  render(<ProjectGraphView projectId="project" refreshVersion={0} onSelectThread={onSelectThread} />);
+  await screen.findByRole("button", { name: "b" });
+  fireEvent.click(nodeButton("b"));
+  expect(nodeButton("b").className).toBe("graph-node-current");
+  for (const id of ["a", "c"]) expect(nodeButton(id).className).toBe("graph-node-connected");
+  for (const id of ["d", "e", "alone"]) expect(nodeButton(id).className).toBe("graph-node-muted");
+  for (const id of ["ab", "bc", "ca"]) expect(edgeButton(id).dataset.width).toBe("3.5");
+  expect(edgeButton("de").className).toBe("graph-edge-muted");
+  const color = edgeButton("ab").dataset.color;
+  fireEvent.click(edgeButton("ab"));
+  expect(nodeButton("b").className).toBe("graph-node-current");
+  fireEvent.click(screen.getByRole("button", { name: "画布空白" }));
+  expect(screen.getByRole("heading", { name: "观察关系 · 派生" })).toBeTruthy();
+  expect(nodeButton("b").className).toBe("");
+  expect(edgeButton("ab").dataset.width).toBe("2");
+  expect(edgeButton("ab").dataset.color).toBe(color);
+  fireEvent.click(nodeButton("alone"));
+  expect(nodeButton("alone").className).toBe("graph-node-current");
+  expect(nodeButton("a").className).toBe("graph-node-muted");
+  fireEvent.keyDown(window, { key: "Escape" });
+  expect(nodeButton("alone").className).toBe("");
+  expect(screen.getByRole("heading", { name: "会话" })).toBeTruthy();
+  fireEvent.click(nodeButton("alone"));
+  expect(nodeButton("alone").className).toBe("graph-node-current");
+  expect(onSelectThread).toHaveBeenLastCalledWith("alone");
+});
+
+test("外部选择同步高亮，筛选隐藏桥梁后重新计算，隐藏选中节点时不淡化全图", async () => {
+  const graph = focusGraph();
+  graph.relations = graph.relations.filter((relation) => relation.id !== "ca");
+  graph.relations.find((relation) => relation.id === "bc")!.kind = "SUBAGENT_OF";
+  vi.mocked(invoke).mockResolvedValue(graph);
+  const { rerender } = render(<ProjectGraphView projectId="project" refreshVersion={0} selectedThreadId="c" />);
+  await screen.findByRole("button", { name: "a" });
+  expect(nodeButton("a").className).toBe("graph-node-connected");
+  rerender(<ProjectGraphView projectId="project" refreshVersion={0} selectedThreadId="a" relationKind="FORKED_FROM" />);
+  await waitFor(() => expect(edgeButton("bc")).toBeNull());
+  expect(nodeButton("a").className).toBe("graph-node-current");
+  expect(nodeButton("b").className).toBe("graph-node-connected");
+  expect(nodeButton("c").className).toBe("graph-node-muted");
+  rerender(<ProjectGraphView projectId="project" refreshVersion={0} selectedThreadId="a" visibleThreadIds={new Set(["d", "e"])} />);
+  await waitFor(() => expect(screen.queryByRole("button", { name: "a" })).toBeNull());
+  expect(nodeButton("d").className).toBe("");
+  expect(nodeButton("e").className).toBe("");
+});
+
+function inferredEdge(id: string, kind: string, confidence = 0.9) {
+  return { id, projectId: "project", candidateId: id, fromThreadId: "a", toThreadId: "b", kind, source: "jev",
+    requestedModel: "jev", actualModel: "jev", confidence, probabilities: {}, evidenceConfidence: 0.9,
+    evidenceProbabilities: {}, timeCheck: "unverifiable", explanation: "关系判断", inputVersion: "v1" };
+}
+
+test("来源与置信度筛选后的关系才参与间接追踪", async () => {
+  const graph = focusGraph();
+  graph.relations = graph.relations.filter((relation) => relation.id === "de");
+  vi.mocked(invoke).mockResolvedValue({ ...graph, inferredRelations: [inferredEdge("bridge", "RELATED", 0.6)] });
+  const { rerender } = render(<ProjectGraphView projectId="project" refreshVersion={0} selectedThreadId="a" />);
+  await screen.findByRole("button", { name: "b" });
+  expect(nodeButton("b").className).toBe("graph-node-connected");
+  fireEvent.change(screen.getByRole("combobox", { name: "最低关系置信度" }), { target: { value: "0.7" } });
+  expect(nodeButton("b").className).toBe("graph-node-muted");
+  fireEvent.change(screen.getByRole("combobox", { name: "最低关系置信度" }), { target: { value: "0" } });
+  expect(nodeButton("b").className).toBe("graph-node-connected");
+  rerender(<ProjectGraphView projectId="project" refreshVersion={0} selectedThreadId="a" relationSource="observed" />);
+  expect(nodeButton("b").className).toBe("graph-node-muted");
+});
+
+test("五组关系配色与来源线型并存，高亮保留颜色及有向语义", async () => {
+  const groups = {
+    progression: ["CONTINUES", "HANDOFF_TO", "SUPERSEDES"], change: ["IMPLEMENTS", "FIXES", "MODIFIES"],
+    examination: ["INVESTIGATES", "VALIDATES", "REVIEWS"], dependency: ["DEPENDS_ON", "MOTIVATED_BY"],
+    connection: ["RELATED", "ALTERNATIVE_TO"],
+  };
+  vi.mocked(invoke).mockResolvedValue({ ...focusGraph(),
+    inferredRelations: Object.values(groups).flat().map((kind) => inferredEdge(kind, kind)),
+    derivedRelations: [{ id: "signal", projectId: "project", fromThreadId: "a", toThreadId: "b",
+      kind: "SHARED_FILE", source: "derived", basis: "同一文件", evidence: [] }],
+  });
+  render(<ProjectGraphView projectId="project" refreshVersion={0} />);
+  await screen.findByRole("button", { name: "a" });
+  fireEvent.click(nodeButton("a"));
+  for (const [group, kinds] of Object.entries(groups)) {
+    for (const kind of kinds) {
+      const edge = edgeButton(kind);
+      expect(edge.dataset.color).toBe(`var(--graph-${group})`);
+      expect(edge.dataset.dashed).toBe("true");
+      expect(edge.dataset.width).toBe("3.5");
+      expect(edge.dataset.marker).toBe(group === "connection" ? undefined : edge.dataset.color);
+    }
+  }
+  expect(edgeButton("ab").dataset.dashed).toBe("false");
+  expect(edgeButton("signal").dataset.color).toBe("var(--graph-derived)");
+  expect(edgeButton("signal").dataset.dashed).toBe("true");
+  expect(screen.getByText("关系图例")).toBeTruthy();
 });

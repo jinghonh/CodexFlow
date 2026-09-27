@@ -58,6 +58,55 @@ const inferredText: Record<InferredRelation["kind"], string> = {
   DEPENDS_ON: "依赖", MODIFIES: "修改", REVIEWS: "评审", HANDOFF_TO: "交接",
   ALTERNATIVE_TO: "替代方案", SUPERSEDES: "取代", MOTIVATED_BY: "促成", RELATED: "相关",
 };
+const relationGroups = {
+  progression: { label: "过程衔接", types: "派生、子代理、延续、交接、取代" },
+  change: { label: "实施变更", types: "落实、修复、修改" },
+  examination: { label: "分析检查", types: "调查、验证、评审" },
+  dependency: { label: "依赖动因", types: "依赖、促成" },
+  connection: { label: "其他联系", types: "相关、替代方案" },
+};
+const inferredGroup: Record<InferredRelation["kind"], keyof typeof relationGroups> = {
+  CONTINUES: "progression", HANDOFF_TO: "progression", SUPERSEDES: "progression",
+  IMPLEMENTS: "change", FIXES: "change", MODIFIES: "change",
+  INVESTIGATES: "examination", VALIDATES: "examination", REVIEWS: "examination",
+  DEPENDS_ON: "dependency", MOTIVATED_BY: "dependency",
+  RELATED: "connection", ALTERNATIVE_TO: "connection",
+};
+
+function GraphLegend() {
+  return <details className="graph-legend" open>
+    <summary>关系图例</summary>
+    <ul>{Object.entries(relationGroups).map(([group, { label, types }]) =>
+      <li key={group}><span className="graph-legend-line" style={{ borderColor: `var(--graph-${group})` }} />
+        <span><strong>{label}</strong><small>{types}</small></span></li>)}</ul>
+    <div className="graph-legend-sources">
+      <span><i className="graph-legend-line" />观察：实线</span>
+      <span><i className="graph-legend-line graph-legend-inferred" />推断：虚线</span>
+      <span><i className="graph-legend-line graph-legend-derived" />候选信号：灰色点线</span>
+      <span>箭头表示关系方向；无箭头表示无向联系</span>
+    </div>
+  </details>;
+}
+
+function connectedNodeIds(graph: ProjectGraph | null, threadId: string | null): Set<string> | null {
+  if (!graph || !threadId || !graph.nodes.some((node) => node.id === threadId)) return null;
+  const neighbors = new Map(graph.nodes.map((node) => [node.id, [] as string[]]));
+  for (const relation of [...graph.relations, ...(graph.derivedRelations ?? []), ...(graph.inferredRelations ?? [])]) {
+    if (!neighbors.has(relation.fromThreadId) || !neighbors.has(relation.toThreadId)) continue;
+    neighbors.get(relation.fromThreadId)!.push(relation.toThreadId);
+    neighbors.get(relation.toThreadId)!.push(relation.fromThreadId);
+  }
+  const connected = new Set([threadId]);
+  const queue = [threadId];
+  for (let index = 0; index < queue.length; index += 1) {
+    for (const neighbor of neighbors.get(queue[index]) ?? []) {
+      if (connected.has(neighbor)) continue;
+      connected.add(neighbor);
+      queue.push(neighbor);
+    }
+  }
+  return connected;
+}
 const executionStageText: Record<NonNullable<InferredRelation["executionStage"]>, string> = {
   planned: "计划中", started: "已开始", completed: "已完成", unknown: "未知",
 };
@@ -178,7 +227,7 @@ function graphEdges(graph: ProjectGraph): Edge[] {
   const visibleRelations = graph.inferredRelations ?? [];
   const edges: Edge[] = graph.relations.map((relation) => {
     const fork = relation.kind === "FORKED_FROM";
-    const color = fork ? "var(--graph-observed)" : "var(--graph-child)";
+    const color = "var(--graph-progression)";
     return {
       id: relation.id,
       source: relation.fromThreadId,
@@ -200,17 +249,17 @@ function graphEdges(graph: ProjectGraph): Edge[] {
       type: "smoothstep", label: `规则 · ${derivedText[relation.kind]}`,
       labelStyle: { fill: "var(--graph-derived)", fontSize: 11, fontWeight: 650 },
       labelBgStyle: { fill: "var(--paper)", fillOpacity: 0.95 }, labelBgPadding: [7, 4],
-      style: { stroke: "var(--graph-derived)", strokeWidth: 2, strokeDasharray: "5 4" },
+      style: { stroke: "var(--graph-derived)", strokeWidth: 2, strokeDasharray: "2 5", strokeLinecap: "round" },
     });
   }
   for (const relation of visibleRelations) {
-    const color = "var(--graph-inferred)";
+    const color = `var(--graph-${inferredGroup[relation.kind]})`;
     edges.push({
       id: relation.id, source: relation.fromThreadId, target: relation.toThreadId,
       type: "smoothstep", label: `推断 · ${inferredText[relation.kind]} · ${relation.confidence.toFixed(2)}`,
       labelStyle: { fill: color, fontSize: 11, fontWeight: 650 },
       labelBgStyle: { fill: "var(--paper)", fillOpacity: 0.95 }, labelBgPadding: [7, 4],
-      style: { stroke: color, strokeWidth: 2 },
+      style: { stroke: color, strokeWidth: 2, strokeDasharray: "8 4" },
       ...(["RELATED", "ALTERNATIVE_TO"].includes(relation.kind) ? {} : { markerEnd: { type: MarkerType.ArrowClosed, color } }),
     });
   }
@@ -314,6 +363,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   const [layout, setLayout] = useState<{ nodes: Node<GraphNodeData>[]; edges: Edge[]; warning: string }>({ nodes: [], edges: [], warning: "" });
   const [layoutPending, setLayoutPending] = useState(false);
   const [selection, setSelection] = useState<Selection>(null);
+  const [highlightedThreadId, setHighlightedThreadId] = useState<string | null>(selectedThreadId);
   const [error, setError] = useState("");
   const [decisionError, setDecisionError] = useState("");
   const [savingDecision, setSavingDecision] = useState(false);
@@ -323,6 +373,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   const threshold = onMinimumConfidenceChange ? minimumConfidence : localMinimumConfidence;
   const changeThreshold = (value: number) => onMinimumConfidenceChange ? onMinimumConfidenceChange(value) : setLocalMinimumConfidence(value);
   useEffect(() => {
+    setHighlightedThreadId(selectedThreadId);
     if (pendingEvidenceThread.current !== null && pendingEvidenceThread.current === selectedThreadId) {
       pendingEvidenceThread.current = null;
       setInspectorPage("session");
@@ -330,7 +381,14 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
     }
     setSelection(selectedThreadId ? { type: "node", id: selectedThreadId } : null);
     setInspectorPage(selectedThreadId ? "session" : "relation");
-  }, [selectedThreadId]);
+  }, [selectedThreadId, projectId]);
+  useEffect(() => {
+    const clearHighlight = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) setHighlightedThreadId(null);
+    };
+    window.addEventListener("keydown", clearHighlight);
+    return () => window.removeEventListener("keydown", clearHighlight);
+  }, []);
   useEffect(() => {
     let active = true;
     if (loadedProjectId.current !== projectId) {
@@ -355,6 +413,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   const visibleGraph = useMemo(() => graph
     ? filteredGraph(graph, visibleThreadIds, relationSource, relationKind, threshold)
     : null, [graph, visibleThreadIds, relationSource, relationKind, threshold]);
+  const connectedIds = useMemo(() => connectedNodeIds(visibleGraph, highlightedThreadId), [visibleGraph, highlightedThreadId]);
 
   useEffect(() => {
     if (!visibleGraph) return;
@@ -395,6 +454,18 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   ].map((relation) => relation.id));
   const visibleNodes = layout.nodes.filter((node) => visibleNodeIds.has(node.id));
   const visibleEdges = layout.edges.filter((edge) => visibleRelationIds.has(edge.id));
+  const highlightedNodes = visibleNodes.map((node) => ({
+    ...node,
+    selected: node.id === highlightedThreadId,
+    className: connectedIds ? node.id === highlightedThreadId ? "graph-node-current" : connectedIds.has(node.id) ? "graph-node-connected" : "graph-node-muted" : undefined,
+  }));
+  const highlightedEdges = visibleEdges.map((edge) => {
+    const related = connectedIds?.has(edge.source) && connectedIds.has(edge.target);
+    return { ...edge,
+      className: connectedIds ? related ? "graph-edge-connected" : "graph-edge-muted" : undefined,
+      style: { ...edge.style, strokeWidth: related ? 3.5 : 2 },
+    };
+  });
 
   const detail = useMemo(() => {
     const current = selection ?? (selectedThreadId ? { type: "node" as const, id: selectedThreadId } : null);
@@ -419,6 +490,7 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
   }
 
   function selectSession(threadId: string) {
+    setHighlightedThreadId(threadId);
     if (threadId !== selectedThreadId) pendingEvidenceThread.current = threadId;
     setInspectorPage("session");
     onSelectThread?.(threadId);
@@ -481,19 +553,24 @@ export function ProjectGraphView({ projectId, refreshVersion, onSelectEvidence, 
         </details>}
       {(graph.inferenceOutcomes ?? []).length > 0 && <p className="analysis-note">候选判断：无关系 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "none").length}，无法判断 {(graph.inferenceOutcomes ?? []).filter((item) => item.status === "undetermined").length}。</p>}
       <button className="browse-button" onClick={() => void refreshGraph()}>自动布局</button>
+      <GraphLegend />
+      <p className="graph-focus-status" aria-live="polite">{connectedIds
+        ? `已突出 ${connectedIds.size} 个关联节点；点击空白或按 Esc 取消高亮。`
+        : "点击会话，突出当前可见关系连接的全部会话。"}</p>
       <p className="graph-layout-status" role="status">{layoutPending ? "正在布局关系图…" : "关系图布局完成"}</p>
       {layout.warning && <div className="graph-layout-warning" role="status">{layout.warning}</div>}
       {visibleNodes.length > 80 && <p className="analysis-note">共 {visibleNodes.length} 个节点、{visibleEdges.length} 条关系；拖动或缩放查看。</p>}
       <div className="graph-inspection-layout">
       {visibleNodes.length ? <div className="graph-canvas" aria-label="项目结构关系图">
-        <ReactFlow nodes={visibleNodes.map((node) => ({ ...node, selected: node.id === selectedThreadId }))} edges={visibleEdges} nodeTypes={nodeTypes} fitView={visibleNodes.length <= 80} onlyRenderVisibleElements fitViewOptions={{ padding: 0.18 }}
+        <ReactFlow nodes={highlightedNodes} edges={highlightedEdges} nodeTypes={nodeTypes} fitView={visibleNodes.length <= 80} onlyRenderVisibleElements fitViewOptions={{ padding: 0.18 }}
           nodesDraggable={false} onNodeClick={(_, node) => {
             setSelection({ type: "node", id: node.id });
+            setHighlightedThreadId(node.id);
             setInspectorPage(node.data.referenceOnly ? "relation" : "session");
             if (!node.data.referenceOnly) onSelectThread?.(node.id);
           }}
           onEdgeClick={(_, edge) => { setSelection({ type: "edge", id: edge.id }); setInspectorPage("relation"); }}
-          onPaneClick={() => { setSelection(null); setInspectorPage("relation"); }} minZoom={0.15} maxZoom={2}>
+          onPaneClick={() => setHighlightedThreadId(null)} minZoom={0.15} maxZoom={2}>
           <Background gap={22} size={1} />
           <Controls showInteractive={false} />
         </ReactFlow>
